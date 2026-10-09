@@ -43,6 +43,7 @@ from resources_servers.gdpval.app import (
     _iter_ref_repeat_dirs,
     _strict_comparison_trial_failure,
 )
+from resources_servers.gdpval.comparison import task_attempted
 from resources_servers.gdpval.task_data import GDPFileTask, prepare_row
 
 
@@ -2315,6 +2316,8 @@ async def test_verify_exports_bytes_and_reuses_existing_gdp_judge(sandbox_server
         captured.append(body)
         assert Path(body.deliverables_dir, "report.csv").read_bytes() == b"name,value\na,3\n"
         assert body.rubric_pretty == "PRIVATE RUBRIC"
+        # Comparison mode skips a task dir without the completion marker as never attempted.
+        assert task_attempted(body.deliverables_dir)
         return GDPValVerifyResponse(**body.model_dump(), reward=0.75)
 
     monkeypatch.setattr(GDPValResourcesServer, "_grade_deliverables", grade)

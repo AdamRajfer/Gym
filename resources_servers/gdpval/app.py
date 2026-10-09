@@ -675,6 +675,8 @@ class GDPValResourcesServer(SimpleResourcesServer):
             await session.sandbox.download(f"{OUTPUT_DIR}/{name}", target / name)
             if (target / name).stat().st_size != item["size"]:
                 raise HTTPException(503, "GDP artifact changed during export")
+        # Comparison mode treats a task dir without this marker as never attempted.
+        (target / "finish_params.json").write_text(json.dumps({"paths": [item["name"] for item in files]}))
         session.deliverables = target
         return target
 

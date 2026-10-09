@@ -84,6 +84,10 @@ from resources_servers.gdpval.task_data import INPUT_DIR, OUTPUT_DIR, WORKDIR, G
 
 LOGGER = logging.getLogger(__name__)
 _MAX_BYTES = 128 * 1024 * 1024
+# Task inputs are larger than exported deliverables: some GDPval tasks ship video or archive
+# references of several hundred MB, and such a file needs more than 180 s to download.
+_MAX_REFERENCE_BYTES = 1024 * 1024 * 1024
+_REFERENCE_DOWNLOAD_TIMEOUT_S = 600
 _LIST_OUTPUTS = f"""
 import json, pathlib, stat
 root = pathlib.Path({OUTPUT_DIR!r})
@@ -633,7 +637,7 @@ class GDPValResourcesServer(SimpleResourcesServer):
     async def _stage_references(self, sandbox: AsyncSandbox, task: GDPFileTask) -> None:
         with tempfile.TemporaryDirectory(prefix="gdp-input-") as scratch:
             for name, url in zip(task.reference_files, task.reference_file_urls, strict=True):
-                response = await http_request("GET", url, timeout=ClientTimeout(total=180))
+                response = await http_request("GET", url, timeout=ClientTimeout(total=_REFERENCE_DOWNLOAD_TIMEOUT_S))
                 try:
                     response.raise_for_status()
                     local = Path(scratch) / "reference"
@@ -641,8 +645,8 @@ class GDPValResourcesServer(SimpleResourcesServer):
                     with local.open("wb") as stream:
                         async for chunk in response.content.iter_chunked(1024 * 1024):
                             size += len(chunk)
-                            if size > _MAX_BYTES:
-                                raise RuntimeError("Reference file exceeds prototype download limit")
+                            if size > _MAX_REFERENCE_BYTES:
+                                raise RuntimeError("Reference file exceeds the input reference size limit")
                             stream.write(chunk)
                     await sandbox.upload(local, f"{INPUT_DIR}/{name}")
                 finally:

@@ -4,7 +4,12 @@
 config_paths:
 - resources_servers/gdpval/configs/gdpval.yaml
 - responses_api_agents/openclaw_agent/configs/openclaw_agent.yaml
-- environment_servers/single_agent_turn_legacy/configs/single_agent_turn_legacy.yaml
+- environment_servers/single_agent_turn/configs/single_agent_turn.yaml
+# Prepare native rows with task_data.py --taskset gdpval; flat source rows stay unchanged.
+environment_routing_mode: taskset
+environment_server_routes:
+  gdpval: single_agent_turn
+num_repeats_add_seed: false
 gdpval_resources_server:
   resources_servers:
     gdpval:
@@ -28,9 +33,9 @@ openclaw_agent:
       # Per-call output limit requested from the model; GDPval deliverables
       # regularly exceed the harness default. Same value as the OpenCode recipe.
       max_output_tokens: 32768
-single_agent_turn_legacy:
+single_agent_turn:
   environment_servers:
-    single_agent_turn_legacy:
+    single_agent_turn:
       resources_server:
         name: gdpval_resources_server
       agent_server:

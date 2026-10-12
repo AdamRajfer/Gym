@@ -20,6 +20,9 @@ from urllib.parse import urlsplit
 from pydantic import BaseModel, ConfigDict, Field, JsonValue, field_validator, model_validator
 from typing_extensions import Self
 
+from nemo_gym.episode_types import MaterializedTask, TaskId
+from nemo_gym.single_agent_turn_types import SingleAgentTurnTaskInput
+
 
 class TaskData(BaseModel):
     model_config = ConfigDict(extra="allow")
@@ -149,13 +152,32 @@ def prepare_row(row: dict[str, JsonValue]) -> dict[str, JsonValue]:
     return result
 
 
+def prepare_task(row: dict[str, JsonValue], *, taskset: str) -> MaterializedTask[SingleAgentTurnTaskInput]:
+    """Prepare a native task while keeping verifier metadata outside the model prompt."""
+    prepared = prepare_row(row)
+    params = prepared.pop("responses_create_params")
+    return MaterializedTask[SingleAgentTurnTaskInput](
+        task_id=TaskId(taskset=taskset, task_id=prepared["task_id"]),
+        task_input=SingleAgentTurnTaskInput(responses_create_params=params, task_data=prepared),
+    )
+
+
 def main() -> None:
     """Prepare a separate JSONL; never overwrite the source dataset."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument(
+        "--taskset", help="Emit native tasks for this taskset; use 'gdpval' with the OpenCode/OpenClaw sandbox recipes"
+    )
     args = parser.parse_args()
-    rows = [prepare_row(json.loads(line)) for line in args.input.read_text().splitlines() if line.strip()]
+    source = [json.loads(line) for line in args.input.read_text().splitlines() if line.strip()]
+    rows = [
+        prepare_task(row, taskset=args.taskset).model_dump(mode="json")
+        if args.taskset is not None
+        else prepare_row(row)
+        for row in source
+    ]
     args.output.parent.mkdir(parents=True, exist_ok=True)
     with args.output.open("x") as stream:
         for row in rows:

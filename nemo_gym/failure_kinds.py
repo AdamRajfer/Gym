@@ -299,6 +299,7 @@ _INFRA_SUBCLASS_NAMES = frozenset(
         "EnvironmentStartTimeoutError",
         "HealthcheckError",
         "AgentSetupTimeoutError",
+        "AgentSetupError",
         "AgentRecordError",
         "SeededSessionExpired",
         "VerifierStartTimeoutError",

@@ -65,22 +65,49 @@ def test_a_free_text_infrastructure_detail_is_not_a_type(tmp_path):
     assert "_ng_failure_type" not in verified
 
 
-@pytest.mark.parametrize("eval_mode", [False, True], ids=["training", "evaluation"])
-def test_an_agent_harness_failure_is_named_for_the_retry_rule_in_evaluation(tmp_path, monkeypatch, eval_mode):
-    """A mini-SWE run with no trajectory: Terminal-Bench retries the trial, so evaluation names it as infra."""
-    monkeypatch.setattr("resources_servers.terminal_bench_4.app.is_eval_mode", lambda: eval_mode)
+def test_an_agent_harness_failure_keeps_its_detail_in_training(tmp_path, monkeypatch):
+    monkeypatch.setattr("resources_servers.terminal_bench_4.app.is_eval_mode", lambda: False)
     verified = _verified(
         tmp_path,
         {"verifier_result": {"rewards": {"reward": 0.0}}},
         AgentTermination(reason="infrastructure_error", detail="mini-SWE produced no trajectory"),
     )
 
-    expected = (
-        "AgentInfrastructureError: mini-SWE produced no trajectory" if eval_mode else "mini-SWE produced no trajectory"
+    assert verified["failure_reason"] == "mini-SWE produced no trajectory"
+
+
+@pytest.mark.parametrize("reward", [0.0, 1.0])
+def test_a_trial_the_verifier_scored_keeps_its_reward_in_evaluation(tmp_path, monkeypatch, reward):
+    """mini-SWE died during the agent's run, but the verifier still graded the sandbox: the grade stands.
+
+    The model can end mini-SWE itself (kill -9 -1, a memory bomb, a full disk). Discarding the grade would turn a
+    scored trial into a retry, which Terminal-Bench does not do: a trial that ran its tests keeps their verdict.
+    """
+    monkeypatch.setattr("resources_servers.terminal_bench_4.app.is_eval_mode", lambda: True)
+    verified = _verified(
+        tmp_path,
+        {"verifier_result": {"rewards": {"reward": reward}}},
+        AgentTermination(reason="infrastructure_error", detail="mini-SWE produced no trajectory"),
     )
-    assert verified["failure_reason"] == expected
-    if eval_mode:
-        assert not is_terminal_failure(verified)
+
+    assert verified["reward"] == reward
+    assert verified["evaluation_completed"] is True
+    assert verified["failure_reason"] is None
+    assert "_ng_failure_class" not in verified
+
+
+def test_a_scored_trial_with_platform_evidence_is_still_retried(tmp_path, monkeypatch):
+    # The platform, not the model, ended the agent's sandbox: the grade is not a measurement.
+    monkeypatch.setattr("resources_servers.terminal_bench_4.app.is_eval_mode", lambda: True)
+    detail = "SandboxPlatformEvictionError: Sandbox was evicted by the platform: reason='Evicted'"
+    verified = _verified(
+        tmp_path,
+        {"verifier_result": {"rewards": {"reward": 1.0}}},
+        AgentTermination(reason="infrastructure_error", detail=detail),
+    )
+
+    assert verified["_ng_failure_class"] == "infrastructure_error"
+    assert not is_terminal_failure(verified)
 
 
 def test_a_scored_trial_carries_no_failure(tmp_path):
@@ -116,3 +143,47 @@ def test_historical_trial_without_test_report_has_null_counts(tmp_path):
         assert verified[key] is None
     assert verified["reward"] == 1.0
     assert verified["evaluation_completed"] is True
+
+
+@pytest.mark.parametrize(
+    ("agent_started", "expected"),
+    [(False, "AgentSetupError"), (True, "AgentInfrastructureError")],
+    ids=["before-the-agent-ran", "during-the-agents-run"],
+)
+async def test_a_harness_failure_is_named_by_whether_the_agent_ran(tmp_path, monkeypatch, agent_started, expected):
+    """mini-SWE failing to set up comes before the model's first command (retried); failing during its run is the
+    model's (final, 0), unless the platform names its own cause."""
+    import resources_servers.terminal_bench_4.app as tb4_app
+
+    async def _finalize(session, grade):
+        session.result.setdefault("verifier_result", {})
+
+    monkeypatch.setattr(tb4_app.lifecycle, "finalize_session", _finalize)
+    termination = AgentTermination(reason="infrastructure_error", detail="mini-SWE command exited 1")
+    body = SimpleNamespace(
+        termination=termination,
+        agent_timings={},
+        agent_started=agent_started,
+        harness_metadata={},
+        model_dump_json=lambda **_: "{}",
+    )
+    session = SimpleNamespace(
+        verify_body=body,
+        request=SimpleNamespace(capture_rollout_id=None),
+        termination=None,
+        result={},
+        diagnostics=[],
+        phase="ready",
+        subphase=None,
+        directory=tmp_path,
+        seed_response=SimpleNamespace(termination=None),
+        persist=lambda: None,
+    )
+    server = SimpleNamespace(_verified_response=lambda session, extra: None)
+
+    await tb4_app.TerminalBench4ResourcesServer._finalize_session(server, session)
+
+    exception_type = session.result["exception_info"]["exception_type"]
+    assert exception_type == expected
+    row = {"_ng_failure_class": "infrastructure_error", "_ng_failure_type": exception_type}
+    assert is_terminal_failure(row) is agent_started

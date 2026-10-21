@@ -1126,7 +1126,8 @@ class SharedRolloutCollectionConfig(RemovedRolloutOptionsMixin, UploadRolloutsCo
         description=(
             "Failure classes from the failures sidecar to count in aggregate metrics, so a failed "
             "rollout lands in the denominator. The default, null, counts every class; a list such as "
-            "['agent_run_error'] counts only those, and [] counts none. A row that carries no reward "
+            "['agent_run_error'] counts only those retryable classes, and [] counts no retryable one; a final "
+            "failure counts as 0 whatever the selection, except a data gap. A row that carries no reward "
             "is scored zero for the metrics only; no artifact is changed."
         ),
     )
@@ -4632,7 +4633,8 @@ class RolloutAggregationConfig(BaseNeMoGymCLIConfig):
         description=(
             "Failure classes from the failures sidecar to count in aggregate metrics, so a failed "
             "rollout lands in the denominator. The default, null, counts every class; a list counts "
-            "only those, and [] counts none. A row that carries no reward is scored zero for the "
+            "only those retryable classes, and [] counts no retryable one; a final failure counts as 0 "
+            "whatever the selection, except a data gap. A row that carries no reward is scored zero for the "
             "metrics only; no artifact is changed. Each shard's "
             "sidecar is read against that shard's own rows, so runs on different environment "
             "servers that reuse task indices do not hide each other's failures."

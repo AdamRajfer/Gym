@@ -59,8 +59,10 @@ class MetricsConfig(Protocol):
 class ArenaMetrics:
     """Compute the same metrics for online and saved rollouts."""
 
-    def __init__(self, config: MetricsConfig) -> None:
+    def __init__(self, config: MetricsConfig, *, evaluation: bool | None = None) -> None:
         self.config = config
+        # Score as evaluation does; None reads the running server's mode (is_eval_mode).
+        self._evaluation = evaluation
         self._bradley_terry_constants = None
         if config.style_control_method == "bradley_terry":
             means, stds, coefs = config.style_norm_mean, config.style_norm_std, config.style_coefs
@@ -81,6 +83,7 @@ class ArenaMetrics:
 
     def compute(self, tasks: list[list[dict[str, Any]]]) -> dict[str, Any]:
         """Compute metrics; each task contains repeated rollouts for one prompt."""
+        evaluation = is_eval_mode() if self._evaluation is None else self._evaluation
         total_rollouts = failed_rollouts = self_comparison_rollouts = 0
         missing_judgment_rollouts = parse_failure_rollouts = 0
         reasoning_only_response_rollouts = max_token_reached_rollouts = context_window_exceeded_rollouts = 0
@@ -140,7 +143,7 @@ class ArenaMetrics:
                 # left out of the score. Only a verified answer carries policy_answer, which tells it apart from a
                 # judge failure or a missing rollout counted as 0.
                 empty_answer = (
-                    is_eval_mode()
+                    evaluation
                     and "policy_answer" in rollout
                     and not response
                     and not reasoning
@@ -268,7 +271,7 @@ class ArenaMetrics:
 
         failure_rate = failed_rollouts / total_rollouts
         failure_rate_exceeded = failure_rate > self.config.max_rollout_failure_rate
-        if failure_rate_exceeded and not is_eval_mode():
+        if failure_rate_exceeded and not evaluation:
             raise ValueError(
                 f"Too many failed rollouts: {failed_rollouts}/{total_rollouts} "
                 f"({failure_rate * 100:.1f}%) exceeds max_rollout_failure_rate="

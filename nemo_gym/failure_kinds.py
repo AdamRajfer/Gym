@@ -216,6 +216,8 @@ FAILURE_RULES: dict[str, FailureRule] = {
     "remote_agent_error": EVIDENCE,
     "harbor_failed": EVIDENCE,
     "infrastructure_error": EVIDENCE,
+    # A verifier masked the row: its reward is not a measurement, because the environment or a service failed.
+    "masked_sample": RETRY,
     "transient": RETRY,
     "timeout_exceeded": FINAL,
     # GDPval data and judge-eligibility gaps: the same inputs fail the same way, and the model did nothing wrong.
@@ -292,6 +294,7 @@ _INFRA_SUBCLASS_NAMES = frozenset(
         "AgentInfrastructureError",
         "AgentRecordError",
         "SeededSessionExpired",
+        "VerifierStartTimeoutError",
     }
 )
 # Ray's wrapper of a task's own exception: "RayTaskError(ImportError): ...". The wrapped name decides.

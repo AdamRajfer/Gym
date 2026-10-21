@@ -4073,9 +4073,11 @@ class RolloutCollectionHelper(BaseModel):
             if config.materialized_jsonl_fpath.exists()
             else len(input_rows) + persisted_count
         )
-        no_score = aggregate_metrics_fpath is None and not config.disable_aggregation and bool(input_rows)
+        # Judge by the run's whole inventory: a resume whose every rollout settled earlier dispatches nothing.
+        no_score = aggregate_metrics_fpath is None and not config.disable_aggregation and expected_rollouts > 0
         if no_score:
-            aggregate_metrics_fpath = await asyncio.to_thread(_unscored_metrics_file, output_fpath, input_rows)
+            inventory = input_rows or await _read_jsonl(config.materialized_jsonl_fpath)
+            aggregate_metrics_fpath = await asyncio.to_thread(_unscored_metrics_file, output_fpath, inventory)
         completeness: Dict[str, Any] = {}
         if aggregate_metrics_fpath is not None:
             unresolved, owed = await asyncio.to_thread(

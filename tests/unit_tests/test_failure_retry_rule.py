@@ -575,6 +575,38 @@ class TestInfraUnresolved:
         printed = capsys.readouterr().out
         assert f"{unresolved} rows unresolved for infra" in printed and "resubmit" not in printed
 
+    async def test_a_resume_with_nothing_left_to_dispatch_still_reports_incomplete(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Bot 4339235356: every rollout settled in an earlier invocation; the resume dispatches nothing."""
+        monkeypatch.setenv("NEMO_GYM_MAX_ROLLOUT_ATTEMPTS", "1")
+        monkeypatch.setattr("nemo_gym.rollout_collection.get_global_config_dict", lambda *args, **kwargs: {})
+        output = tmp_path / "out.jsonl"
+        row = {"responses_create_params": {"input": []}, "agent_ref": {"name": "agent"}}
+        (tmp_path / "in.jsonl").write_bytes(orjson.dumps(row) + b"\n")
+
+        class Helper(RolloutCollectionHelper):
+            def _run_examples_with_metadata(self, examples, *args, **kwargs):
+                futures = []
+                for example in examples:
+                    future = asyncio.get_event_loop().create_future()
+                    result = {NG_FAILURE_CLASS_KEY: "judge_failed"}
+                    future.set_result(_CompletedRollout(row=example, result=result, rollout_latency_ms=None))
+                    futures.append(future)
+                return futures
+
+            async def _call_aggregate_metrics(self, results, rows, output_fpath, *, raise_on_error=True):
+                return None
+
+        common = dict(
+            input_jsonl_fpath=str(tmp_path / "in.jsonl"), output_jsonl_fpath=str(output), disable_health_check=True
+        )
+        await Helper().run_from_config(RolloutCollectionConfig(**common, disable_aggregation=True))
+        await Helper().run_from_config(RolloutCollectionConfig(**common, resume_from_cache=True))
+
+        [entry] = orjson.loads(output.with_name("out_aggregate_metrics.json").read_bytes())
+        assert (entry["key_metrics"]["rollouts_complete"], entry["key_metrics"]["publishable"]) == (False, False)
+
     def test_only_retryable_infra_and_missing_rollouts_are_unresolved(self) -> None:
         unresolved, owed = _infra_unresolved_counts(self._rows(), {}, set(), expected=10, missing=1)
         # The judge failure and the missing rollout; owed excludes the two rows left out by method.

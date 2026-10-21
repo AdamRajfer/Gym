@@ -143,7 +143,10 @@ class Tau2ToolValidatingAsyncOpenAI(NeMoGymAsyncOpenAI):
         if not self.user_model_server_name or not self.policy_model_server_name:
             return False
         user_url = get_server_url(self.user_model_server_name)
-        return user_url != get_server_url(self.policy_model_server_name) and self.base_url.startswith(user_url)
+        # The base URL is the server root plus a path: match at a path boundary, so :800 is not a prefix of :8000.
+        return user_url != get_server_url(self.policy_model_server_name) and self.base_url.startswith(
+            user_url.rstrip("/") + "/"
+        )
 
     async def create_chat_completion(self, **kwargs: Any) -> Dict[str, Any]:
         max_attempts = self.malformed_tool_call_max_retries + 1

@@ -468,6 +468,11 @@ class TestApp:
             policy = user.model_copy(update={"base_url": "http://policy:1/v1"})
             assert user._is_user_simulator()
             assert not policy._is_user_simulator()
+        # A user server whose URL is a string prefix of the policy's is a different server.
+        prefixed = {"policy": "http://127.0.0.1:8000", "user": "http://127.0.0.1:800"}
+        with patch("responses_api_agents.tau2.app.get_server_url", side_effect=prefixed.__getitem__):
+            assert not user.model_copy(update={"base_url": "http://127.0.0.1:8000/v1"})._is_user_simulator()
+            assert user.model_copy(update={"base_url": "http://127.0.0.1:800/ng-rollout/r/v1"})._is_user_simulator()
         # One server for both: a malformed call cannot be told apart, so it stays the policy's.
         with patch("responses_api_agents.tau2.app.get_server_url", return_value="http://shared:1"):
             assert not user.model_copy(update={"base_url": "http://shared:1/v1"})._is_user_simulator()

@@ -18,12 +18,13 @@ Gym describes failures with free text and component-local labels, so the same fa
 arrives at a collector, a log line and a metric under three different names and cannot be
 grouped. This module holds the one vocabulary those producers share.
 
-A name says *what kind of thing went wrong* and nothing else. Whether to retry, whether
-the request may be replayed, whether a completed result should be masked, and what to tell
-a person are all properties of the occurrence, not of the name — they live on the failure
-record, on the verify response, and in ``failure_reason`` respectively. Keeping them out is
-deliberate: metadata attached to a name goes stale the moment one caller wants to retry
-what another caller does not.
+A name says *what kind of thing went wrong*. Whether resume retries it is one fixed rule per
+name, in ``FAILURE_RULES``, so no agent or benchmark decides it: a failure in a service the model
+does not control is retried, and a failure caused by what the model produced is final and scores 0.
+A name that can be either (``EVIDENCE``) is split by where the failure happened, which
+``failure_cause_of`` reads from the error itself. An unknown name is final, so the model never
+gets a free retry. Whether a result is masked and what to tell a person stay on the verify
+response and in ``failure_reason``.
 
 Names are low cardinality on purpose. They are safe as a metric label or a span dimension;
 ``failure_reason`` never is, because it carries occurrence detail and can be unbounded.
@@ -166,6 +167,15 @@ def validate_failure_kind(name: str | None) -> str | None:
     return name
 
 
+# --- retry rule ------------------------------------------------------------------------------ #
+FailureRule = Literal["retry", "final", "evidence", "unscored"]
+RETRY: FailureRule = "retry"
+FINAL: FailureRule = "final"
+EVIDENCE: FailureRule = "evidence"
+# A gap in the benchmark's own data or judge eligibility: nothing to retry and nothing to score.
+UNSCORED: FailureRule = "unscored"
+
+
 FailureCause = Literal["infra", "model"]
 INFRA: FailureCause = "infra"
 MODEL: FailureCause = "model"
@@ -174,6 +184,45 @@ MODEL: FailureCause = "model"
 # as legacy_agent carries it to rollout collection unchanged.
 FAILURE_CAUSE_HEADER = "X-NeMo-Gym-Failure-Cause"
 
+
+FAILURE_RULES: dict[str, FailureRule] = {
+    TRANSPORT_UNREACHABLE: RETRY,
+    TRANSPORT_PEER_DROP: RETRY,
+    TRANSPORT_TIMEOUT: RETRY,
+    TRANSPORT_LOCAL_RESOURCE: RETRY,
+    AGENT_RUN_ERROR: EVIDENCE,
+    AGENT_REQUEST_FAILED: EVIDENCE,
+    AGENT_TIMEOUT: EVIDENCE,
+    AGENT_COMMAND_NOT_ALLOWED: EVIDENCE,
+    JUDGE_FAILED: RETRY,
+    # The judge, a service the model does not control, produced the verdict it could not parse.
+    JUDGE_UNPARSEABLE: RETRY,
+    VERIFIER_ERROR: EVIDENCE,
+    PROVIDER_UNAVAILABLE: RETRY,
+    PROVIDER_QUOTA_EXHAUSTED: RETRY,
+    PROVIDER_OOM_KILLED: RETRY,
+    SESSION_LOST: RETRY,
+    SESSION_EXPIRED: RETRY,
+    SESSION_RELEASE_FAILED: RETRY,
+    CANCELLED: RETRY,
+    KILL_SHAPED: RETRY,
+    SHUTDOWN: RETRY,
+    PERSISTENCE_FAILED: RETRY,
+    COHORT_INCOMPLETE: RETRY,
+    # Sidecar labels that predate this vocabulary and that Gym's own collector, servers and agents write.
+    "environment_server_failed": EVIDENCE,
+    "tau2_malformed_tool_call": FINAL,
+    "tau2_agent_error": EVIDENCE,
+    "remote_agent_error": EVIDENCE,
+    "harbor_failed": EVIDENCE,
+    "infrastructure_error": EVIDENCE,
+    "transient": RETRY,
+    "timeout_exceeded": FINAL,
+    # GDPval data and judge-eligibility gaps: the same inputs fail the same way, and the model did nothing wrong.
+    "reference_missing": UNSCORED,
+    "eval_missing": UNSCORED,
+    "transport_ineligible": UNSCORED,
+}
 
 # 401/403: a key or route the model does not control; 408/425/429 and 5xx: an overloaded or broken service.
 # Any other 4xx answers a request the model shaped, such as output that overflows the context window.
@@ -333,3 +382,21 @@ def episode_failure_cause(error: BaseException, *, terminal: bool) -> FailureCau
     if failure_cause_of(error) == INFRA:
         return INFRA
     return MODEL if terminal else INFRA
+
+
+def is_retryable(kind: str | None, *, cause: FailureCause | None) -> bool:
+    """Whether resume retries a failure of ``kind``.
+
+    An ``EVIDENCE`` kind, and a kind with no rule, is retried only with infra evidence. Without it the
+    failure is final: a failure Gym cannot place must not hand the model another attempt, and it stays
+    visible in the failure counts and the health check.
+    """
+    rule = FAILURE_RULES.get(kind, EVIDENCE)
+    if rule == EVIDENCE:
+        return cause == INFRA
+    return rule == RETRY
+
+
+def is_unscored(kind: str | None) -> bool:
+    """Whether a failure of ``kind`` is left out of the score: never retried and never counted as 0."""
+    return FAILURE_RULES.get(kind) == UNSCORED

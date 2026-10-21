@@ -1401,9 +1401,7 @@ def test_build_response_rejects_partial_caller_identity() -> None:
         _build_response(request, DEFAULT_RUN_RESULT, "test-policy", 1.0, 0.9)
 
 
-@pytest.mark.parametrize("eval_mode", [False, True], ids=["training", "evaluation"])
-def test_empty_response_reports_runtime_admission(monkeypatch: pytest.MonkeyPatch, eval_mode: bool) -> None:
-    monkeypatch.setattr("responses_api_agents.osworld_agent.app.is_eval_mode", lambda: eval_mode)
+def test_empty_response_reports_runtime_admission() -> None:
     request = OSWorldRunRequest.model_validate(
         {
             "responses_create_params": {"input": []},
@@ -1429,10 +1427,6 @@ def test_empty_response_reports_runtime_admission(monkeypatch: pytest.MonkeyPatc
     assert response.runtime_admission_reason == "rollout_error"
     assert response.runtime_admission_policy_id == RUNTIME_ADMISSION_POLICY_ID
     assert response.verifier_metadata["osworld_termination_reason"] == "rollout_error"
-    # In evaluation a masked OSWorld row is named as an infra failure, so Gym retries it. Training sees the same
-    # mask and reward as before, with no failure kind.
-    assert response.failure_kind == ("provider_unavailable" if eval_mode else None)
-    assert response.failure_reason == ("rollout_error" if eval_mode else None)
 
 
 def test_exact_trace_keeps_parser_retries_as_distinct_model_calls() -> None:

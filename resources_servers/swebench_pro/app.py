@@ -45,7 +45,7 @@ from nemo_gym.base_resources_server import (
     SimpleResourcesServer,
 )
 from nemo_gym.episode_types import EpisodeId, TaskId
-from nemo_gym.global_config import get_global_config_dict, is_eval_mode
+from nemo_gym.global_config import get_global_config_dict
 from nemo_gym.sandbox import AsyncSandbox, SandboxResources, SandboxSpec
 from nemo_gym.sandbox.access import DirectSandboxConnection, SandboxAccess
 from nemo_gym.sandbox.config import resolve_provider_config, resolve_provider_metadata
@@ -108,10 +108,6 @@ def _attempt_budget(attempt_timeout: float | None, deadline: float | None) -> fl
     if remaining is None:
         return attempt_timeout
     return min(attempt_timeout, remaining)
-
-
-class SandboxPatchExtractionError(RuntimeError):
-    """The task sandbox could not run the patch command or return its output."""
 
 
 class SWEBenchProResourcesServerConfig(BaseResourcesServerConfig):
@@ -469,22 +465,16 @@ class SWEBenchProResourcesServer(SimpleResourcesServer):
         pristine_untracked = self._session_id_to_pristine_untracked.get(session_id, frozenset())
         patch_path = f"/tmp/nemo-gym-swebench-pro-{uuid4().hex}.diff"
         try:
-            try:
-                result = await original_sandbox.exec(
-                    f"umask 077; git -C /app add -N . && git -C /app --no-pager diff {quote(base_commit)}"
-                    f" > {quote(patch_path)}"
-                )
-            except Exception as exc:
-                raise SandboxPatchExtractionError(str(exc)) from exc
+            result = await original_sandbox.exec(
+                f"umask 077; git -C /app add -N . && git -C /app --no-pager diff {quote(base_commit)}"
+                f" > {quote(patch_path)}"
+            )
             if result.return_code != 0:
                 raise RuntimeError(result.stderr or "git diff failed")
             # Command logs can drop line endings; download the patch bytes instead.
             with TemporaryDirectory(prefix="nemo-gym-swebench-pro-") as directory:
                 local_patch = Path(directory) / "model.diff"
-                try:
-                    await original_sandbox.download(patch_path, local_patch)
-                except Exception as exc:
-                    raise SandboxPatchExtractionError(str(exc)) from exc
+                await original_sandbox.download(patch_path, local_patch)
                 patch = local_patch.read_bytes().decode("utf-8", errors="replace")
             return drop_patch_sections(patch, pristine_untracked)
         finally:
@@ -515,7 +505,6 @@ class SWEBenchProResourcesServer(SimpleResourcesServer):
         ):
             raise ValueError("SWE-bench Pro task sandbox is no longer available")
         extraction_error = None
-        extraction_failed_in_sandbox = False
         if self.config.is_verifying_golden_patch:
             model_patch = body.patch
         else:
@@ -524,8 +513,6 @@ class SWEBenchProResourcesServer(SimpleResourcesServer):
             except Exception as exc:
                 model_patch = ""
                 extraction_error = f"Failed to extract model patch: {exc}"
-                # The sandbox call itself failed, so the patch was never read: an infra failure, not a 0.
-                extraction_failed_in_sandbox = isinstance(exc, SandboxPatchExtractionError)
 
         inputs = self._verification_inputs(body, model_patch)
         workspace_files, _ = assemble_workspace_files(body.instance_id, None, model_patch, asdict(inputs))
@@ -572,10 +559,6 @@ class SWEBenchProResourcesServer(SimpleResourcesServer):
                         print("Failed to stop verification sandbox", format_exc(), file=sys.stderr)
 
             reason = inconclusive_reason(result)
-            if reason is not None and result.timed_out and is_eval_mode():
-                # The tests ran and outlived their limit: the SWE-bench harness reports such an instance as
-                # unresolved, so it is the model's 0, not a verification to retry.
-                break
             if reason is not None and _budget_spent(deadline):
                 print(
                     f"Verification for {body.instance_id} gave up after {attempt} attempt(s): "
@@ -613,16 +596,6 @@ class SWEBenchProResourcesServer(SimpleResourcesServer):
             "error": extraction_error or result.error or reason,
             "log_dir": str(run_log_dir),
         }
-        # Evaluation only: training keeps the sample unmasked, as it always was.
-        if is_eval_mode() and ((reason is not None and not result.timed_out) or extraction_failed_in_sandbox):
-            # No verdict, or no patch read from the task sandbox: the sandbox failed, not the model, so the row is
-            # retried instead of scored 0. Tests that timed out are the model's unresolved 0, scored as they stand.
-            failure_reason = extraction_error if extraction_failed_in_sandbox else reason
-            response_data |= {
-                "mask_sample": True,
-                "failure_kind": "provider_unavailable",
-                "failure_reason": failure_reason,
-            }
         return SWEBenchProVerifyResponse.model_validate(response_data)
 
 

@@ -401,6 +401,19 @@ class TestTimeSplit:
         assert section["other_model_call_time_share"] == 0.6
         assert section["policy_calls_per_rollout_p50"] == 1.0
 
+    def test_a_policy_call_without_timing_makes_only_the_policy_share_unknown(self) -> None:
+        """Review finding 4338902666 on #4842: an untimed call is unknown time, not zero time."""
+        section = summarize_time_limits([timed_out(100, [timed_out_policy_call(), call(0, 20, model="judge_model")])])
+        assert section["policy_call_time_share"] is None
+        assert section["other_model_call_time_share"] == 0.2
+        assert section["untracked_time_share"] is None
+
+    def test_a_judge_call_without_timing_makes_only_the_other_model_share_unknown(self) -> None:
+        untimed_judge = {**timed_out_policy_call(), "model_ref": {"name": "judge_model"}}
+        section = summarize_time_limits([timed_out(100, [call(0, 30), untimed_judge])])
+        assert section["policy_call_time_share"] == 0.3
+        assert section["other_model_call_time_share"] is None
+
     def test_a_call_without_model_ref_is_the_policy(self) -> None:
         raw = call(0, 60)
         raw.pop("model_ref")

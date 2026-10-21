@@ -216,11 +216,21 @@ def _time_split(rows: list[Mapping[str, Any]]) -> dict[str, Any]:
         if measured and all(_tool_time_measured(row, t) for t, (row, _, _) in zip(tools, measured))
         else None
     )
+
+    def model_time_known(is_policy: bool) -> bool:
+        # A call with neither bounds nor a duration is unknown time; that category's share is then unknown too.
+        return all(
+            (c.start is not None and c.end is not None) or c.duration_s is not None
+            for _, _, calls in measured
+            for c in calls
+            if c.is_policy == is_policy
+        )
+
     unrecorded_parts = [_unrecorded_s(row, calls + t) for (row, _, calls), t in zip(measured, tools)]
     unrecorded = sum(unrecorded_parts) if measured and all(u is not None for u in unrecorded_parts) else None
     shares = {
-        "policy_call_time_share": _share(policy, total),
-        "other_model_call_time_share": _share(other, total),
+        "policy_call_time_share": _share(policy, total) if model_time_known(True) else None,
+        "other_model_call_time_share": _share(other, total) if model_time_known(False) else None,
         "tool_call_time_share": _share(tool, total) if tool is not None else None,
         "unrecorded_time_share": _share(unrecorded, total) if unrecorded is not None else None,
     }

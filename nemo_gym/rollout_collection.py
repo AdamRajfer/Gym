@@ -664,6 +664,11 @@ def _build_trajectory_record(row: dict[str, Any], result: dict[str, Any]) -> Tra
         except Exception as exc:
             gaps.append(ObservationGap(code="agent_observations_invalid", detail=type(exc).__name__))
 
+    # With neither a producer trajectory nor observations, the empty tool list below is the collector's
+    # default, not a report that no tool ran.
+    if not isinstance(raw_trajectory, dict) and raw_observations is None:
+        gaps.append(ObservationGap(code="tool_timing_unavailable"))
+
     turns.sort(key=lambda turn: (turn.timestamp, turn.invocation_id, turn.turn_no))
 
     capture = result.get("ng_model_call_capture")

@@ -29,6 +29,7 @@ from nemo_gym.rollout_collection import (
     RolloutAggregationHelper,
     RolloutCollectionConfig,
     RolloutCollectionHelper,
+    _attach_trajectory_record,
     _write_time_limit_sections,
 )
 from nemo_gym.time_limit_diagnostics import NG_ELAPSED_S_KEY, ran_out_of_time, rollout_elapsed_s, summarize_time_limits
@@ -369,6 +370,13 @@ class TestTimeSplit:
         # policy 100 of 200 s, tool 10 s, after the last call 10 s (first rollout only): 80 s untracked.
         assert section["unrecorded_time_share"] == 0.05
         assert section["untracked_time_share"] == 0.4
+
+    def test_a_trajectory_the_collector_projected_without_tool_evidence_has_no_tool_share(self) -> None:
+        """Review finding 4338902636 on #4842: the collector's empty tool list is not a measured zero."""
+        row = {**timed_out(100, [call(0, 50)], window_end=60), TASK_INDEX_KEY_NAME: 0, ROLLOUT_INDEX_KEY_NAME: 0}
+        _attach_trajectory_record({TASK_INDEX_KEY_NAME: 0, ROLLOUT_INDEX_KEY_NAME: 0}, row)
+        assert row["ng_trajectory"]["tool_calls"] == []
+        assert summarize_time_limits([row])["tool_call_time_share"] is None
 
     def test_a_row_with_no_trajectory_has_no_tool_share(self) -> None:
         section = summarize_time_limits([timed_out(100, [call(0, 50)], window_end=60)])

@@ -340,6 +340,18 @@ class TestTimeSplit:
         row = timed_out(480, [call(0, 150)], [tool(150, 151)], window_end=421)
         assert summarize_time_limits([row])["unrecorded_time_share"] == round(270 / 480, 4)
 
+    def test_a_call_after_the_agent_window_does_not_hide_its_tail(self) -> None:
+        """Review finding 4338902650 on #4842: a judge call after the window ends is not agent activity."""
+        row = timed_out(100, [call(0, 10), call(70, 90, model="judge_model")], [], window_end=60)
+        section = summarize_time_limits([row])
+        assert section["unrecorded_time_share"] == 0.5
+        assert section["other_model_call_time_share"] == 0.2
+        assert section["untracked_time_share"] == 0.2
+
+    def test_a_call_spanning_the_window_end_leaves_no_tail(self) -> None:
+        section = summarize_time_limits([timed_out(100, [call(40, 80)], [], window_end=60)])
+        assert section["unrecorded_time_share"] == 0.0
+
     def test_no_window_end_means_unknown_unrecorded_time(self) -> None:
         row = timed_out(480, [call(0, 150)], [tool(150, 151)])
         section = summarize_time_limits([row])

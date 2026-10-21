@@ -186,12 +186,23 @@ def _agent_window_end(row: Mapping[str, Any]) -> Optional[float]:
 
 
 def _unrecorded_s(row: Mapping[str, Any], events: list[_Call]) -> Optional[float]:
-    """Agent time after the last recorded call: typically a call cancelled in flight at the deadline."""
+    """Agent time after the last recorded call: typically a call cancelled in flight at the deadline.
+
+    Only calls inside the agent's window bound it: a judge call that starts after the window is not agent
+    activity, and a call spanning the window end leaves no tail. An end-only call after the window cannot
+    be placed, so the tail is then unknown.
+    """
     window_end = _agent_window_end(row)
-    ends = [call.end for call in events if call.end is not None]
-    if window_end is None or not ends:
+    if window_end is None:
         return None
-    return max(0.0, window_end - max(ends))
+    ends = []
+    for call in events:
+        if call.end is None or (call.start is not None and call.start > window_end):
+            continue
+        if call.start is None and call.end > window_end:
+            return None
+        ends.append(min(call.end, window_end))
+    return max(0.0, window_end - max(ends)) if ends else None
 
 
 def _share(part: float, whole: float) -> Optional[float]:

@@ -13,8 +13,39 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
 import shlex
 from typing import Any
+
+from omegaconf import OmegaConf
+from omegaconf.errors import OmegaConfBaseException
+
+from nemo_gym.config_types import ConfigError
+from nemo_gym.global_config import CONFIG_PATHS_KEY_NAME
+
+
+logger = logging.getLogger(__name__)
+
+
+def ray_extra(run: dict[str, Any]) -> tuple[str, ...]:
+    """`("ray",)` when a server in the run's `config_paths` declares `ray_enabled = True`, else `()`.
+
+    Ray is an optional extra, so a driver that installs Gym must add it for such a server. The check reads the
+    configs and server sources of the Gym checkout doing the submit; a config that fails to load adds nothing.
+    """
+    # Lazy: the CLI module is heavy, and only a submit that installs Gym needs it.
+    from nemo_gym.cli.env import _configured_servers
+    from nemo_gym.global_config import GlobalConfigDictParser
+    from nemo_gym.server_utils import entrypoint_ray_enabled
+
+    try:
+        _, configs = GlobalConfigDictParser().load_extra_config_paths(list(run.get(CONFIG_PATHS_KEY_NAME) or []))
+        servers = list(_configured_servers(OmegaConf.merge(*configs))) if configs else []
+    except (ConfigError, OmegaConfBaseException) as e:
+        logger.warning("Could not load the benchmark configs to check whether it needs Ray: %s", e)
+        return ()
+    uses_ray = any(entrypoint_ray_enabled(s.dir_path / s.entrypoint_fpath) is True for s in servers)
+    return ("ray",) if uses_ray else ()
 
 
 def flatten_run_args(run: dict[str, Any], prefix: str = "") -> list[str]:

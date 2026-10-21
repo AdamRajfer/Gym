@@ -59,7 +59,7 @@ from nemo_gym.orchestration.executors.script_templates import (
     render_vllm_ray_symmetric_run,
     render_write_file_from_base64,
 )
-from nemo_gym.orchestration.executors.utils import flatten_run_args
+from nemo_gym.orchestration.executors.utils import flatten_run_args, ray_extra
 
 
 _SCRIPT_TEMPLATE = """\
@@ -1055,7 +1055,9 @@ def build_sbatch_script(
         ref=gi.ref if gi else None,
         prepare_cmd=prepare_cmd,
         command=benchmark.command,
-        extras=((GYM_TELEMETRY_EXTRA,) if instrumented else ()) + exporter_extras(benchmark.run),
+        extras=((GYM_TELEMETRY_EXTRA,) if instrumented else ())
+        + exporter_extras(benchmark.run)
+        + ray_extra(benchmark.run),
     )
     prepare_command = ""
     driver_env_prefix = _resolve_env(driver_env) if driver_env else ""

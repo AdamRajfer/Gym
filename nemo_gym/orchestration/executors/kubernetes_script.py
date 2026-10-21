@@ -38,7 +38,7 @@ from nemo_gym.orchestration.executors.script_templates import (
     render_gym_cmd,
     render_write_file_from_base64,
 )
-from nemo_gym.orchestration.executors.utils import flatten_run_args
+from nemo_gym.orchestration.executors.utils import flatten_run_args, ray_extra
 
 
 GPU_RESOURCE_KEY = "nvidia.com/gpu"
@@ -237,7 +237,11 @@ def _driver_command(
         # instead (see _command_env) -- build_job_manifest merges those into the driver's env.
         gym_cmd = ""
     entrypoint = render_driver_entrypoint(
-        repo=gi.repo if gi else None, ref=gi.ref if gi else None, prepare_cmd=prepare_cmd, command=benchmark.command
+        repo=gi.repo if gi else None,
+        ref=gi.ref if gi else None,
+        prepare_cmd=prepare_cmd,
+        command=benchmark.command,
+        extras=ray_extra(benchmark.run),
     )
 
     script_lines = [

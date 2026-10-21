@@ -232,6 +232,15 @@ class SandboxCreateError(RuntimeError):
     """Raised when a provider cannot create a sandbox."""
 
 
+class SandboxPlatformEvictionError(RuntimeError):
+    """Raised when the platform, not the sandbox's own processes, ended a running sandbox.
+
+    Only for independent platform evidence: an eviction, node loss or preemption the control plane reports. A sandbox
+    that died while the model's commands ran (OOM within its own limit, a lost exec daemon, a wedged command) is not
+    this error: the model can cause those, so they are the model's.
+    """
+
+
 class SandboxCreateVerificationError(SandboxCreateError):
     """Raised when a newly-created sandbox fails provider readiness checks."""
 

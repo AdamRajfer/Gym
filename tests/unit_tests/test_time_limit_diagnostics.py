@@ -47,6 +47,39 @@ def timed_out_policy_call() -> dict:
     return {"model_ref": {"type": "responses_api_models", "name": "policy_model"}, "error_category": "timeout"}
 
 
+T0 = 1_000_000.0  # Unix time the rollout's first call starts.
+
+
+def call(start: float, end: float, *, model: str = "policy_model", tokens_out: int | None = 100) -> dict:
+    return {
+        "model_ref": {"type": "responses_api_models", "name": model},
+        "started_at": T0 + start,
+        "completed_at": T0 + end,
+        "latency_total_ms": (end - start) * 1000,
+        "tokens_out": tokens_out,
+    }
+
+
+def tool(start: float, end: float) -> dict:
+    return {"started_at": T0 + start, "completed_at": T0 + end, "duration_ms": (end - start) * 1000}
+
+
+def timed_out(
+    elapsed: float,
+    calls: list[dict],
+    tools: list[dict] | None = None,
+    window_end: float | None = None,
+    window_start: float = 0.0,
+):
+    """A rollout that ran out of its time budget, with its captured calls and, optionally, timed tool calls."""
+    row = rollout(elapsed, termination={"reason": "timeout"}, ng_model_call_capture={"calls": calls})
+    if tools is not None:
+        row["ng_trajectory"] = {"tool_calls": tools, "gaps": []}
+    if window_end is not None:
+        row["timings"] = {"agent_execution": {"started_at": T0 + window_start, "finished_at": T0 + window_end}}
+    return row
+
+
 class TestElapsed:
     @pytest.mark.parametrize(
         ("row", "expected"),
@@ -101,22 +134,23 @@ class TestDetection:
 
 
 class TestSummary:
-    def test_fields(self) -> None:
+    def test_counts_and_elapsed_without_captures(self) -> None:
         rows = [rollout(100, timed_out=True), rollout(300, timed_out=True), rollout(10), rollout(20)]
-        assert summarize_time_limits(rows) == {
-            "timed_out": 2,
-            "timed_out_share": 0.5,
-            "timed_out_elapsed_s_p50": 200.0,
-            "timed_out_elapsed_s_p95": 290.0,
-        }
+        section = summarize_time_limits(rows)
+        assert section["timed_out"] == 2
+        assert section["timed_out_share"] == 0.5
+        assert section["timed_out_elapsed_s_p50"] == 200.0
+        assert section["timed_out_elapsed_s_p95"] == 290.0
+        # No captures: nothing to split.
+        assert section["rollouts_with_captures"] == 0
+        assert section["policy_call_time_share"] is None
+        assert section["untracked_time_share"] is None
 
     def test_no_rollout_ran_out_of_time(self) -> None:
-        assert summarize_time_limits([rollout(10)]) == {
-            "timed_out": 0,
-            "timed_out_share": 0.0,
-            "timed_out_elapsed_s_p50": None,
-            "timed_out_elapsed_s_p95": None,
-        }
+        section = summarize_time_limits([rollout(10, ng_model_call_capture={"calls": [call(0, 5)]})])
+        assert section["timed_out"] == 0
+        assert section["timed_out_elapsed_s_p50"] is None
+        assert section["rollouts_with_captures"] == 0
 
     def test_no_rows(self) -> None:
         assert summarize_time_limits([])["timed_out_share"] is None
@@ -169,12 +203,9 @@ class TestWriteSections:
         assert written[0]["time_limit"]["timed_out"] == 1
         assert "time_limit" not in written[1]
         [[metrics], _] = exported.call_args
-        assert metrics == {
-            "time_limit/a/timed_out": 1,
-            "time_limit/a/timed_out_share": 1.0,
-            "time_limit/a/timed_out_elapsed_s_p50": 100.0,
-            "time_limit/a/timed_out_elapsed_s_p95": 100.0,
-        }
+        assert metrics == {f"time_limit/a/{key}": value for key, value in written[0]["time_limit"].items()}
+        assert metrics["time_limit/a/timed_out"] == 1
+        assert metrics["time_limit/a/timed_out_elapsed_s_p50"] == 100.0
 
     def test_a_broken_section_never_fails_the_run(self, tmp_path: Path) -> None:
         fpath = _metrics_file(tmp_path, [{AGENT_REF_KEY_NAME: {"name": "a"}, NG_ENVIRONMENT_SERVER_KEY: "e"}])
@@ -265,3 +296,112 @@ async def test_run_examples_output_is_unchanged(monkeypatch: pytest.MonkeyPatch)
 
     assert results == [reply, reply]
     summarize.assert_not_called()
+
+
+class TestTimeSplit:
+    def test_every_field(self) -> None:
+        # 100 s rollouts: policy 0-40 and 40-70 s (10 and 20 tokens/s), a tool 70-75 s, the agent window
+        # ends at 85 s; the other 15 s are setup and verification, which no field names.
+        rows = [
+            timed_out(
+                100,
+                [call(0, 40, tokens_out=400), call(40, 70, tokens_out=600)],
+                [tool(70, 75)],
+                window_end=85,
+            )
+            for _ in range(2)
+        ] + [rollout(10, ng_model_call_capture={"calls": [call(0, 1)]})]
+        assert summarize_time_limits(rows) == {
+            "timed_out": 2,
+            "timed_out_share": round(2 / 3, 4),
+            "timed_out_elapsed_s_p50": 100.0,
+            "timed_out_elapsed_s_p95": 100.0,
+            "rollouts_with_captures": 2,
+            "policy_call_time_share": 0.7,
+            "other_model_call_time_share": 0.0,
+            "tool_call_time_share": 0.05,
+            "unrecorded_time_share": 0.1,
+            "untracked_time_share": 0.15,
+            "policy_e2e_output_tokens_per_s_p50": 15.0,
+            "policy_e2e_output_tokens_per_s_p5": 10.0,
+            "policy_calls_per_rollout_p50": 2.0,
+            "policy_calls_per_rollout_p95": 2.0,
+        }
+
+    def test_setup_before_the_first_call_is_not_unrecorded(self) -> None:
+        # 300 s of setup, then calls until the window ends: nothing after the last call is unrecorded.
+        row = timed_out(400, [call(300, 390)], [tool(390, 400)], window_end=400)
+        section = summarize_time_limits([row])
+        assert section["unrecorded_time_share"] == 0.0
+        assert section["untracked_time_share"] == round(1 - 90 / 400 - 10 / 400, 4)
+
+    def test_time_after_the_last_call_is_unrecorded(self) -> None:
+        # The call in flight at the deadline was cancelled before the capture wrote it.
+        row = timed_out(480, [call(0, 150)], [tool(150, 151)], window_end=421)
+        assert summarize_time_limits([row])["unrecorded_time_share"] == round(270 / 480, 4)
+
+    def test_no_window_end_means_unknown_unrecorded_time(self) -> None:
+        row = timed_out(480, [call(0, 150)], [tool(150, 151)])
+        section = summarize_time_limits([row])
+        assert section["unrecorded_time_share"] is None
+        assert section["untracked_time_share"] is None
+
+    def test_an_empty_tool_call_list_is_zero_tool_time(self) -> None:
+        # The agent reported its tool calls and there were none: a measured zero, not an unknown share.
+        rows = [
+            timed_out(100, [call(0, 50)], [], window_end=60),
+            timed_out(100, [call(0, 50)], [tool(50, 60)], window_end=60),
+        ]
+        section = summarize_time_limits(rows)
+        assert section["tool_call_time_share"] == 0.05
+        # policy 100 of 200 s, tool 10 s, after the last call 10 s (first rollout only): 80 s untracked.
+        assert section["unrecorded_time_share"] == 0.05
+        assert section["untracked_time_share"] == 0.4
+
+    def test_a_row_with_no_trajectory_has_no_tool_share(self) -> None:
+        section = summarize_time_limits([timed_out(100, [call(0, 50)], window_end=60)])
+        assert section["tool_call_time_share"] is None
+        assert section["untracked_time_share"] is None
+
+    def test_reported_tool_timing_gap_means_no_tool_share(self) -> None:
+        row = timed_out(100, [call(0, 50)], [tool(50, 60)], window_end=60)
+        row["ng_trajectory"]["gaps"] = [{"code": "tool_timing_unavailable"}]
+        assert summarize_time_limits([row])["tool_call_time_share"] is None
+
+    def test_tool_calls_without_any_timing_have_no_tool_share(self) -> None:
+        # A harness that records which tools ran but not when: no measured tool time, so no zero share.
+        row = timed_out(100, [call(0, 50)], [{"tool_call_id": "a"}, {"tool_call_id": "b"}], window_end=60)
+        assert summarize_time_limits([row])["tool_call_time_share"] is None
+
+    def test_a_tool_end_time_alone_still_bounds_unrecorded_time(self) -> None:
+        # Only completed_at is known: no tool share, but the tool's end is the last recorded event.
+        row = timed_out(480, [call(0, 150)], [{"completed_at": T0 + 151}], window_end=421)
+        section = summarize_time_limits([row])
+        assert section["tool_call_time_share"] is None
+        assert section["unrecorded_time_share"] == round(270 / 480, 4)
+
+    def test_one_rollout_without_tool_timing_makes_the_share_unknown(self) -> None:
+        rows = [timed_out(100, [call(0, 50)], [tool(50, 60)], window_end=60), timed_out(100, [call(0, 50)])]
+        assert summarize_time_limits(rows)["tool_call_time_share"] is None
+
+    def test_overlapping_calls_count_once_and_never_exceed_elapsed(self) -> None:
+        # Two parallel subagent calls cover 0-60 s together.
+        assert summarize_time_limits([timed_out(50, [call(0, 40), call(20, 60)])])["policy_call_time_share"] == 1.0
+        assert summarize_time_limits([timed_out(100, [call(0, 40), call(20, 60)])])["policy_call_time_share"] == 0.6
+
+    def test_a_call_without_timestamps_counts_its_duration(self) -> None:
+        raw = {"model_ref": {"name": "policy_model"}, "latency_total_ms": 30000, "tokens_out": 300}
+        section = summarize_time_limits([timed_out(60, [raw])])
+        assert section["policy_call_time_share"] == 0.5
+        assert section["policy_e2e_output_tokens_per_s_p50"] == 10.0
+
+    def test_judge_calls_are_other_model_calls(self) -> None:
+        section = summarize_time_limits([timed_out(100, [call(0, 10), call(10, 70, model="judge_model")])])
+        assert section["policy_call_time_share"] == 0.1
+        assert section["other_model_call_time_share"] == 0.6
+        assert section["policy_calls_per_rollout_p50"] == 1.0
+
+    def test_a_call_without_model_ref_is_the_policy(self) -> None:
+        raw = call(0, 60)
+        raw.pop("model_ref")
+        assert summarize_time_limits([timed_out(100, [raw])])["policy_call_time_share"] == 0.6

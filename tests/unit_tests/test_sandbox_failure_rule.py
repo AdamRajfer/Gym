@@ -23,9 +23,11 @@ or with platform evidence (``SandboxPlatformEvictionError``: an eviction, node l
 import pytest
 
 from nemo_gym.failure_kinds import INFRA, MODEL, failure_cause_of, failure_cause_of_text
+from nemo_gym.global_config import ROLLOUT_INDEX_KEY_NAME, TASK_INDEX_KEY_NAME
 from nemo_gym.rollout_collection import (
     NG_FAILURE_CAUSE_KEY,
     NG_FAILURE_CLASS_KEY,
+    _infra_unresolved_counts,
     _masked_result_names_infra,
     is_terminal_failure,
 )
@@ -133,3 +135,29 @@ class TestProviderMasksNeedAnExplicitInfraCause:
 
     def test_other_retried_kinds_keep_naming_infra(self) -> None:
         assert _masked_result_names_infra({"mask_sample": True, "failure_kind": "judge_failed"})
+
+
+class TestAMaskWithNoReasonIsUnresolvedInEvaluation:
+    RESULTS = [
+        {TASK_INDEX_KEY_NAME: 0, ROLLOUT_INDEX_KEY_NAME: 0, "reward": 1.0},
+        {TASK_INDEX_KEY_NAME: 1, ROLLOUT_INDEX_KEY_NAME: 0, "reward": 0.0, "mask_sample": True},
+        {
+            TASK_INDEX_KEY_NAME: 2,
+            ROLLOUT_INDEX_KEY_NAME: 0,
+            "reward": 0.0,
+            "mask_sample": True,
+            "mask_reason": "budget",
+        },
+    ]
+    SCORED = {(0, 0), (1, 0), (2, 0)}
+
+    def test_a_silent_mask_counts_as_unresolved_in_evaluation(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr("nemo_gym.rollout_collection.is_eval_mode", lambda: True)
+        # The mask with no reason is owed a score it never got; the budget mask is the model's 0.
+        counts = _infra_unresolved_counts({}, {}, self.SCORED, expected=3, missing=0, results=self.RESULTS)
+        assert counts == (1, 3)
+
+    def test_training_keeps_a_silent_mask_out_of_the_count(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr("nemo_gym.rollout_collection.is_eval_mode", lambda: False)
+        counts = _infra_unresolved_counts({}, {}, self.SCORED, expected=3, missing=0, results=self.RESULTS)
+        assert counts == (0, 3)

@@ -96,6 +96,7 @@ from nemo_gym.global_config import (
     environment_server_agent_names,
     environment_server_attributed_agent,
     get_global_config_dict,
+    is_eval_mode,
     label_runs,
     pairing_override_enabled,
     resolve_dataset_agent,
@@ -2249,11 +2250,18 @@ def _infra_unresolved_counts(
     expected: int,
     missing: int,
     retry_terminal_timeouts: bool = False,
+    results: Iterable[Mapping[str, Any]] = (),
 ) -> Tuple[int, int]:
-    """``(unresolved, owed)``: infra failures still retryable plus missing rollouts, over the rollouts owed a score."""
+    """``(unresolved, owed)``: infra failures still retryable plus missing rollouts, over the rollouts owed a score.
+
+    In evaluation a scored result masked with no reason is unresolved too: aggregation leaves it out of the score,
+    so without this it would vanish from the run's completeness while the run still read as complete.
+    """
     max_attempts = _get_max_rollout_attempts()
     scored = set(scored_keys)
     unresolved = left_out = 0
+    if is_eval_mode():
+        unresolved += sum(1 for result in results if result.get(MASK_SAMPLE_KEY) and not result.get(MASK_REASON_KEY))
     for key, row in latest_rows.items():
         if key in scored:
             continue
@@ -4115,6 +4123,7 @@ class RolloutCollectionHelper(BaseModel):
                 expected=expected_rollouts,
                 missing=len(no_row),
                 retry_terminal_timeouts=config.retry_terminal_timeouts,
+                results=persisted_results,
             )
             completeness = await asyncio.to_thread(
                 _annotate_infra_unresolved,
@@ -5128,6 +5137,7 @@ class RolloutAggregationHelper(BaseModel):
             # A failure another shard recovered is not owed a second time.
             expected=len(results) + len(set(latest_failures) - result_ids) + len(unaccounted),
             missing=len(unaccounted),
+            results=results,
         )
         completeness = _annotate_infra_unresolved(
             aggregate_metrics_fpath, _infra_unresolved_metrics(unresolved, owed, no_score=no_score)

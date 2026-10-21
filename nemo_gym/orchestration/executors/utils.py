@@ -40,12 +40,24 @@ def ray_extra(run: dict[str, Any]) -> tuple[str, ...]:
 
     try:
         _, configs = GlobalConfigDictParser().load_extra_config_paths(list(run.get(CONFIG_PATHS_KEY_NAME) or []))
-        servers = list(_configured_servers(OmegaConf.merge(*configs))) if configs else []
+        servers = []
+        if configs:
+            merged = OmegaConf.to_container(OmegaConf.merge(*configs), resolve=False)
+            servers = list(_configured_servers(OmegaConf.create(_without_empty_mappings(merged))))
     except (ConfigError, OmegaConfBaseException) as e:
         logger.warning("Could not load the benchmark configs to check whether it needs Ray: %s", e)
         return ()
     uses_ray = any(entrypoint_ray_enabled(s.dir_path / s.entrypoint_fpath) is True for s in servers)
     return ("ray",) if uses_ray else ()
+
+
+def _without_empty_mappings(value: object) -> object:
+    """`value` without empty mappings, which hold no server. Runtime drops empty `_inherit_from` templates before
+    it lists servers, and the server listing indexes the first key of every mapping."""
+    if isinstance(value, dict):
+        pruned = {key: _without_empty_mappings(item) for key, item in value.items()}
+        return {key: item for key, item in pruned.items() if item != {}}
+    return value
 
 
 def flatten_run_args(run: dict[str, Any], prefix: str = "") -> list[str]:

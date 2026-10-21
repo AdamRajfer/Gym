@@ -102,3 +102,15 @@ def test_a_config_that_does_not_load_keeps_the_plain_install(tmp_path, monkeypat
     config_path = _write_ray_server(tmp_path, "      addresses: [unclosed\n")
 
     assert _PLAIN_INSTALL in _slurm_script(_config([config_path]))
+
+
+@pytest.mark.parametrize(
+    ("config_path", "expected"),
+    [("benchmarks/gpqa/config.yaml", _PLAIN_INSTALL), ("benchmarks/wmt24pp/config.yaml", _RAY_INSTALL)],
+)
+def test_an_empty_inherited_template_does_not_break_rendering(tmp_path, config_path, expected):
+    # Runtime consumes an empty `_inherit_from` template before it lists servers; detection must accept it too.
+    overlay = tmp_path / "overlay.yaml"
+    overlay.write_text("empty_defaults: {}\nresponses_create_params:\n  _inherit_from: empty_defaults\n")
+
+    assert expected in _slurm_script(_config([config_path, str(overlay)]))

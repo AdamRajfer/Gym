@@ -27,7 +27,7 @@ from nemo_gym.base_resources_server import (
     ReverifyMode,
     SimpleResourcesServer,
 )
-from nemo_gym.config_types import Domain, ModelServerRef
+from nemo_gym.config_types import AggregateMetrics, AggregateMetricsRequest, Domain, ModelServerRef
 from nemo_gym.global_config import is_eval_mode
 from nemo_gym.judge import JudgeError
 from nemo_gym.openai_utils import (
@@ -379,6 +379,18 @@ class ArenaResourcesServer(SimpleResourcesServer):
     def get_key_metrics(self, agent_metrics: dict[str, Any]) -> dict[str, Any]:
         """NeMo Gym hook for the compact metrics summary."""
         return self._metrics.get_key_metrics(agent_metrics)
+
+    async def aggregate_metrics(self, body: AggregateMetricsRequest) -> AggregateMetrics:
+        """Past the failed-rollout gate no reward is a measurement: withhold the repeat summaries too."""
+        result = await super().aggregate_metrics(body)
+        if result.agent_metrics.get("failed_rollout_gate"):
+            for metrics in (result.agent_metrics, result.key_metrics):
+                metrics.update({key: None for key, value in metrics.items() if "reward" in key and value is not None})
+            result.repeat_level_metrics = [
+                {key: value for key, value in level.items() if "reward" not in key}
+                for level in result.repeat_level_metrics
+            ]
+        return result
 
 
 if __name__ == "__main__":

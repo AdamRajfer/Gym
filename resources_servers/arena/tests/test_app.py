@@ -1379,6 +1379,30 @@ class TestArenaResourcesServer:
         assert metrics["rollout_failure_rate"] == approx(0.75)
         assert metrics["failed_rollout_gate"] is True
 
+    async def test_past_the_gate_no_repeat_level_reward_is_published(
+        self, server: ArenaResourcesServer, eval_mode: None
+    ):
+        """Repeated rollouts: the per-repeat reward summaries are a score too and must be withheld past the gate."""
+        good = self._rollout("[[A>B]]", "[[B>A]]", reward=1.0)
+        failed = {"reward": 0.0, "policy_answer": None, "policy_reasoning": "", "baseline_answer": "b", "games": None}
+        rows = [
+            {**row, "_ng_task_index": task, "_ng_rollout_index": repeat, "response": {}}
+            for task, row_pair in enumerate(([good, good], [failed, failed]))
+            for repeat, row in enumerate(row_pair)
+        ]
+
+        metrics = await server.aggregate_metrics(AggregateMetricsRequest(verify_responses=rows))
+
+        assert metrics.agent_metrics["failed_rollout_gate"] is True
+        published = {**metrics.agent_metrics, **metrics.key_metrics}
+        assert not [key for key, value in published.items() if "reward" in key and isinstance(value, float)]
+        assert not [
+            key
+            for level in metrics.repeat_level_metrics
+            for key, value in level.items()
+            if "reward" in key and isinstance(value, float)
+        ]
+
     def test_below_the_gate_the_score_is_published(self, server: ArenaResourcesServer, eval_mode: None):
         """Nothing changes below the gate: the win rate is there and the verdict is false."""
         good = self._rollout("[[A>B]]", "[[B>A]]", reward=1.0)

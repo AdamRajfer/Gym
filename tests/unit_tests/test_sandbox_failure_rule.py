@@ -23,7 +23,12 @@ or with platform evidence (``SandboxPlatformEvictionError``: an eviction, node l
 import pytest
 
 from nemo_gym.failure_kinds import INFRA, MODEL, failure_cause_of, failure_cause_of_text
-from nemo_gym.rollout_collection import NG_FAILURE_CLASS_KEY, is_terminal_failure
+from nemo_gym.rollout_collection import (
+    NG_FAILURE_CAUSE_KEY,
+    NG_FAILURE_CLASS_KEY,
+    _masked_result_names_infra,
+    is_terminal_failure,
+)
 from nemo_gym.sandbox.providers.base import (
     SandboxCreateError,
     SandboxOperationTimeoutError,
@@ -110,3 +115,21 @@ class TestPlatformEvidenceAndCreateStayInfra:
             "infrastructure_error": "SandboxCreateError",
         }
         assert not is_terminal_failure(row)
+
+
+class TestProviderMasksNeedAnExplicitInfraCause:
+    """A ``provider_*`` mask is the producer's claim that the provider failed; only an explicit cause makes it infra."""
+
+    @pytest.mark.parametrize("kind", ["provider_unavailable", "provider_oom_killed", "provider_quota_exhausted"])
+    def test_a_provider_mask_without_a_cause_does_not_name_infra(self, kind: str) -> None:
+        # A sandbox the model OOM-killed, reported as the provider's: no evidence the platform failed.
+        result = {"mask_sample": True, "failure_kind": kind, "failure_reason": "Sandbox has ended (OOMKilled)"}
+        assert not _masked_result_names_infra(result)
+
+    @pytest.mark.parametrize("kind", ["provider_unavailable", "provider_oom_killed"])
+    def test_a_provider_mask_with_an_explicit_infra_cause_is_retried(self, kind: str) -> None:
+        result = {"mask_sample": True, "failure_kind": kind, NG_FAILURE_CAUSE_KEY: INFRA}
+        assert _masked_result_names_infra(result)
+
+    def test_other_retried_kinds_keep_naming_infra(self) -> None:
+        assert _masked_result_names_infra({"mask_sample": True, "failure_kind": "judge_failed"})

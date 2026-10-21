@@ -66,6 +66,9 @@ from nemo_gym.failure_kinds import (
     INFRA,
     JUDGE_FAILED,
     MODEL,
+    PROVIDER_OOM_KILLED,
+    PROVIDER_QUOTA_EXHAUSTED,
+    PROVIDER_UNAVAILABLE,
     RETRY,
     RETRY_THEN_UNSCORED,
     failure_cause_of_text,
@@ -1692,10 +1695,17 @@ def _masked_result_names_infra(result: Mapping[str, Any]) -> bool:
         return cause == INFRA
     if result.get(MASK_REASON_KEY) == MASK_REASON_BUDGET:
         return False
+    # A provider mask is the producer's claim that its sandbox or provider failed. A sandbox the model's own
+    # commands broke reads the same, so only an explicit infra cause (set on platform evidence) makes it a retry.
+    if result.get("failure_kind") in _PROVIDER_MASK_KINDS:
+        return False
     rule = FAILURE_RULES.get(result.get("failure_kind"))
     if rule in (RETRY, FINAL):
         return rule == RETRY
     return failure_cause_of_text(_failure_text(result)) == INFRA
+
+
+_PROVIDER_MASK_KINDS = frozenset({PROVIDER_UNAVAILABLE, PROVIDER_OOM_KILLED, PROVIDER_QUOTA_EXHAUSTED})
 
 
 def failure_cause_of_row(record: Mapping[str, Any]) -> str:

@@ -66,9 +66,19 @@ class TestMaskedRows:
         assert (counted["reward"], counted["mask_sample"]) == (0.0, False)
 
     def test_an_osworld_infra_mask_is_retried(self) -> None:
-        # An OSWorld evaluator browser timeout, as OSWorld now names it.
-        result = {"mask_sample": True, "failure_kind": "provider_unavailable", "failure_reason": "evaluator_error"}
+        # An OSWorld provider failure, named with the infra cause OSWorld sets on platform evidence.
+        result = {
+            "mask_sample": True,
+            "failure_kind": "provider_unavailable",
+            "failure_reason": "environment_start_failed",
+            "_ng_failure_cause": "infra",
+        }
         assert _masked_result_names_infra(result)
+
+    def test_an_osworld_provider_mask_without_a_cause_is_not_retried(self) -> None:
+        # An evaluator that broke on the VM the model left behind: the producer's provider claim is no evidence.
+        result = {"mask_sample": True, "failure_kind": "provider_unavailable", "failure_reason": "evaluator_error"}
+        assert not _masked_result_names_infra(result)
 
 
 class TestCheckCompletion:

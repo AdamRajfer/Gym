@@ -35,6 +35,7 @@ from nemo_gym.sandbox.providers.base import (
     SandboxEndpoint,
     SandboxExecResult,
     SandboxHandle,
+    SandboxOperationTimeoutError,
     SandboxPtyError,
     SandboxPtySession,
     SandboxPtySpec,
@@ -1225,7 +1226,7 @@ class OpenSandboxProvider:
         try:
             return await asyncio.wait_for(awaitable, timeout=timeout_s)
         except asyncio.TimeoutError as e:
-            raise TimeoutError(
+            raise SandboxOperationTimeoutError(
                 f"Timed out during OpenSandbox {operation} after {timeout_s:g}s; sandbox_id={sandbox_id!r}"
             ) from e
 

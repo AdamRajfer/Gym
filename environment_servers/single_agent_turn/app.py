@@ -36,6 +36,7 @@ from nemo_gym.config_types import (
     AggregateMetricsRequest,
     ResourcesServerRef,
 )
+from nemo_gym.failure_kinds import episode_failure_cause
 from nemo_gym.global_config import (
     TOKEN_ID_CAPTURE_BLOCK,
     get_first_server_config_dict,
@@ -203,6 +204,7 @@ class SingleAgentTurnEnvironmentServer(BaseEnvironmentServer[SingleAgentTurnRequ
                         stage="cleanup",
                         failure_reason=str(error),
                         terminal=not _is_retryable_dependency_error(error),
+                        error=error,
                         partial_response=agent_response,
                     ) from error
             observations = close.agent_observations
@@ -276,6 +278,7 @@ class SingleAgentTurnEnvironmentServer(BaseEnvironmentServer[SingleAgentTurnRequ
                 stage="seed",
                 failure_reason=str(error),
                 terminal=not _is_retryable_dependency_error(error),
+                error=error,
             ) from error
         return seed
 
@@ -356,6 +359,7 @@ class SingleAgentTurnEnvironmentServer(BaseEnvironmentServer[SingleAgentTurnRequ
                 stage="agent",
                 failure_reason=str(error),
                 terminal=not _is_retryable_dependency_error(error),
+                error=error,
             ) from error
 
     async def _invoke_agent(self, request: SingleAgentTurnRequest, handles: "SessionHandles") -> NeMoGymResponse:
@@ -379,6 +383,7 @@ class SingleAgentTurnEnvironmentServer(BaseEnvironmentServer[SingleAgentTurnRequ
                 stage="agent",
                 failure_reason=str(error),
                 terminal=not _is_retryable_dependency_error(error),
+                error=error,
             ) from error
 
     async def _close_agent(
@@ -448,6 +453,7 @@ class SingleAgentTurnEnvironmentServer(BaseEnvironmentServer[SingleAgentTurnRequ
                 stage="verification",
                 failure_reason=str(error),
                 terminal=not _is_retryable_dependency_error(error),
+                error=error,
                 partial_response=agent_response,
                 agent_observations=observations,
             ) from error
@@ -472,6 +478,7 @@ class SingleAgentTurnEnvironmentServer(BaseEnvironmentServer[SingleAgentTurnRequ
         terminal: bool,
         partial_response: Any = None,
         agent_observations: Any = None,
+        error: BaseException | None = None,
     ) -> HandledEpisodeError:
         return HandledEpisodeError(
             SingleAgentTurnFailure(
@@ -480,7 +487,8 @@ class SingleAgentTurnEnvironmentServer(BaseEnvironmentServer[SingleAgentTurnRequ
                 terminal=terminal,
                 partial_response=partial_response,
                 agent_observations=agent_observations,
-            )
+            ),
+            cause=episode_failure_cause(error, terminal=terminal) if error is not None else None,
         )
 
 

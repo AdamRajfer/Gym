@@ -51,9 +51,12 @@ from nemo_gym.rollout_collection import (
     _CompletedRollout,
     _counted_failure_row,
     _failure_rows_counted_as_zero,
+    _infra_unresolved_counts,
+    _infra_unresolved_metrics,
     _masked_result_names_infra,
     failure_cause_of_row,
     failures_path_for,
+    is_infra_unresolved,
     is_terminal_failure,
 )
 from nemo_gym.server_utils import BaseServerConfig, ServerClient, SimpleServer
@@ -510,6 +513,138 @@ class TestTau2LeavesOutWhatItReruns:
         assert _failure_rows_counted_as_zero([failures], None, set()) == []
 
 
+class TestInfraUnresolved:
+    """Infra failures that persist are left out of the score and counted; their rows stay non-terminal."""
+
+    def _rows(self) -> dict:
+        return {
+            (0, 0): {NG_FAILURE_CLASS_KEY: "judge_failed"},  # infra, retryable
+            (1, 0): {NG_FAILURE_CLASS_KEY: "timeout_exceeded"},  # final model failure
+            (2, 0): {NG_FAILURE_CLASS_KEY: "reference_missing"},  # data gap, left out by method
+            (3, 0): {NG_FAILURE_CLASS_KEY: "tau2_context_overflow"},  # left out by method
+        }
+
+    @pytest.mark.parametrize(
+        ("failure_class", "unresolved"),
+        [("judge_failed", 2), ("tau2_malformed_tool_call", 0)],
+        ids=["infra-unresolved", "left-out-by-method"],
+    )
+    async def test_a_fully_unscored_settled_run_finishes_and_reports_incomplete(
+        self,
+        failure_class: str,
+        unresolved: int,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture,
+    ) -> None:
+        """Nothing is left to do: the run must finish, with no score, incomplete and not publishable."""
+        monkeypatch.setenv("NEMO_GYM_MAX_ROLLOUT_ATTEMPTS", "1")
+        monkeypatch.setattr("nemo_gym.rollout_collection.get_global_config_dict", lambda *args, **kwargs: {})
+        output = tmp_path / "out.jsonl"
+        row = {"responses_create_params": {"input": []}, "agent_ref": {"name": "agent"}}
+        (tmp_path / "in.jsonl").write_bytes(orjson.dumps(row) + b"\n" + orjson.dumps(row) + b"\n")
+
+        class Helper(RolloutCollectionHelper):
+            def _run_examples_with_metadata(self, examples, *args, **kwargs):
+                futures = []
+                for example in examples:
+                    future = asyncio.get_event_loop().create_future()
+                    result = {NG_FAILURE_CLASS_KEY: failure_class}
+                    future.set_result(_CompletedRollout(row=example, result=result, rollout_latency_ms=None))
+                    futures.append(future)
+                return futures
+
+            async def _call_aggregate_metrics(self, results, rows, output_fpath, *, raise_on_error=True):
+                assert not results, "nothing is scored, so no server is asked to aggregate"
+                return None
+
+        config = RolloutCollectionConfig(
+            input_jsonl_fpath=str(tmp_path / "in.jsonl"),
+            output_jsonl_fpath=str(output),
+            disable_health_check=True,
+            require_complete=True,
+        )
+        await Helper().run_from_config(config)
+
+        [entry] = orjson.loads(output.with_name("out_aggregate_metrics.json").read_bytes())
+        assert entry["agent_ref"] == {"name": "agent"}
+        for metrics in (entry["agent_metrics"], entry["key_metrics"]):
+            assert "mean/reward" not in metrics
+            assert metrics["rollouts_complete"] is False and metrics["publishable"] is False
+            assert metrics["rollouts_infra_unresolved"] == unresolved
+        printed = capsys.readouterr().out
+        assert f"{unresolved} rows unresolved for infra" in printed and "resubmit" not in printed
+
+    def test_only_retryable_infra_and_missing_rollouts_are_unresolved(self) -> None:
+        unresolved, owed = _infra_unresolved_counts(self._rows(), {}, set(), expected=10, missing=1)
+        # The judge failure and the missing rollout; owed excludes the two rows left out by method.
+        assert (unresolved, owed) == (2, 8)
+
+    def test_final_and_method_left_out_rows_are_not_unresolved(self) -> None:
+        assert is_infra_unresolved({NG_FAILURE_CLASS_KEY: "judge_failed"})
+        assert not is_infra_unresolved({NG_FAILURE_CLASS_KEY: "timeout_exceeded"})
+        assert not is_infra_unresolved({NG_FAILURE_CLASS_KEY: "reference_missing"})
+        assert not is_infra_unresolved({NG_FAILURE_CLASS_KEY: "tau2_malformed_tool_call"})
+
+    def test_a_rerun_the_method_still_owes_leaves_the_run_incomplete(self) -> None:
+        """Tau2 reruns a malformed or empty episode: pending below the cap, left out once the cap is reached."""
+        rows = {(0, 0): {NG_FAILURE_CLASS_KEY: "tau2_malformed_tool_call"}}
+        assert _infra_unresolved_counts(rows, {(0, 0): 1}, set(), expected=1, missing=0) == (1, 1)
+        assert _infra_unresolved_counts(rows, {(0, 0): 3}, set(), expected=1, missing=0) == (0, 0)
+
+    @pytest.mark.parametrize(
+        ("config_path", "key", "value"),
+        [
+            # Terminal-Bench 4 scores an errored trial as 0; SWE-bench Pro scores an evaluation error as unresolved.
+            ("benchmarks/terminal_bench_4/resources.yaml", "count_infra_unresolved_as_zero", True),
+            ("benchmarks/swebench/pro/opencode.yaml", "count_infra_unresolved_as_zero", True),
+            ("benchmarks/swebench/pro/hermes.yaml", "count_infra_unresolved_as_zero", True),
+            # LMArena counts a judge failure at the cap against its failed-rollout gate.
+            ("benchmarks/lmarena_v2/config.yaml", "count_failure_classes_as_zero", ["judge_failed"]),
+            ("benchmarks/lmarena_v3/config.yaml", "count_failure_classes_as_zero", ["judge_failed"]),
+        ],
+    )
+    def test_benchmark_configs_set_their_official_rule(self, config_path: str, key: str, value) -> None:
+        config = OmegaConf.load(Path(__file__).parents[2] / config_path)
+        assert OmegaConf.to_container(config)[key] == value
+        RolloutCollectionConfig.model_validate(
+            {"input_jsonl_fpath": "in.jsonl", "output_jsonl_fpath": "out.jsonl", key: value}
+        )
+
+    @pytest.mark.parametrize(
+        ("unresolved", "owed", "publishable"),
+        [(0, 100, True), (2, 100, True), (3, 100, False)],
+    )
+    def test_publishable_is_the_rate_against_the_limit(self, unresolved: int, owed: int, publishable: bool) -> None:
+        fields = _infra_unresolved_metrics(unresolved, owed)
+        assert fields["publishable"] is publishable
+        assert fields["rollouts_complete"] is (unresolved == 0)
+        assert fields["rollouts_infra_unresolved_rate"] == unresolved / owed
+
+    def test_a_row_left_out_at_the_cap_stays_non_terminal_so_a_fresh_budget_dispatches_it(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A capped infra row stays non-terminal, so a fresh attempt budget dispatches it again."""
+        output = tmp_path / "out.jsonl"
+        output.write_bytes(b"")
+        rows = [{"responses_create_params": {"input": []}, TASK_INDEX_KEY_NAME: 0, ROLLOUT_INDEX_KEY_NAME: 0}]
+        config = RolloutCollectionConfig(
+            input_jsonl_fpath=str(tmp_path / "in.jsonl"), output_jsonl_fpath=str(output), resume_from_cache=True
+        )
+        config.materialized_jsonl_fpath.write_bytes(b"".join(orjson.dumps(row) + b"\n" for row in rows))
+        failure = {TASK_INDEX_KEY_NAME: 0, ROLLOUT_INDEX_KEY_NAME: 0, NG_FAILURE_CLASS_KEY: "judge_failed"}
+        failures_path_for(output).write_bytes(b"".join(orjson.dumps(failure) + b"\n" for _ in range(3)))
+        assert not is_terminal_failure(failure)
+
+        monkeypatch.setenv("NEMO_GYM_MAX_ROLLOUT_ATTEMPTS", "3")
+        at_the_cap, *_ = RolloutCollectionHelper()._load_from_cache(config)
+        assert at_the_cap == []
+        # With a fresh attempt budget the row is dispatched again.
+        monkeypatch.setenv("NEMO_GYM_MAX_ROLLOUT_ATTEMPTS", "6")
+        redispatched, *_ = RolloutCollectionHelper()._load_from_cache(config)
+        assert [row[TASK_INDEX_KEY_NAME] for row in redispatched] == [0]
+
+
 class TestScoringDefaults:
     """Every failed rollout counts as 0 by default; opting out leaves only final failures counted."""
 
@@ -522,13 +657,16 @@ class TestScoringDefaults:
         failures.write_bytes(b"".join(orjson.dumps(row) + b"\n" for row in rows))
         return failures
 
-    def test_the_default_counts_every_failure(self, tmp_path: Path) -> None:
+    def test_the_default_counts_every_final_failure_and_leaves_infra_out(self, tmp_path: Path) -> None:
         config = RolloutCollectionConfig(input_jsonl_fpath="in.jsonl", output_jsonl_fpath="out.jsonl")
         assert config.count_failure_classes_as_zero is None
+        assert config.count_missing_rollouts_as_zero is False
+        assert config.count_infra_unresolved_as_zero is False
         assert config.route_failures_to_sidecar is True
 
+        # The final model failure counts as 0; the judge failure is unresolved infra, left out.
         counted = _failure_rows_counted_as_zero([self._sidecar(tmp_path)], None, set())
-        assert sorted(row[TASK_INDEX_KEY_NAME] for row in counted) == [0, 1]
+        assert sorted(row[TASK_INDEX_KEY_NAME] for row in counted) == [0]
 
     def test_the_default_leaves_a_data_gap_out_of_the_score(self, tmp_path: Path) -> None:
         failures = self._sidecar(tmp_path)
@@ -537,7 +675,7 @@ class TestScoringDefaults:
         config = RolloutCollectionConfig(input_jsonl_fpath="in.jsonl", output_jsonl_fpath="out.jsonl")
 
         counted = _failure_rows_counted_as_zero([failures], config.count_failure_classes_as_zero, set())
-        assert sorted(row[TASK_INDEX_KEY_NAME] for row in counted) == [0, 1]
+        assert sorted(row[TASK_INDEX_KEY_NAME] for row in counted) == [0]
 
     def test_opting_out_still_counts_a_final_failure(self, tmp_path: Path) -> None:
         counted = _failure_rows_counted_as_zero([self._sidecar(tmp_path)], [], set())

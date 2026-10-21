@@ -1266,7 +1266,9 @@ class TestArenaResourcesServer:
         warnings = [r for r in caplog.records if "max_rollout_failure_rate" in r.getMessage()]
         assert len(warnings) == 1 and "33.3%" in warnings[0].getMessage()
 
-    async def _collect(self, server, tmp_path, monkeypatch, failure_rows: int, attempts_recorded: int) -> list:
+    async def _collect(
+        self, server, tmp_path, monkeypatch, failure_rows: int, attempts_recorded: int, **overrides
+    ) -> list:
         """Run rollout collection to its end, with Arena's real aggregation, on a sidecar of judge failures.
 
         Two rollouts score; ``failure_rows`` judge failures (plain ``judge_failed``, counted as 0) have
@@ -1291,6 +1293,7 @@ class TestArenaResourcesServer:
             resume_from_cache=True,
             require_complete=True,
             disable_health_check=True,
+            **overrides,
         )
         config.materialized_jsonl_fpath.write_bytes(b"".join(json.dumps(r).encode() + b"\n" for r in rows))
         scored = [{**rows[i], **self._rollout("[[A>B]]", "[[B>A]]", reward=1.0)} for i in range(2)]
@@ -1333,13 +1336,40 @@ class TestArenaResourcesServer:
     async def test_a_settled_run_above_the_failure_rate_finishes_with_metrics(
         self, server: ArenaResourcesServer, tmp_path, monkeypatch, eval_mode: None
     ):
-        """Every judge failure is at the attempt cap: nothing is left to run, so the run must finish."""
-        aggregated = await self._collect(server, tmp_path, monkeypatch, failure_rows=3, attempts_recorded=2)
+        """Every judge failure is at the attempt cap and counted: nothing is left to run, so the run must finish."""
+        aggregated = await self._collect(
+            server,
+            tmp_path,
+            monkeypatch,
+            failure_rows=3,
+            attempts_recorded=2,
+            count_failure_classes_as_zero=["judge_failed"],
+        )
 
         (metrics,) = aggregated
         assert metrics.agent_metrics["rollout_failure_rate"] == approx(0.6)
         assert metrics.agent_metrics["failed_rollout_gate"] is True
         assert "win_rate" not in metrics.key_metrics and metrics.key_metrics["mean/reward"] is None
+
+    async def test_judge_failures_at_the_cap_count_against_the_gate(
+        self, server: ArenaResourcesServer, tmp_path, monkeypatch, eval_mode: None
+    ):
+        """LMArena's config counts judge_failed, so a judge failure at the cap reaches the gate, not the win rate."""
+        lmarena = yaml.safe_load((Path(__file__).parents[3] / "benchmarks/lmarena_v3/config.yaml").read_text())
+        aggregated = await self._collect(
+            server,
+            tmp_path,
+            monkeypatch,
+            failure_rows=3,
+            attempts_recorded=2,
+            count_failure_classes_as_zero=lmarena["count_failure_classes_as_zero"],
+        )
+
+        (metrics,) = aggregated
+        # 3 of 5 rollouts failed their judge: past the gate, so the run publishes no win rate.
+        assert metrics.agent_metrics["rollout_failure_rate"] == approx(0.6)
+        assert metrics.agent_metrics["failed_rollout_gate"] is True
+        assert "win_rate" not in metrics.key_metrics
 
     async def test_unsettled_judge_failures_still_leave_the_run_incomplete(
         self, server: ArenaResourcesServer, tmp_path, monkeypatch, eval_mode: None

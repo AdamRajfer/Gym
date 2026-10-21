@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -187,3 +188,63 @@ async def test_a_harness_failure_is_named_by_whether_the_agent_ran(tmp_path, mon
     assert exception_type == expected
     row = {"_ng_failure_class": "infrastructure_error", "_ng_failure_type": exception_type}
     assert is_terminal_failure(row) is agent_started
+
+
+@pytest.mark.parametrize("eval_mode", [False, True], ids=["training", "evaluation"])
+async def test_a_pod_oom_kill_during_the_agents_turn_is_the_models_zero(tmp_path, monkeypatch, eval_mode):
+    """The sandbox pod was OOM-killed while the agent ran: the resource-limit detector grades the trial
+    0, as Harbor scores it. No failure is recorded, so the row is final and not retried."""
+    import resources_servers.terminal_bench_4.app as tb4_app
+
+    monkeypatch.setattr(tb4_app, "is_eval_mode", lambda: eval_mode)
+    monkeypatch.setattr(tb4_app.lifecycle, "is_eval_mode", lambda: eval_mode)
+    monkeypatch.setattr(tb4_app.lifecycle, "cleanup", AsyncMock())
+    detail = (
+        "Failed to run command: [SANDBOX::ENDED] sandbox sandbox-1 exited with code 137 (OOMKilled) "
+        "before the command finished"
+    )
+    termination = AgentTermination(reason="infrastructure_error", detail=detail)
+    body = SandboxedVerifyRequest(
+        responses_create_params=NeMoGymResponseCreateParamsNonStreaming(input="hi"),
+        response=NeMoGymResponse(
+            id="resp-1",
+            created_at=0,
+            model="model",
+            object="response",
+            output=[],
+            parallel_tool_calls=False,
+            tool_choice="auto",
+            tools=[],
+        ),
+        session_id="session-1",
+        termination=termination,
+        agent_started=True,
+    )
+    session = SimpleNamespace(
+        verify_body=body,
+        request=SimpleNamespace(capture_rollout_id=None, task_name="task-1"),
+        session_id="session-1",
+        termination=None,
+        result={},
+        diagnostics=[],
+        phase="ready",
+        subphase=None,
+        directory=tmp_path,
+        seed_response=SimpleNamespace(termination=None),
+        environment=None,
+        verifier_environment=None,
+        persist=lambda: None,
+    )
+    server = SimpleNamespace(
+        _verified_response=lambda session, extra: TerminalBench4ResourcesServer._verified_response(
+            None, session, extra
+        )
+    )
+
+    await tb4_app.TerminalBench4ResourcesServer._finalize_session(server, session)
+
+    verified = session.verified_response.model_dump()
+    assert session.result["verifier_result"]["source"] == "sandbox_resource_limit"
+    assert verified["sandbox_resource_limit"]["resource"] == "memory"
+    assert (verified["reward"], verified["evaluation_completed"]) == (0.0, True)
+    assert verified["infrastructure_error"] is None and "_ng_failure_class" not in verified

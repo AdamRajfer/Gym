@@ -147,11 +147,23 @@ def test_historical_trial_without_test_report_has_null_counts(tmp_path):
 
 
 @pytest.mark.parametrize(
-    ("agent_started", "expected"),
-    [(False, "AgentSetupError"), (True, "AgentInfrastructureError")],
-    ids=["before-the-agent-ran", "during-the-agents-run"],
+    ("agent_started", "detail", "expected"),
+    [
+        (False, "mini-SWE command exited 1", "AgentSetupError"),
+        (True, "mini-SWE command exited 1", "AgentInfrastructureError"),
+        # The provider found the running sandbox deleted (round-2 case R9: deleted through the OpenSandbox API).
+        (
+            True,
+            "SandboxPlatformEvictionError: Sandbox not found: the control plane no longer knows it "
+            "(Get sandbox failed: HTTP 404); sandbox_id='tb4-sbx'",
+            "SandboxPlatformEvictionError",
+        ),
+    ],
+    ids=["before-the-agent-ran", "during-the-agents-run", "sandbox-deleted-during-the-agents-run"],
 )
-async def test_a_harness_failure_is_named_by_whether_the_agent_ran(tmp_path, monkeypatch, agent_started, expected):
+async def test_a_harness_failure_is_named_by_whether_the_agent_ran(
+    tmp_path, monkeypatch, agent_started, detail, expected
+):
     """mini-SWE failing to set up comes before the model's first command (retried); failing during its run is the
     model's (final, 0), unless the platform names its own cause."""
     import resources_servers.terminal_bench_4.app as tb4_app
@@ -160,7 +172,7 @@ async def test_a_harness_failure_is_named_by_whether_the_agent_ran(tmp_path, mon
         session.result.setdefault("verifier_result", {})
 
     monkeypatch.setattr(tb4_app.lifecycle, "finalize_session", _finalize)
-    termination = AgentTermination(reason="infrastructure_error", detail="mini-SWE command exited 1")
+    termination = AgentTermination(reason="infrastructure_error", detail=detail)
     body = SimpleNamespace(
         termination=termination,
         agent_timings={},
@@ -187,7 +199,7 @@ async def test_a_harness_failure_is_named_by_whether_the_agent_ran(tmp_path, mon
     exception_type = session.result["exception_info"]["exception_type"]
     assert exception_type == expected
     row = {"_ng_failure_class": "infrastructure_error", "_ng_failure_type": exception_type}
-    assert is_terminal_failure(row) is agent_started
+    assert is_terminal_failure(row) is (expected == "AgentInfrastructureError")
 
 
 @pytest.mark.parametrize("eval_mode", [False, True], ids=["training", "evaluation"])

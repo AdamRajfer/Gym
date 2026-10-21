@@ -252,6 +252,9 @@ class TerminalBench4ResourcesServer(SimpleResourcesServer):
             if body.termination.reason == "infrastructure_error":
                 # Before the agent ran, the harness failed to set up (retried); during its run, the model can cause it.
                 failure_type = "AgentInfrastructureError" if body.agent_started else "AgentSetupError"
+                if body.agent_started and failure_cause_of_text(body.termination.detail or "") == INFRA:
+                    # The harness relayed platform evidence (a deleted or evicted sandbox): not the model's.
+                    failure_type = "SandboxPlatformEvictionError"
                 lifecycle.exception(session, body.termination.detail, failure_type)
             elif not body.agent_started and body.termination.reason == "timeout":
                 lifecycle.exception(session, body.termination.detail, "AgentSetupTimeoutError")

@@ -262,6 +262,7 @@ _INFRA_EXCEPTION_NAMES = frozenset(
         "SandboxCreateError",
         "OpenSandboxCreateError",
         "SandboxPlatformEvictionError",
+        "SandboxPtyPlatformEvictionError",
         # Ray lost the worker, the node or the object, not the task's own code.
         "OutOfMemoryError",
         "WorkerCrashedError",

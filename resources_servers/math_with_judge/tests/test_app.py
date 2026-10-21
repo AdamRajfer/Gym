@@ -952,15 +952,11 @@ class TestApp:
         with raises(JudgeError, match="Field required"):
             await resources_server._generate_judge_evaluation("invalid_response", "invalid_1", "invalid_2")
 
+        # A reply with no readable verdict is the judge's failure, retried as judge_failed: never a 0.
         reasoning_item = NeMoGymResponseReasoningItem(id="reasoning_item", summary=[], type="reasoning")
         response_mock.return_value = json.dumps(self._create_response("reasoning_id", reasoning_item))
-        await self._generate_and_check_judge_evaluation(
-            resources_server,
-            "reasoning_question",
-            False,
-            "reasoning_id",
-            reasoning_item,
-        )
+        with raises(JudgeError, match="unparseable"):
+            await resources_server._generate_judge_evaluation("reasoning_question", "a", "b")
 
         refusal_item = NeMoGymResponseOutputMessage(
             id="refusal_item",
@@ -972,19 +968,13 @@ class TestApp:
             type="message",
         )
         response_mock.return_value = json.dumps(self._create_response("refusal_id", refusal_item))
-        await self._generate_and_check_judge_evaluation(
-            resources_server, "refusal_question", False, "refusal_id", refusal_item
-        )
+        with raises(JudgeError, match="unparseable"):
+            await resources_server._generate_judge_evaluation("refusal_question", "a", "b")
 
         no_evaluation_item = self._create_response_output_message("no evaluation")
         response_mock.return_value = json.dumps(self._create_response("no_evaluation_id", no_evaluation_item))
-        await self._generate_and_check_judge_evaluation(
-            resources_server,
-            "no_evaluation_question",
-            False,
-            "no_evaluation_id",
-            no_evaluation_item,
-        )
+        with raises(JudgeError, match="unparseable"):
+            await resources_server._generate_judge_evaluation("no_evaluation_question", "a", "b")
 
         not_equal_item = self._create_response_output_message(
             f"Evaluation: {LibraryJudgeMathResourcesServer.JUDGE_NOT_EQUAL_LABEL}"
@@ -1046,8 +1036,6 @@ class TestApp:
             ("[[ A = B ]]", "[[A!=B]] Final: [[\nA = B\n]]", 1.0, 2),
             ("[[A=B]] [[A=B]]", "[[A=B]]", 1.0, 2),
             ("[[A!=B]] [[A!=B]]", "[[A=B]]", 0.0, 1),
-            ("No verdict", "[[A=B]]", 0.0, 1),
-            ("[[A=B]]", "No verdict", 0.0, 2),
         ],
     )
     async def test_last_verdict_preserves_reverse_check(
@@ -1076,7 +1064,7 @@ class TestApp:
             reverse_prompt = evaluations[1].responses_create_params.input[-1].content
             assert reverse_prompt.index("generated") < reverse_prompt.index("expected")
 
-    @mark.parametrize("final_text", ["No verdict", "[[A!=B]]", "[[A=B]]"])
+    @mark.parametrize("final_text", ["[[A!=B]]", "[[A=B]]"])
     async def test_verdict_ignores_reasoning_trace(
         self,
         config: LibraryJudgeMathResourcesServerConfig,
@@ -1098,6 +1086,37 @@ class TestApp:
         equal, evaluation = await resources_server._generate_judge_evaluation("question", "first", "second")
         assert equal is (final_text == "[[A=B]]")
         assert evaluation.response.output[0].summary[0].text == "[[A!=B]] [[A=B]]"
+
+    @mark.parametrize("judge_text", ["no verdict at all", "I cannot decide."], ids=["no-marker", "prose"])
+    async def test_an_unparseable_judge_verdict_is_judge_failed_not_a_zero(
+        self, config: LibraryJudgeMathResourcesServerConfig, judge_text: str
+    ) -> None:
+        """The judge, not the model, failed: the row is retried as judge_failed and stays out of the score."""
+        from nemo_gym.judge import judge_failsafe
+
+        server_mock = MagicMock(spec=ServerClient)
+        judge_reply = self._create_response("judge", self._create_response_output_message(judge_text))
+        server_mock.post = AsyncMock(return_value=MagicMock(read=AsyncMock(return_value=json.dumps(judge_reply))))
+        resources_server = LibraryJudgeMathResourcesServer(
+            config=config.model_copy(update={"should_use_judge": True}), server_client=server_mock
+        )
+        answer = NeMoGymResponse(
+            **self._create_response("policy", self._create_response_output_message("The sum is \\boxed{2}."))
+        )
+        request = LibraryJudgeMathVerifyRequest(
+            responses_create_params=NeMoGymResponseCreateParamsNonStreaming(input=[]),
+            response=answer,
+            question="What is 1 + 2?",
+            expected_answer="3",
+        )
+
+        row = json.loads((await judge_failsafe(resources_server.verify)(request)).body)
+
+        assert server_mock.post.await_count == 1
+        assert row["_ng_failure_class"] == "judge_failed"
+        assert row["failure_kind"] == "judge_failed"
+        assert row["mask_sample"] is True
+        assert "unparseable" in row["_ng_failure_judge_error"]
 
 
 # ──────────────────────────────────────────────────────────

@@ -309,7 +309,7 @@ class PinchBenchAgent(SimpleResponsesAPIAgent):
                 raise TimeoutError("PinchBench sandbox execution timed out")
             if exec_result.error_type:
                 detail = exec_result.stderr or exec_result.stdout or "unknown sandbox error"
-                raise RuntimeError(f"PinchBench sandbox execution failed ({exec_result.error_type}): {detail}")
+                raise SandboxExecError(f"PinchBench sandbox execution failed ({exec_result.error_type}): {detail}")
             await sb.download(archive, out_dir / "out.tgz")
         finally:
             await sb.stop()

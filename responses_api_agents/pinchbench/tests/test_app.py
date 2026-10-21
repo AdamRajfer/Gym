@@ -461,7 +461,7 @@ async def test_observation_failure_does_not_change_result(tmp_path, monkeypatch)
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "error_type,exception_type",
-    [("timeout", TimeoutError), ("sandbox", RuntimeError)],
+    [("timeout", TimeoutError), ("sandbox", SandboxExecError)],
 )
 async def test_managed_sandbox_exec_errors_skip_download(tmp_path, monkeypatch, error_type, exception_type):
     agent = make_agent(sandbox_provider={"opensandbox": {}})

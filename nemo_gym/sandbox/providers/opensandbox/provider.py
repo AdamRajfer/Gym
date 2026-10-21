@@ -36,6 +36,7 @@ from nemo_gym.sandbox.providers.base import (
     SandboxExecResult,
     SandboxHandle,
     SandboxOperationTimeoutError,
+    SandboxPlatformEvictionError,
     SandboxPtyError,
     SandboxPtySession,
     SandboxPtySpec,
@@ -79,6 +80,15 @@ class OpenSandboxCreateTimeoutError(OpenSandboxCreateError):
 
 class OpenSandboxCreateVerificationError(SandboxCreateVerificationError):
     """Raised when a newly-created sandbox cannot execute a probe command."""
+
+
+# Control-plane status text that names a cause outside the sandbox's own processes: an eviction, node loss or
+# preemption. An OOM kill within the sandbox's own memory limit is not listed: the model's commands can cause it.
+_PLATFORM_EVICTION_PATTERN = re.compile(
+    r"\bevict(?:ed|ion)\b|\bnode[\s_-]*lost\b|\bnode\b[^;]{0,40}\b(?:not ready|drain(?:ed|ing)?|shut ?down|"
+    r"terminated|unreachable)\b|\bpreempt(?:ed|ion)\b",
+    re.IGNORECASE,
+)
 
 
 class SandboxBackendUnreachableError(RuntimeError):
@@ -1751,8 +1761,11 @@ class OpenSandboxProvider:
         except Exception as error:
             if not isinstance(error, SandboxBackendUnreachableError) and _exception_status_code(error) != 502:
                 raise
-            notice = await self._oom_death_notice(handle)
-            if notice is not None:
+            notice = await self._oom_death_notice(handle, any_death=True)
+            if notice is not None and _PLATFORM_EVICTION_PATTERN.search(notice):
+                # The control plane names a cause outside the sandbox: the platform ended it, not the model.
+                raise SandboxPlatformEvictionError(notice) from error
+            if notice is not None and notice.startswith("Sandbox was OOM-killed"):
                 raise SandboxBackendUnreachableError(notice) from error
             raise
 

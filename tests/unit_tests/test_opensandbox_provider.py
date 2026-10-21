@@ -1223,10 +1223,93 @@ async def test_exec_background_reports_oom_status_after_502(monkeypatch: pytest.
     assert isinstance(exc_info.value.__cause__, Backend502Error)
     assert raw.info_calls == 2
 
-    raw.statuses = [SimpleNamespace(state="Failed", reason="FAILED", message="sandbox node was drained")]
+    raw.statuses = [SimpleNamespace(state="Failed", reason="FAILED", message="sandbox exited with code 1")]
     raw.info_calls = 0
     with pytest.raises(Backend502Error, match="Get command status failed"):
         await provider.exec(handle, "retry after non-OOM failure", timeout_s=30)
+
+
+@pytest.mark.parametrize(
+    ("reason", "message"),
+    [
+        ("Evicted", "The node was low on resource: memory."),
+        ("NodeLost", "node nvl72-T01 is not ready"),
+        ("FAILED", "sandbox node was drained"),
+        ("Preempted", "pod preempted by a higher-priority pod"),
+    ],
+)
+async def test_exec_raises_platform_eviction_only_on_platform_evidence(
+    monkeypatch: pytest.MonkeyPatch, reason: str, message: str
+) -> None:
+    # The platform, not the sandbox's own processes, ended the sandbox: the one sandbox loss that stays infra.
+    class Backend502Error(Exception):
+        status_code = 502
+
+    class FakeCommands:
+        async def run(self, command: str, *, opts: Any) -> Any:
+            return SimpleNamespace(id="exec-evicted")
+
+        async def get_command_status(self, execution_id: str) -> Any:
+            raise Backend502Error("Get command status failed: HTTP 502")
+
+    class FakeRaw:
+        commands = FakeCommands()
+
+        async def get_info(self) -> Any:
+            return SimpleNamespace(status=SimpleNamespace(state="Failed", reason=reason, message=message))
+
+    monkeypatch.setattr(
+        opensandbox_provider, "_require_opensandbox_sdk", lambda: (object, object, dict, object, object)
+    )
+    monkeypatch.setattr(asyncio, "sleep", _no_sleep)
+    provider = opensandbox_provider.OpenSandboxProvider(
+        connection={"request_timeout_s": 5},
+        probe={"command": None},
+        operations={"background_exec": True, "retries": 0},
+    )
+    handle = opensandbox_provider.SandboxHandle(sandbox_id="sandbox-ev", provider_name="opensandbox", raw=FakeRaw())
+
+    with pytest.raises(opensandbox_provider.SandboxPlatformEvictionError) as exc_info:
+        await provider.exec(handle, "work", timeout_s=30)
+    assert isinstance(exc_info.value.__cause__, Backend502Error)
+    assert "sandbox_id='sandbox-ev'" in str(exc_info.value)
+
+
+async def test_an_oom_kill_of_the_sandboxs_own_processes_is_not_platform_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Backend502Error(Exception):
+        status_code = 502
+
+    class FakeCommands:
+        async def run(self, command: str, *, opts: Any) -> Any:
+            return SimpleNamespace(id="exec-oom")
+
+        async def get_command_status(self, execution_id: str) -> Any:
+            raise Backend502Error("Get command status failed: HTTP 502")
+
+    class FakeRaw:
+        commands = FakeCommands()
+
+        async def get_info(self) -> Any:
+            status = SimpleNamespace(state="Failed", reason="OOMKilled", message="container terminated (exit 137)")
+            return SimpleNamespace(status=status)
+
+    monkeypatch.setattr(
+        opensandbox_provider, "_require_opensandbox_sdk", lambda: (object, object, dict, object, object)
+    )
+    monkeypatch.setattr(asyncio, "sleep", _no_sleep)
+    provider = opensandbox_provider.OpenSandboxProvider(
+        connection={"request_timeout_s": 5},
+        probe={"command": None},
+        operations={"background_exec": True, "retries": 0},
+    )
+    handle = opensandbox_provider.SandboxHandle(sandbox_id="sandbox-oom", provider_name="opensandbox", raw=FakeRaw())
+
+    with pytest.raises(opensandbox_provider.SandboxBackendUnreachableError) as exc_info:
+        await provider.exec(handle, "allocate memory", timeout_s=30)
+    assert not isinstance(exc_info.value, opensandbox_provider.SandboxPlatformEvictionError)
+    assert "OOM-killed" in str(exc_info.value)
 
 
 @pytest.mark.parametrize(

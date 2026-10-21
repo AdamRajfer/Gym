@@ -598,16 +598,24 @@ class TestInfraUnresolved:
         assert [(e["agent_ref"]["name"], e.get(NG_ENVIRONMENT_SERVER_KEY)) for e in entries] == expected
         assert all(e["key_metrics"] == {} for e in entries)
 
-    @pytest.mark.parametrize("opted_in", [True, False], ids=["infra-zero-opt-in", "default"])
-    async def test_an_all_infra_run_finishes_with_zero_when_its_benchmark_scores_infra_as_zero(
-        self, opted_in: bool, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    @pytest.mark.parametrize(
+        ("opted_in", "landed"),
+        [(True, False), (False, False), (True, True)],
+        ids=["opt-in-all-infra", "default-all-infra", "opt-in-one-real-result"],
+    )
+    async def test_infra_zeros_need_a_real_result_beside_them(
+        self, opted_in: bool, landed: bool, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """Review finding 4339235366: the opted-in zeros are a result, so the run finishes, scored 0 and incomplete."""
+        """With count_infra_unresolved_as_zero, a run whose every rollout is infra-unresolved has no score.
+
+        It fails as it would without the option and says to resubmit; once one rollout has a real result,
+        the opted-in zeros count beside it.
+        """
         monkeypatch.setenv("NEMO_GYM_MAX_ROLLOUT_ATTEMPTS", "3")
         monkeypatch.setattr("nemo_gym.rollout_collection.get_global_config_dict", lambda *args, **kwargs: {})
         output = tmp_path / "out.jsonl"
-        row = {"responses_create_params": {"input": []}, "agent_ref": {"name": "agent"}}
-        (tmp_path / "in.jsonl").write_bytes(orjson.dumps(row) + b"\n")
+        rows = [{"responses_create_params": {"input": []}, "agent_ref": {"name": "agent"}, "i": i} for i in range(2)]
+        (tmp_path / "in.jsonl").write_bytes(b"".join(orjson.dumps(row) + b"\n" for row in rows))
         scored: list = []
 
         class Helper(RolloutCollectionHelper):
@@ -615,7 +623,8 @@ class TestInfraUnresolved:
                 futures = []
                 for example in examples:
                     future = asyncio.get_event_loop().create_future()
-                    result = {NG_FAILURE_CLASS_KEY: "judge_failed"}
+                    real = landed and example[TASK_INDEX_KEY_NAME] == 0
+                    result = {"reward": 1.0} if real else {NG_FAILURE_CLASS_KEY: "judge_failed"}
                     future.set_result(_CompletedRollout(row=example, result=result, rollout_latency_ms=None))
                     futures.append(future)
                 return futures
@@ -634,20 +643,20 @@ class TestInfraUnresolved:
             disable_health_check=True,
             count_infra_unresolved_as_zero=opted_in,
         )
-        if not opted_in:
-            # Below the cap and not opted in: a resume retries it, so there is nothing to report yet.
-            with pytest.raises(RuntimeError, match="produced a result"):
+        if not landed:
+            with pytest.raises(RuntimeError, match="produced a result") as raised:
                 await Helper().run_from_config(config)
+            assert "resubmit" in str(raised.value)
+            assert scored == []
+            assert not output.with_name("out_aggregate_metrics.json").exists()
             return
         await Helper().run_from_config(config)
 
-        assert [r["reward"] for r in scored] == [0.0]
-        assert output.read_bytes() == b""
-        assert failures_path_for(output).read_bytes().count(b"judge_failed") == 1
+        assert sorted(r["reward"] for r in scored) == [0.0, 1.0]
         [entry] = orjson.loads(output.with_name("out_aggregate_metrics.json").read_bytes())
         key_metrics = entry["key_metrics"]
-        assert (key_metrics["mean/reward"], key_metrics["rollouts_infra_unresolved"]) == (0.0, 1)
-        assert (key_metrics["rollouts_complete"], key_metrics["publishable"]) == (False, False)
+        assert (key_metrics["mean/reward"], key_metrics["rollouts_infra_unresolved"]) == (0.5, 1)
+        assert key_metrics["rollouts_complete"] is False
 
     async def test_a_resume_with_nothing_left_to_dispatch_still_reports_incomplete(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch

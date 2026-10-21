@@ -3955,11 +3955,12 @@ class RolloutCollectionHelper(BaseModel):
             missing_scored = config.count_missing_rollouts_as_zero or config.count_infra_unresolved_as_zero
             missing: List[Dict[str, Any]] = no_row if missing_scored else []
             # The default counts every class as 0, but a run where only retryable rows landed has nothing to
-            # report yet: a resume runs them. Only a final row, or a class the caller named, is a result, and so
-            # is a benchmark's own zero for a persistent infra failure (count_infra_unresolved_as_zero).
+            # report yet: a resume runs them. Only a final row, or a class the caller named, is a result. A
+            # benchmark's own zero for a persistent infra failure (count_infra_unresolved_as_zero) counts only
+            # beside a real result: a run whose every rollout is infra-unresolved measured nothing.
             result_failures = (
                 counted
-                if config.count_failure_classes_as_zero is not None or config.count_infra_unresolved_as_zero
+                if config.count_failure_classes_as_zero is not None
                 else await asyncio.to_thread(
                     _failure_rows_counted_as_zero,
                     [failures_fpath],
@@ -3974,7 +3975,7 @@ class RolloutCollectionHelper(BaseModel):
                 input_rows
                 and persisted_count == 0
                 and not result_failures
-                and not missing
+                and not (missing and not config.count_infra_unresolved_as_zero)
                 and not await asyncio.to_thread(
                     _every_rollout_settled, input_rows, failures_fpath, config.retry_terminal_timeouts
                 )
@@ -3989,7 +3990,8 @@ class RolloutCollectionHelper(BaseModel):
                 )
                 raise RuntimeError(
                     f"None of the {len(input_rows)} dispatched rollouts produced a result "
-                    f"{dict(failure_counts)}.{drained_note} Inspect {failures_fpath}; the run has no score to report."
+                    f"{dict(failure_counts)}.{drained_note} Inspect {failures_fpath}; the run has no score to report. "
+                    "Resubmit the run (gym eval resubmit) once the failing service is back."
                 )
             collection_succeeded = True
         finally:

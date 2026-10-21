@@ -382,6 +382,34 @@ class TestApp:
         assert result[NG_FAILURE_CLASS_KEY] == "tau2_context_overflow"
         assert is_terminal_failure(result) and is_unscored_failure(result)
 
+    @pytest.mark.parametrize(
+        ("status", "body", "expected"),
+        [
+            (400, b'{"error":{"message":"maximum context length is 131072 tokens"}}', "tau2_context_overflow"),
+            (500, b'{"error":{"message":"maximum context length is 131072 tokens"}}', "tau2_context_overflow"),
+            (400, b'{"error":{"message":"invalid tool schema"}}', "tau2_agent_error"),
+        ],
+    )
+    def test_a_context_overflow_carried_only_in_the_http_body_is_left_out(
+        self, monkeypatch: pytest.MonkeyPatch, status: int, body: bytes, expected: str
+    ) -> None:
+        from types import SimpleNamespace
+
+        from aiohttp import ClientResponseError
+
+        monkeypatch.setattr("responses_api_agents.tau2.app.is_eval_mode", lambda: True)
+        _, server = self._dummy_server()
+        error = ClientResponseError(
+            request_info=SimpleNamespace(real_url="http://model/v1/chat/completions"), history=(), status=status
+        )
+        error.response_content = body
+        with (
+            patch("responses_api_agents.tau2.app.get_server_url", return_value="http://model"),
+            patch("responses_api_agents.tau2.app.run_single_task", AsyncMock(side_effect=error)),
+        ):
+            response = asyncio.run(server.run(self._example_run_request()))
+        assert response.model_dump(mode="json")[NG_FAILURE_CLASS_KEY] == expected
+
     @pytest.mark.parametrize("eval_mode", [False, True], ids=["training", "evaluation"])
     def test_an_empty_episode_is_rerun_only_in_evaluation(
         self, monkeypatch: pytest.MonkeyPatch, eval_mode: bool

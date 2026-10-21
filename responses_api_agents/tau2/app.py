@@ -312,7 +312,11 @@ class Tau2Agent(SimpleResponsesAPIAgent):
             else:
                 failure_class = TAU2_AGENT_FAILURE_CLASS
                 detail = _first_nested_exception(error)
-                if eval_mode and _CONTEXT_OVERFLOW_PATTERN.search(f"{type(detail).__name__}: {detail}"):
+                # A model server's 400 keeps its body in response_content; str() of the error omits it.
+                payload = getattr(detail, "response_content", b"") or b""
+                if isinstance(payload, bytes):
+                    payload = payload.decode("utf-8", errors="replace")
+                if eval_mode and _CONTEXT_OVERFLOW_PATTERN.search(f"{type(detail).__name__}: {detail} {payload}"):
                     # The policy's request overflowed the context window: left out of the score.
                     failure_class = TAU2_CONTEXT_OVERFLOW_FAILURE_CLASS
                 # The harness lost its data or prompt files (a domain db.json, documents/*.json, a prompt template)

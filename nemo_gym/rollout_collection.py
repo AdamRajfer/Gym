@@ -33,6 +33,7 @@ from datetime import timedelta
 from difflib import get_close_matches
 from itertools import repeat
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from time import perf_counter
 from typing import Any, Callable, Dict, Iterator, List, Literal, Optional, Tuple, Union
 
@@ -2170,7 +2171,11 @@ def _write_time_limit_sections(
             exported.update({f"time_limit/{name}/{key}": value for key, value in section.items()})
         if not exported:
             return
-        metrics_fpath.write_bytes(orjson.dumps(entries, option=orjson.OPT_INDENT_2))
+        # Replaced only once the new document is written whole: a failed write leaves the metrics as they were.
+        with TemporaryDirectory(dir=metrics_fpath.parent) as tmp_dir:
+            pending = Path(tmp_dir) / metrics_fpath.name
+            pending.write_bytes(orjson.dumps(entries, option=orjson.OPT_INDENT_2))
+            pending.replace(metrics_fpath)
     except Exception:
         logger.exception("Could not add the time-limit section to %s; the aggregate metrics stand.", metrics_fpath)
         return

@@ -187,6 +187,28 @@ class TestWriteSections:
         assert fpath.read_bytes() == before
         _write_time_limit_sections(None, [{}], broken)
 
+    def test_a_write_that_fails_partway_leaves_the_metrics_file_intact(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Review finding 4339034971 on #4841: a failed diagnostic write must not truncate the aggregate metrics."""
+        exported = MagicMock()
+        monkeypatch.setattr(nemo_gym.rollout_collection, "export_metrics", exported)
+        fpath = _metrics_file(tmp_path, [{AGENT_REF_KEY_NAME: {"name": "a"}, NG_ENVIRONMENT_SERVER_KEY: "e"}])
+        before = fpath.read_bytes()
+        write_bytes = Path.write_bytes
+
+        def disk_full(self: Path, data: bytes) -> int:
+            write_bytes(self, data[:10])
+            raise OSError(28, "No space left on device")
+
+        monkeypatch.setattr(Path, "write_bytes", disk_full)
+        _write_time_limit_sections(fpath, [rollout(100, **{NG_FAILURE_CLASS_KEY: "agent_run_error"})], lambda row: "e")
+        monkeypatch.undo()
+
+        assert fpath.read_bytes() == before
+        assert [path.name for path in tmp_path.iterdir()] == [fpath.name]
+        exported.assert_not_called()
+
 
 def _input(tmp_path: Path, count: int) -> Path:
     fpath = tmp_path / "input.jsonl"

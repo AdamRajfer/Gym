@@ -3955,10 +3955,11 @@ class RolloutCollectionHelper(BaseModel):
             missing_scored = config.count_missing_rollouts_as_zero or config.count_infra_unresolved_as_zero
             missing: List[Dict[str, Any]] = no_row if missing_scored else []
             # The default counts every class as 0, but a run where only retryable rows landed has nothing to
-            # report yet: a resume runs them. Only a final row, or a class the caller named, is a result.
+            # report yet: a resume runs them. Only a final row, or a class the caller named, is a result, and so
+            # is a benchmark's own zero for a persistent infra failure (count_infra_unresolved_as_zero).
             result_failures = (
                 counted
-                if config.count_failure_classes_as_zero is not None
+                if config.count_failure_classes_as_zero is not None or config.count_infra_unresolved_as_zero
                 else await asyncio.to_thread(
                     _failure_rows_counted_as_zero,
                     [failures_fpath],

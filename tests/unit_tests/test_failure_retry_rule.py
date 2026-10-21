@@ -598,6 +598,57 @@ class TestInfraUnresolved:
         assert [(e["agent_ref"]["name"], e.get(NG_ENVIRONMENT_SERVER_KEY)) for e in entries] == expected
         assert all(e["key_metrics"] == {} for e in entries)
 
+    @pytest.mark.parametrize("opted_in", [True, False], ids=["infra-zero-opt-in", "default"])
+    async def test_an_all_infra_run_finishes_with_zero_when_its_benchmark_scores_infra_as_zero(
+        self, opted_in: bool, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Review finding 4339235366: the opted-in zeros are a result, so the run finishes, scored 0 and incomplete."""
+        monkeypatch.setenv("NEMO_GYM_MAX_ROLLOUT_ATTEMPTS", "3")
+        monkeypatch.setattr("nemo_gym.rollout_collection.get_global_config_dict", lambda *args, **kwargs: {})
+        output = tmp_path / "out.jsonl"
+        row = {"responses_create_params": {"input": []}, "agent_ref": {"name": "agent"}}
+        (tmp_path / "in.jsonl").write_bytes(orjson.dumps(row) + b"\n")
+        scored: list = []
+
+        class Helper(RolloutCollectionHelper):
+            def _run_examples_with_metadata(self, examples, *args, **kwargs):
+                futures = []
+                for example in examples:
+                    future = asyncio.get_event_loop().create_future()
+                    result = {NG_FAILURE_CLASS_KEY: "judge_failed"}
+                    future.set_result(_CompletedRollout(row=example, result=result, rollout_latency_ms=None))
+                    futures.append(future)
+                return futures
+
+            async def _call_aggregate_metrics(self, results, rows, output_fpath, *, raise_on_error=True):
+                scored.extend(results)
+                metrics_fpath = output_fpath.with_name(output_fpath.stem + "_aggregate_metrics.json")
+                mean = sum(r["reward"] for r in results) / len(results)
+                entry = {"agent_ref": {"name": "agent"}, "agent_metrics": {}, "key_metrics": {"mean/reward": mean}}
+                metrics_fpath.write_bytes(orjson.dumps([entry]))
+                return metrics_fpath
+
+        config = RolloutCollectionConfig(
+            input_jsonl_fpath=str(tmp_path / "in.jsonl"),
+            output_jsonl_fpath=str(output),
+            disable_health_check=True,
+            count_infra_unresolved_as_zero=opted_in,
+        )
+        if not opted_in:
+            # Below the cap and not opted in: a resume retries it, so there is nothing to report yet.
+            with pytest.raises(RuntimeError, match="produced a result"):
+                await Helper().run_from_config(config)
+            return
+        await Helper().run_from_config(config)
+
+        assert [r["reward"] for r in scored] == [0.0]
+        assert output.read_bytes() == b""
+        assert failures_path_for(output).read_bytes().count(b"judge_failed") == 1
+        [entry] = orjson.loads(output.with_name("out_aggregate_metrics.json").read_bytes())
+        key_metrics = entry["key_metrics"]
+        assert (key_metrics["mean/reward"], key_metrics["rollouts_infra_unresolved"]) == (0.0, 1)
+        assert (key_metrics["rollouts_complete"], key_metrics["publishable"]) == (False, False)
+
     async def test_a_resume_with_nothing_left_to_dispatch_still_reports_incomplete(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:

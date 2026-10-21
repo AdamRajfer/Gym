@@ -293,7 +293,8 @@ class Tau2Agent(SimpleResponsesAPIAgent):
             response = await self._run(body)
             if is_eval_mode() and response.result.termination_reason == "empty_tool_calls_and_content":
                 # Evaluation reruns an empty episode, then leaves it out of the score at the attempt cap.
-                setattr(response, NG_FAILURE_CLASS_KEY, TAU2_EMPTY_OUTPUT_FAILURE_CLASS)
+                # model_copy puts the key in the serialized extras; setattr of an underscore name would not.
+                response = response.model_copy(update={NG_FAILURE_CLASS_KEY: TAU2_EMPTY_OUTPUT_FAILURE_CLASS})
             return response
         except Exception as error:  # noqa: BLE001 -- one bad rollout must not abort the full collection
             malformed_error = _find_nested_exception(error, Tau2MalformedToolCallError)

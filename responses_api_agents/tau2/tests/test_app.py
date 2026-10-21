@@ -394,11 +394,24 @@ class TestApp:
             result = asyncio.run(server.run(self._example_run_request()))
 
         if eval_mode:
-            assert getattr(result, NG_FAILURE_CLASS_KEY) == "tau2_empty_output"
+            response.model_copy.assert_called_once_with(update={NG_FAILURE_CLASS_KEY: "tau2_empty_output"})
+            assert result is response.model_copy.return_value
             assert not is_terminal_failure({NG_FAILURE_CLASS_KEY: "tau2_empty_output"})
         else:
             # Training gets the scored episode exactly as tau2 returned it.
             assert result is response and not isinstance(getattr(result, NG_FAILURE_CLASS_KEY, None), str)
+
+    def test_the_empty_episode_marker_reaches_the_run_json(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A real response, not a mock: the class must be in what /run serializes, or collection scores it."""
+        monkeypatch.setattr("responses_api_agents.tau2.app.is_eval_mode", lambda: True)
+        _, server = self._dummy_server()
+        simulation = self._fake_simulation_run(termination_reason=TerminationReason.EMPTY_TOOL_CALLS_AND_CONTENT)
+        with (
+            patch("responses_api_agents.tau2.app.get_server_url", return_value="http://model"),
+            patch("responses_api_agents.tau2.app.run_single_task", AsyncMock(return_value=simulation)),
+        ):
+            response = asyncio.run(server.run(self._example_run_request()))
+        assert response.model_dump(mode="json")[NG_FAILURE_CLASS_KEY] == "tau2_empty_output"
 
     def test_the_client_tells_the_user_simulator_from_the_policy(self) -> None:
         urls = {"policy": "http://policy:1", "user": "http://user:2"}

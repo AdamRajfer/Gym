@@ -46,6 +46,8 @@ from nemo_gym.base_responses_api_agent import (
     SimpleResponsesAPIAgent,
 )
 from nemo_gym.config_types import ModelServerRef, ResourcesServerRef
+from nemo_gym.failure_kinds import PROVIDER_UNAVAILABLE
+from nemo_gym.global_config import is_eval_mode
 from nemo_gym.openai_utils import (
     NeMoGymResponse,
     NeMoGymResponseCreateParamsNonStreaming,
@@ -547,6 +549,12 @@ class OSWorldVerifyResponse(BaseVerifyResponse):
             value = getattr(self, field_name)
             if not isinstance(value, str) or not value.strip():
                 raise ValueError(f"{field_name} must be a non-empty string")
+        # OSWorld masks only for its environment, evaluator, model-call or task-timeout failures; the model's
+        # own FAIL, horizon and unparseable answers stay unmasked. Name the mask so Gym retries it.
+        # Evaluation only: training sees the mask exactly as before, with no failure kind.
+        if self.mask_sample and self.failure_kind is None and is_eval_mode():
+            self.failure_kind = PROVIDER_UNAVAILABLE
+            self.failure_reason = self.failure_reason or self.runtime_admission_reason
         return self
 
 

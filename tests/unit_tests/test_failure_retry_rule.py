@@ -96,6 +96,31 @@ class TestWhereTheFailureHappened:
         """A 400 for a context overflow answers the model's own request."""
         assert failure_cause_of(_http_error(status)) == MODEL
 
+    @pytest.mark.parametrize(
+        ("status", "body"),
+        [
+            (422, b'{"error": {"message": "Budget has been exceeded! Current cost: 101.2, Max budget: 100.0"}}'),
+            (402, b'{"error": "Payment Required"}'),
+            (429, b'{"error": {"code": "insufficient_quota", "message": "You exceeded your current quota"}}'),
+            (400, b'{"error": {"type": "insufficient_quota", "message": "quota exhausted for this key"}}'),
+        ],
+        ids=["422-budget-exceeded", "402", "429-insufficient-quota", "400-insufficient-quota"],
+    )
+    def test_a_spent_budget_or_quota_is_infra(self, status: int, body: bytes) -> None:
+        """The endpoint refused to serve the key, whatever the model sent: retry, never score the model 0."""
+        assert failure_cause_of(_http_error(status, body)) == INFRA
+        # The same failure relayed as text, as the sidecar keeps it.
+        assert failure_cause_of_text(f"{status}, message='Unprocessable Entity' {body.decode()}") == INFRA
+
+    @pytest.mark.parametrize(
+        "body",
+        [b'{"error": "prompt is longer than the context window"}', b'{"error": "invalid tool schema"}', b""],
+        ids=["context-overflow", "bad-request", "no-body"],
+    )
+    def test_other_4xx_keep_their_label(self, body: bytes) -> None:
+        assert failure_cause_of(_http_error(422, body)) == MODEL
+        assert failure_cause_of_text(f"422, message='Unprocessable Entity' {body.decode()}") == MODEL
+
     def test_a_connection_error_wrapped_in_an_agent_error_is_infra(self) -> None:
         try:
             try:

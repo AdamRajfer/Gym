@@ -224,9 +224,17 @@ FAILURE_RULES: dict[str, FailureRule] = {
     "transport_ineligible": UNSCORED,
 }
 
-# 401/403: a key or route the model does not control; 408/425/429 and 5xx: an overloaded or broken service.
-# Any other 4xx answers a request the model shaped, such as output that overflows the context window.
-_INFRA_HTTP_STATUSES = frozenset({401, 403, 408, 425, 429})
+# 401/402/403: a key, a payment or a route the model does not control; 408/425/429 and 5xx: an overloaded or
+# broken service. Any other 4xx answers a request the model shaped, such as output that overflows the context
+# window, unless its body reports a spent budget or quota (``_SPENT_BUDGET_PATTERN``).
+_INFRA_HTTP_STATUSES = frozenset({401, 402, 403, 408, 425, 429})
+# An endpoint that refuses a key whose budget or quota is spent answers with a 4xx (a proxy's 422 "Budget has been
+# exceeded", OpenAI's insufficient_quota): the same request succeeds once the budget is restored.
+_SPENT_BUDGET_PATTERN = re.compile(
+    r"budget has been exceeded|insufficient_quota|exceeded your current quota|quota (?:has been )?exhausted"
+    r"|credit balance is too low|max budget",
+    re.IGNORECASE,
+)
 
 # Matched against every class in an exception's MRO, so subclasses (aiohttp's ClientConnectorError,
 # LiteLLM's wrappers of the OpenAI SDK errors) count too. A bare TimeoutError is not listed: it is the
@@ -348,6 +356,8 @@ def failure_cause_of(error: BaseException) -> FailureCause:
         status = getattr(current, "status", None)
         if isinstance(status, int) and _is_infra_status(status):
             return INFRA
+        if isinstance(status, int) and 400 <= status < 500 and _reports_spent_budget(current):
+            return INFRA
         if any(cls.__name__ in _INFRA_EXCEPTION_NAMES for cls in type(current).__mro__):
             return INFRA
         if isinstance(current, TimeoutError) and _raised_in_infra_module(current):
@@ -366,7 +376,17 @@ def failure_cause_of_text(text: str) -> FailureCause:
         return INFRA
     if any(_is_infra_status(int(status)) for status in _RESPONSE_STATUS_PATTERN.findall(text)):
         return INFRA
+    if _SPENT_BUDGET_PATTERN.search(text):
+        return INFRA
     return MODEL
+
+
+def _reports_spent_budget(error: BaseException) -> bool:
+    """Whether an HTTP error's reason or body says the key's budget or quota is spent."""
+    body = getattr(error, "response_content", None)
+    if isinstance(body, bytes):
+        body = body.decode("utf-8", errors="replace")
+    return bool(_SPENT_BUDGET_PATTERN.search(f"{getattr(error, 'message', '')} {body or ''}"))
 
 
 def episode_failure_cause(error: BaseException, *, terminal: bool) -> FailureCause:

@@ -2277,17 +2277,33 @@ def _infra_unresolved_metrics(unresolved: int, owed: int, *, no_score: bool = Fa
 
 
 def _unscored_metrics_file(output_fpath: Path, rows: Iterable[Mapping[str, Any]]) -> Path:
-    """The metrics file of a settled run that scored nothing: one entry per agent, with no score in it."""
-    agents = sorted({name for name in map(_routing_identity, rows) if name})
+    """The metrics file of a settled run that scored nothing: one entry per run, with no score in it.
+
+    Runs are keyed and labelled as `_call_aggregate_metrics` keys them: a stamped row by its environment
+    server, an unstamped legacy row by its agent.
+    """
+    agent_by_key: Dict[str, Optional[str]] = {}
+    stamped: set = set()
+    for row in rows:
+        agent_name = (row.get(AGENT_REF_KEY_NAME) or {}).get("name")
+        server_name = row.get(NG_ENVIRONMENT_SERVER_KEY)
+        if isinstance(server_name, str):
+            stamped.add(server_name)
+            if agent_by_key.get(server_name) is None:
+                agent_by_key[server_name] = agent_name
+        elif agent_name:
+            agent_by_key.setdefault(agent_name, agent_name)
+    labels = label_runs(agent_by_key)
     entries = [
         {
-            AGENT_REF_KEY_NAME: {"name": name},
+            AGENT_REF_KEY_NAME: {"name": labels[key]},
+            **({NG_ENVIRONMENT_SERVER_KEY: key} if key in stamped else {}),
             "agent_metrics": {},
             "key_metrics": {},
             "group_level_metrics": [],
             "repeat_level_metrics": [],
         }
-        for name in agents
+        for key in sorted(agent_by_key, key=lambda key: labels[key])
     ]
     metrics_fpath = aggregate_metrics_path_for(output_fpath)
     metrics_fpath.write_bytes(orjson.dumps(entries, option=orjson.OPT_INDENT_2))

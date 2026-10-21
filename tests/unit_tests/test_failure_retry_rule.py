@@ -43,6 +43,7 @@ from nemo_gym.failure_kinds import (
 from nemo_gym.global_config import ROLLOUT_INDEX_KEY_NAME, TASK_INDEX_KEY_NAME
 from nemo_gym.rollout_collection import (
     MASKED_SAMPLE_FAILURE_CLASS,
+    NG_ENVIRONMENT_SERVER_KEY,
     NG_FAILURE_CAUSE_KEY,
     NG_FAILURE_CLASS_KEY,
     RolloutCollectionConfig,
@@ -54,6 +55,7 @@ from nemo_gym.rollout_collection import (
     _infra_unresolved_counts,
     _infra_unresolved_metrics,
     _masked_result_names_infra,
+    _unscored_metrics_file,
     failure_cause_of_row,
     failures_path_for,
     is_infra_unresolved,
@@ -574,6 +576,27 @@ class TestInfraUnresolved:
             assert metrics["rollouts_infra_unresolved"] == unresolved
         printed = capsys.readouterr().out
         assert f"{unresolved} rows unresolved for infra" in printed and "resubmit" not in printed
+
+    @pytest.mark.parametrize(
+        ("rows", "expected"),
+        [
+            (
+                [
+                    {"agent_ref": {"name": "agent_x"}, NG_ENVIRONMENT_SERVER_KEY: "env1"},
+                    {"agent_ref": {"name": "agent_x"}, NG_ENVIRONMENT_SERVER_KEY: "env2"},
+                ],
+                [("env1", "env1"), ("env2", "env2")],
+            ),
+            ([{NG_ENVIRONMENT_SERVER_KEY: "env1"}], [("env1", "env1")]),
+            ([{"agent_ref": {"name": "agent"}}], [("agent", None)]),
+        ],
+        ids=["two-servers-one-agent", "native-row", "unstamped-legacy-row"],
+    )
+    def test_scoreless_entries_keep_their_environment_server(self, rows: list, expected: list, tmp_path: Path) -> None:
+        """Bot 4339235393: scoreless entries are keyed and labelled as scored entries are."""
+        entries = orjson.loads(_unscored_metrics_file(tmp_path / "out.jsonl", rows).read_bytes())
+        assert [(e["agent_ref"]["name"], e.get(NG_ENVIRONMENT_SERVER_KEY)) for e in entries] == expected
+        assert all(e["key_metrics"] == {} for e in entries)
 
     async def test_a_resume_with_nothing_left_to_dispatch_still_reports_incomplete(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch

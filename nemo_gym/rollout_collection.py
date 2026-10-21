@@ -5059,13 +5059,18 @@ class RolloutAggregationHelper(BaseModel):
             no_row.extend(
                 _missing_rollout_rows_counted_as_zero([materialized_fpath], [failures_fpath], set(shard_keys[path]))
             )
+        # A rollout one shard has no row for may have landed, or failed, in another: count each rollout once.
+        if no_row and not result_ids and results:
+            result_ids = {_identity_key(r, group) for r in results}
+        accounted = result_ids | set(latest_failures)
+        unaccounted: List[Dict[str, Any]] = []
+        for zero in no_row:
+            if _identity_key(zero, group) not in accounted:
+                accounted.add(_identity_key(zero, group))
+                unaccounted.append(zero)
         missing: List[Dict[str, Any]] = []
         if config.count_missing_rollouts_as_zero or config.count_infra_unresolved_as_zero:
-            accounted = result_ids | set(latest_failures)
-            for zero in no_row:
-                if _identity_key(zero, group) not in accounted:
-                    accounted.add(_identity_key(zero, group))
-                    missing.append(zero)
+            missing = unaccounted
             print(f"Counting {len(missing)} materialized rollout(s) with no row as scored zeros")
             counted.extend(missing)
         if counted:
@@ -5080,8 +5085,8 @@ class RolloutAggregationHelper(BaseModel):
             failure_attempts,
             result_ids,
             # A failure another shard recovered is not owed a second time.
-            expected=len(results) + len(set(latest_failures) - result_ids) + len(missing if missing else no_row),
-            missing=len(missing if missing else no_row),
+            expected=len(results) + len(set(latest_failures) - result_ids) + len(unaccounted),
+            missing=len(unaccounted),
         )
         completeness = _annotate_infra_unresolved(aggregate_metrics_fpath, _infra_unresolved_metrics(unresolved, owed))
         if batch_tracker is not None:

@@ -8149,6 +8149,32 @@ class TestRolloutAggregationHelper:
         assert coverage["rollouts_infra_unresolved_rate"] == pytest.approx(1 / 49)
         assert coverage["publishable"] is False
 
+    async def test_a_rollout_another_shard_landed_is_not_missing(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, empty_global_config: MagicMock
+    ) -> None:
+        """Bot 4339235334: the original shard has no row for task 0, the retry shard does; nothing is missing."""
+        original, retry = tmp_path / "a" / "rollouts.jsonl", tmp_path / "b" / "rollouts.jsonl"
+        server = {NG_ENVIRONMENT_SERVER_KEY: "env_a"}
+        self._write_rows(materialized_path_for(original), *(self._rollout(i, "agent_a", **server) for i in range(2)))
+        self._write_rows(original, self._rollout(1, "agent_a", reward=1.0, **server))
+        self._write_rows(materialized_path_for(retry), self._rollout(0, "agent_a", **server))
+        self._write_rows(retry, self._rollout(0, "agent_a", reward=1.0, **server))
+        exported: list[dict] = []
+        monkeypatch.setattr(nemo_gym.rollout_collection, "get_exporters", lambda: [object()])
+        monkeypatch.setattr(nemo_gym.rollout_collection, "export_metrics", lambda m, **kw: exported.append(m))
+        self._serve(monkeypatch, {}, {"env_a": "agent_a"})
+
+        metrics_fpath = await RolloutAggregationHelper().run_from_config(
+            RolloutAggregationConfig(
+                input_glob=f"{original},{retry}",
+                output_jsonl_fpath=str(tmp_path / "merged.jsonl"),
+                disable_health_check=True,
+            )
+        )
+
+        # A complete run carries no completeness fields.
+        assert "rollouts_complete" not in orjson.loads(metrics_fpath.read_bytes())[0]["key_metrics"]
+
     async def test_gym_eval_aggregate_reports_infra_failures_that_persist(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, empty_global_config: MagicMock
     ) -> None:

@@ -86,6 +86,17 @@ def test_saved_v3_rollouts_score_an_empty_answer_as_live_evaluation_does(monkeyp
     assert metrics["win_rate_no_SC"] == approx(0.5, abs=0.05)
 
 
+def test_cleanup_keeps_a_verified_empty_v3_answer_and_removes_a_missing_judgment():
+    """An empty v3 answer is a scored loss; deleting it would rerun a real policy loss on resume."""
+    from resources_servers.arena.scripts.remove_failed_rollouts import is_failed_rollout
+
+    empty = {"category": "lmarena_v3", "policy_answer": None, "policy_reasoning": None, "games": None}
+    missing_judgment = {"category": "lmarena_v3", "policy_answer": "an answer", "policy_reasoning": "", "games": None}
+
+    assert not is_failed_rollout(empty)
+    assert is_failed_rollout(missing_judgment)
+
+
 def test_anchored_elo_requires_two_parsed_judge_games():
     dataset = {"q1": {"question_id": "q1", "baseline_model": "opponent"}}
     verdicts = {"q1": {"games": [{"verdict": "[[A>>B]]"}, {"verdict": None}]}}

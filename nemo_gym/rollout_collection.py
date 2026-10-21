@@ -104,6 +104,7 @@ from nemo_gym.observability.model_calls import (
 )
 from nemo_gym.path_utils import aggregate_metrics_path_for, failures_path_for, materialized_path_for
 from nemo_gym.prompt import apply_prompt_to_row, load_prompt_config, validate_prompt_compatibility
+from nemo_gym.reward_profile import NG_COUNTED_FAILURE_KEY
 from nemo_gym.rollout_correlation import maybe_rollout_id_from_run_body
 from nemo_gym.rollout_observability import (
     NG_AGENT_OBSERVATIONS_KEY,
@@ -2220,6 +2221,8 @@ def _counted_failure_row(row: Dict[str, Any]) -> Dict[str, Any]:
     # answer, failure diagnostics, and training mask remain untouched in the sidecar.
     scored["mask_sample"] = False
     scored.setdefault("reward", 0.0)
+    # Benchmark scorers read channels other than reward (math's symbolic accuracy); this row scores 0 on each.
+    scored[NG_COUNTED_FAILURE_KEY] = True
     return scored
 
 

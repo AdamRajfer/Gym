@@ -441,6 +441,21 @@ class TestApp:
             response = asyncio.run(server.run(self._example_run_request()))
         assert response.model_dump(mode="json")[NG_FAILURE_CLASS_KEY] == "tau2_empty_output"
 
+    def test_aggregation_of_a_run_whose_every_rollout_failed(self) -> None:
+        """Every rollout a failure counted as 0: no assistant message, and still a score, not a crash."""
+        from nemo_gym.rollout_collection import _counted_failure_row
+
+        _, server = self._dummy_server()
+        body = self._example_run_request()
+        failure = server._failure_response(body, server._sanitized_record(body), "tau2_agent_error", "RuntimeError: x")
+        row = _counted_failure_row(
+            {**body.model_dump(mode="json"), **failure.model_dump(mode="json"), "_ng_task_index": 0}
+        )
+
+        metrics = server.compute_metrics([[row]])
+
+        assert metrics["messages_with_incomplete_reasoning/pct"] == 0
+
     def test_the_client_tells_the_user_simulator_from_the_policy(self) -> None:
         urls = {"policy": "http://policy:1", "user": "http://user:2"}
         with patch("responses_api_agents.tau2.app.get_server_url", side_effect=urls.__getitem__):

@@ -621,7 +621,8 @@ class Tau2Agent(SimpleResponsesAPIAgent):
             "trajectory_missing_tool_call/count": missing_tool_call,
             "trajectory_missing_tool_call/pct": missing_tool_call / total_count,
             "messages_with_incomplete_reasoning/count": incomplete_reasoning,
-            "messages_with_incomplete_reasoning/pct": incomplete_reasoning / total_num_assistant_messages,
+            # A run of failures counted as 0 has no assistant message at all.
+            "messages_with_incomplete_reasoning/pct": incomplete_reasoning / max(total_num_assistant_messages, 1),
         }
         self.__key_metrics = list(res.keys())
         return res

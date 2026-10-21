@@ -21,6 +21,7 @@ from typing import Any, Protocol
 import numpy as np
 import tiktoken
 
+from nemo_gym.global_config import is_eval_mode
 from resources_servers.arena.arena import (
     _VERDICT_LABEL_BOTH_BAD,
     _VERDICT_LABELS_TIE,
@@ -33,6 +34,8 @@ from resources_servers.arena.taxonomy import MIN_SLICE_PROMPTS, PROMPT_CATEGORY_
 
 
 logger = logging.getLogger(__name__)
+# The per-rollout reward statistics Gym's profiler publishes; a run past the failed-rollout gate nulls them.
+_REWARD_STATS = ("mean", "median", "min", "max", "std")
 DECISIVE_VERDICTS = {"[[A>>B]]", "[[A>B]]", "[[B>A]]", "[[B>>A]]"}
 
 
@@ -133,8 +136,20 @@ class ArenaMetrics:
                 reasoning_only = bool(reasoning) and not response
                 reasoning_only_response_rollouts += int(reasoning_only)
                 incomplete_reason = ((rollout.get("response") or {}).get("incomplete_details") or {}).get("reason")
+                # In evaluation a fully empty answer is a lost game, as LMArena's own scoring treats it, not a rollout
+                # left out of the score. Only a verified answer carries policy_answer, which tells it apart from a
+                # judge failure or a missing rollout counted as 0.
+                empty_answer = (
+                    is_eval_mode()
+                    and "policy_answer" in rollout
+                    and not response
+                    and not reasoning
+                    and rollout.get("games") is None
+                )
                 if self.config.style_control_method == "reference_length" and (
-                    incomplete_reason == "max_output_tokens" or (incomplete_reason is None and reasoning_only)
+                    incomplete_reason == "max_output_tokens"
+                    or (incomplete_reason is None and reasoning_only)
+                    or empty_answer
                 ):
                     if incomplete_reason == "max_output_tokens":
                         # Context-window rejections have no usage because generation never started.
@@ -252,12 +267,25 @@ class ArenaMetrics:
             return {}
 
         failure_rate = failed_rollouts / total_rollouts
-        if failure_rate > self.config.max_rollout_failure_rate:
+        failure_rate_exceeded = failure_rate > self.config.max_rollout_failure_rate
+        if failure_rate_exceeded and not is_eval_mode():
             raise ValueError(
                 f"Too many failed rollouts: {failed_rollouts}/{total_rollouts} "
                 f"({failure_rate * 100:.1f}%) exceeds max_rollout_failure_rate="
                 f"{self.config.max_rollout_failure_rate * 100:.1f}%. "
                 "Check gen_answer and gen_judgment API errors."
+            )
+        # In evaluation a run past the gate finishes but publishes no score: rollout collection has already retried
+        # every judge failure up to the attempt cap, so raising would fail a run with nothing left to run and make
+        # auto-resume rerun it. The gate matches Arena-Hard-Auto's: above it, the win rate is not a measurement.
+        if failure_rate_exceeded:
+            logger.warning(
+                "Too many failed rollouts: %d/%d (%.1f%%) exceeds max_rollout_failure_rate=%.1f%%; "
+                "the run publishes no win rate. Check gen_answer and gen_judgment API errors.",
+                failed_rollouts,
+                total_rollouts,
+                failure_rate * 100,
+                self.config.max_rollout_failure_rate * 100,
             )
 
         if self.config.style_control_method == "reference_length":
@@ -266,6 +294,8 @@ class ArenaMetrics:
         metrics.update(
             {
                 "rollout_failure_rate": failure_rate,
+                "max_rollout_failure_rate": self.config.max_rollout_failure_rate,
+                "failed_rollout_gate": failure_rate_exceeded,
                 "reasoning_only_response_rate": reasoning_only_response_rollouts / total_rollouts,
                 "missing_judgment_rate": missing_judgment_rollouts / total_rollouts,
                 "parse_failure_rate": parse_failure_rollouts / total_rollouts,
@@ -273,6 +303,10 @@ class ArenaMetrics:
                 "any_tie_rate": any_tie_rollouts / total_rollouts,
             }
         )
+        if failure_rate_exceeded:
+            # Withhold every headline: no win rate, and the reward statistics the profiler computed are nulled.
+            metrics.update({f"{stat}/reward": None for stat in _REWARD_STATS})
+            return metrics
         if not scores_by_category:
             return metrics
 
@@ -344,6 +378,8 @@ class ArenaMetrics:
             "max_token_reached_rate",
             "context_window_exceeded_rate",
             "rollout_failure_rate",
+            "max_rollout_failure_rate",
+            "failed_rollout_gate",
             "reasoning_only_response_rate",
             "missing_judgment_rate",
             "parse_failure_rate",

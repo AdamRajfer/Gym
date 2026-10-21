@@ -42,13 +42,30 @@ def ray_extra(run: dict[str, Any]) -> tuple[str, ...]:
         _, configs = GlobalConfigDictParser().load_extra_config_paths(list(run.get(CONFIG_PATHS_KEY_NAME) or []))
         servers = []
         if configs:
-            merged = OmegaConf.to_container(OmegaConf.merge(*configs), resolve=False)
+            merged = OmegaConf.merge(*configs)
+            # The run's overrides win over the files, as at runtime, where each reaches `gym eval run` as a
+            # dotted `+key.path=value` (see flatten_run_args). Values stay unresolved.
+            for path, value in _run_override_paths(run):
+                OmegaConf.update(merged, path, value, force_add=True)
+            merged = OmegaConf.to_container(merged, resolve=False)
             servers = list(_configured_servers(OmegaConf.create(_without_empty_mappings(merged))))
     except (ConfigError, OmegaConfBaseException) as e:
         logger.warning("Could not load the benchmark configs to check whether it needs Ray: %s", e)
         return ()
     uses_ray = any(entrypoint_ray_enabled(s.dir_path / s.entrypoint_fpath) is True for s in servers)
     return ("ray",) if uses_ray else ()
+
+
+def _run_override_paths(run: dict[str, Any], prefix: str = "") -> list[tuple[str, Any]]:
+    """The (dotted path, value) pairs that flatten_run_args turns the run config into."""
+    pairs = []
+    for key, value in run.items():
+        full_key = f"{prefix}.{key}" if prefix else key
+        if isinstance(value, dict):
+            pairs.extend(_run_override_paths(value, full_key))
+        elif full_key != CONFIG_PATHS_KEY_NAME:
+            pairs.append((full_key, value))
+    return pairs
 
 
 def _without_empty_mappings(value: object) -> object:

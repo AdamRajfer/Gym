@@ -104,6 +104,49 @@ def test_a_config_that_does_not_load_keeps_the_plain_install(tmp_path, monkeypat
     assert _PLAIN_INSTALL in _slurm_script(_config([config_path]))
 
 
+def _write_server(root: Path, name: str, *, ray_enabled: bool) -> None:
+    server_dir = root / "resources_servers" / name
+    server_dir.mkdir(parents=True)
+    (server_dir / "requirements.txt").write_text("nemo-gym\n")
+    (server_dir / "app.py").write_text(f"class Server:\n    ray_enabled = {ray_enabled}\n\nServer.run_webserver()\n")
+
+
+@pytest.mark.parametrize(
+    ("file_server", "file_entrypoint", "overrides", "expected"),
+    [
+        # The entrypoint interpolates a value the run sets.
+        ("uses_ray", "${server_entrypoint}", {"server_entrypoint": "app.py"}, _RAY_INSTALL),
+        # The run points a non-Ray server at a Ray entrypoint, and the reverse.
+        (
+            "no_ray",
+            "app.py",
+            {"s": {"resources_servers": {"no_ray": {"entrypoint": "../uses_ray/app.py"}}}},
+            _RAY_INSTALL,
+        ),
+        (
+            "uses_ray",
+            "app.py",
+            {"s": {"resources_servers": {"uses_ray": {"entrypoint": "../no_ray/app.py"}}}},
+            _PLAIN_INSTALL,
+        ),
+        # A dotted key reaches `gym eval run` as the same nested path.
+        ("no_ray", "app.py", {"s.resources_servers.no_ray.entrypoint": "../uses_ray/app.py"}, _RAY_INSTALL),
+    ],
+)
+def test_run_overrides_decide_the_entrypoint_as_at_runtime(
+    tmp_path, monkeypatch, file_server, file_entrypoint, overrides, expected
+):
+    monkeypatch.chdir(tmp_path)
+    _write_server(tmp_path, "uses_ray", ray_enabled=True)
+    _write_server(tmp_path, "no_ray", ray_enabled=False)
+    config_path = tmp_path / "bench.yaml"
+    config_path.write_text(f"s:\n  resources_servers:\n    {file_server}:\n      entrypoint: {file_entrypoint}\n")
+    config = _config([str(config_path)])
+    config.driver.benchmarks["bench"].run.update(overrides)
+
+    assert expected in _slurm_script(config)
+
+
 @pytest.mark.parametrize(
     ("config_path", "expected"),
     [("benchmarks/gpqa/config.yaml", _PLAIN_INSTALL), ("benchmarks/wmt24pp/config.yaml", _RAY_INSTALL)],

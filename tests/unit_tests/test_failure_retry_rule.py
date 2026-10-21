@@ -46,6 +46,7 @@ from nemo_gym.rollout_collection import (
     RolloutCollectionConfig,
     RolloutCollectionHelper,
     _agent_request_failure_row,
+    _failure_rows_counted_as_zero,
     failure_cause_of_row,
     failures_path_for,
     is_terminal_failure,
@@ -125,6 +126,25 @@ class TestWhereTheFailureHappened:
     def test_text_naming_only_a_model_output_error_is_the_models(self) -> None:
         assert failure_cause_of_text("Tau2MalformedToolCallError: tool call 0 arguments is invalid JSON") == MODEL
         assert failure_cause_of_text("400, message='prompt is longer than the context window'") == MODEL
+
+
+class TestAFinalFailureScoresZero:
+    """A final failure is a score of 0, even when its row carries a reward."""
+
+    def _sidecar(self, tmp_path: Path, row: dict) -> Path:
+        failures = tmp_path / "out_failures.jsonl"
+        failures.write_bytes(orjson.dumps({TASK_INDEX_KEY_NAME: 0, ROLLOUT_INDEX_KEY_NAME: 0, **row}) + b"\n")
+        return failures
+
+    def test_a_final_row_with_a_reward_counts_as_zero(self, tmp_path: Path) -> None:
+        row = {NG_FAILURE_CLASS_KEY: "agent_run_error", "_ng_failure_cause": "model", "reward": 0.8}
+        [counted] = _failure_rows_counted_as_zero([self._sidecar(tmp_path, row)], [], set())
+        assert counted["reward"] == 0.0
+
+    def test_a_selected_retryable_row_keeps_its_reward(self, tmp_path: Path) -> None:
+        row = {NG_FAILURE_CLASS_KEY: "judge_failed", "reward": 0.8}
+        [counted] = _failure_rows_counted_as_zero([self._sidecar(tmp_path, row)], ["judge_failed"], set())
+        assert counted["reward"] == 0.8
 
 
 class TestTheRuleOnSidecarRows:

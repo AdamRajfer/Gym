@@ -2154,7 +2154,7 @@ def _failure_rows_counted_as_zero(
     """
     latest_by_key = _latest_failure_rows(failures_fpaths)
     return [
-        _counted_failure_row(row)
+        _counted_failure_row(row, final=is_terminal_failure(row, retry_terminal_timeouts=retry_terminal_timeouts))
         for key, row in latest_by_key.items()
         if key not in scored_keys
         and _counts_failure_class(row, failure_classes, retry_terminal_timeouts=retry_terminal_timeouts)
@@ -2206,7 +2206,7 @@ def _every_rollout_settled(rows: List[Dict[str, Any]], failures_fpath: Path, ret
     return all((row[TASK_INDEX_KEY_NAME], row[ROLLOUT_INDEX_KEY_NAME]) in settled for row in rows)
 
 
-def _counted_failure_row(row: Dict[str, Any]) -> Dict[str, Any]:
+def _counted_failure_row(row: Dict[str, Any], *, final: bool = False) -> Dict[str, Any]:
     """The metric-input copy of a sidecar row counted as zero."""
     # Diagnostics stay in the sidecar: an HTTP status is a number, and the aggregator
     # averages every number it is handed.
@@ -2218,6 +2218,9 @@ def _counted_failure_row(row: Dict[str, Any]) -> Dict[str, Any]:
     # This metrics-only copy honors the explicit denominator policy. The original
     # answer, failure diagnostics, and training mask remain untouched in the sidecar.
     scored["mask_sample"] = False
+    # A final failure scores 0 whatever reward its row carries; a selected retryable row keeps its reward.
+    if final:
+        scored["reward"] = 0.0
     scored.setdefault("reward", 0.0)
     return scored
 
@@ -4769,7 +4772,7 @@ class RolloutAggregationHelper(BaseModel):
         )
         # A row that names no agent and no server cannot reach any server's metrics; it stays a dropped one.
         counted = [
-            _counted_failure_row(row)
+            _counted_failure_row(row, final=is_terminal_failure(row))
             for identity, row in latest_failures.items()
             if identity not in result_ids
             and _counts_failure_class(row, config.count_failure_classes_as_zero)

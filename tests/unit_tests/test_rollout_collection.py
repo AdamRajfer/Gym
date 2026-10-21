@@ -8175,6 +8175,38 @@ class TestRolloutAggregationHelper:
         # A complete run carries no completeness fields.
         assert "rollouts_complete" not in orjson.loads(metrics_fpath.read_bytes())[0]["key_metrics"]
 
+    async def test_a_resume_that_completes_clears_the_exported_completeness(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, empty_global_config: MagicMock
+    ) -> None:
+        """Bot 4339235378: MLflow and W&B reopen the earlier run, so a complete pass must overwrite its fields."""
+        original, retry = tmp_path / "a" / "rollouts.jsonl", tmp_path / "b" / "rollouts.jsonl"
+        server = {NG_ENVIRONMENT_SERVER_KEY: "env_a"}
+        self._write_rows(materialized_path_for(original), *(self._rollout(i, "agent_a", **server) for i in range(2)))
+        self._write_rows(original, self._rollout(1, "agent_a", reward=1.0, **server))
+        self._write_rows(
+            _failures_path_for(original),
+            self._rollout(0, "agent_a", **{NG_FAILURE_CLASS_KEY: "judge_failed", **server}),
+        )
+        self._write_rows(materialized_path_for(retry), self._rollout(0, "agent_a", **server))
+        self._write_rows(retry, self._rollout(0, "agent_a", reward=1.0, **server))
+        tracked: dict = {}  # One tracking run that both passes log into, as a reopened MLflow run is.
+        monkeypatch.setattr(nemo_gym.rollout_collection, "get_exporters", lambda: [object()])
+        monkeypatch.setattr(nemo_gym.rollout_collection, "export_metrics", lambda m, **kw: tracked.update(m))
+        self._serve(monkeypatch, {}, {"env_a": "agent_a"})
+
+        for shards in ([original], [original, retry]):
+            metrics_fpath = await RolloutAggregationHelper().run_from_config(
+                RolloutAggregationConfig(
+                    input_glob=",".join(str(shard) for shard in shards),
+                    output_jsonl_fpath=str(tmp_path / "merged.jsonl"),
+                    disable_health_check=True,
+                )
+            )
+
+        assert (tracked["rollouts_infra_unresolved"], tracked["rollouts_infra_unresolved_rate"]) == (0, 0.0)
+        assert (tracked["rollouts_complete"], tracked["publishable"]) == (True, True)
+        assert "rollouts_complete" not in orjson.loads(metrics_fpath.read_bytes())[0]["key_metrics"]
+
     async def test_gym_eval_aggregate_reports_infra_failures_that_persist(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, empty_global_config: MagicMock
     ) -> None:

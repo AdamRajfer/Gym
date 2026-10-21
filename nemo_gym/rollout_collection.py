@@ -2298,11 +2298,11 @@ def _annotate_infra_unresolved(metrics_fpath: Optional[Path], fields: Mapping[st
     """Add the completeness fields to each agent entry of an aggregate-metrics file, and log the count.
 
     Like the coverage block, they appear only when the run is incomplete, so a complete run publishes exactly
-    the keys it published before; their absence means complete and publishable. Returns the fields it added,
-    for the exporters, or ``{}``.
+    the keys it published before; their absence means complete and publishable. Returns the fields for the
+    exporters in every case: MLflow and W&B reopen a resumed run, so a complete pass must overwrite them.
     """
     if fields["rollouts_complete"]:
-        return {}
+        return dict(fields)
     print(
         f"{fields['rollouts_infra_unresolved']} rows unresolved for infra "
         f"({fields['rollouts_infra_unresolved_rate']:.1%}) of the rollouts owed a score",

@@ -5098,6 +5098,18 @@ class RolloutAggregationHelper(BaseModel):
         aggregate_metrics_fpath = await helper._call_aggregate_metrics(
             scored, scored, output_fpath, raise_on_error=False
         )
+        # Nothing scored, and a resume would dispatch nothing: the run reports itself incomplete, as collection does.
+        no_score = (
+            not scored
+            and bool(latest_failures)
+            and not unaccounted
+            and all(
+                is_terminal_failure(row) or failure_attempts[identity] >= max_attempts
+                for identity, row in latest_failures.items()
+            )
+        )
+        if no_score:
+            aggregate_metrics_fpath = _unscored_metrics_file(output_fpath, list(latest_failures.values()))
         unresolved, owed = _infra_unresolved_counts(
             latest_failures,
             failure_attempts,
@@ -5106,7 +5118,9 @@ class RolloutAggregationHelper(BaseModel):
             expected=len(results) + len(set(latest_failures) - result_ids) + len(unaccounted),
             missing=len(unaccounted),
         )
-        completeness = _annotate_infra_unresolved(aggregate_metrics_fpath, _infra_unresolved_metrics(unresolved, owed))
+        completeness = _annotate_infra_unresolved(
+            aggregate_metrics_fpath, _infra_unresolved_metrics(unresolved, owed, no_score=no_score)
+        )
         if batch_tracker is not None:
             batch_tracker.write_status(
                 batch_completed_rows,

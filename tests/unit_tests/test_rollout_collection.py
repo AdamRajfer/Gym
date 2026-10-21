@@ -8207,6 +8207,37 @@ class TestRolloutAggregationHelper:
         assert (tracked["rollouts_complete"], tracked["publishable"]) == (True, True)
         assert "rollouts_complete" not in orjson.loads(metrics_fpath.read_bytes())[0]["key_metrics"]
 
+    @pytest.mark.parametrize("attempts", [1, 2], ids=["settled-at-cap", "retryable-below-cap"])
+    async def test_gym_eval_aggregate_of_a_settled_scoreless_run_reports_incomplete(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, empty_global_config: MagicMock, attempts: int
+    ) -> None:
+        """Bot 4339235356: offline aggregation writes the scoreless artifact that collection writes."""
+        monkeypatch.setenv("NEMO_GYM_MAX_ROLLOUT_ATTEMPTS", str(attempts))
+        run = tmp_path / "run" / "rollouts.jsonl"
+        server = {NG_ENVIRONMENT_SERVER_KEY: "env_a"}
+        self._write_rows(materialized_path_for(run), self._rollout(0, "agent_a", **server))
+        self._write_rows(run)
+        self._write_rows(
+            _failures_path_for(run), self._rollout(0, "agent_a", **{NG_FAILURE_CLASS_KEY: "judge_failed", **server})
+        )
+        self._serve(monkeypatch, {}, {"env_a": "agent_a"})
+
+        metrics_fpath = await RolloutAggregationHelper().run_from_config(
+            RolloutAggregationConfig(
+                input_glob=str(run), output_jsonl_fpath=str(tmp_path / "out.jsonl"), disable_health_check=True
+            )
+        )
+
+        if attempts > 1:
+            # A resume still runs the failure, so there is nothing to report yet.
+            assert metrics_fpath is None
+            return
+        [entry] = orjson.loads(metrics_fpath.read_bytes())
+        key_metrics = entry["key_metrics"]
+        assert "mean/reward" not in key_metrics and entry[NG_ENVIRONMENT_SERVER_KEY] == "env_a"
+        assert key_metrics["rollouts_infra_unresolved"] == 1
+        assert (key_metrics["rollouts_complete"], key_metrics["publishable"]) == (False, False)
+
     async def test_gym_eval_aggregate_reports_infra_failures_that_persist(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, empty_global_config: MagicMock
     ) -> None:

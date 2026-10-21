@@ -1208,3 +1208,26 @@ def test_close_session_accepts_cookie_and_typed_bodies_over_http() -> None:
     assert typed_close.status_code == 200
     assert typed_close.json()["resources_session_id"] == "session"
     assert malformed_close.status_code == 422
+
+
+@pytest.mark.parametrize("source", ["defaults", "shipped config"])
+def test_a_hung_test_reaches_its_own_deadline_inside_the_verification_ceilings(source: str) -> None:
+    """Review finding 4339108862: the test command's own timeout must fire before any surrounding ceiling.
+
+    Otherwise a hung test is cancelled by the attempt or total ceiling, reported as provider_unavailable and
+    retried, instead of scoring unresolved as the official harness's single per-instance timeout does.
+    """
+    from omegaconf import OmegaConf
+
+    from resources_servers.swebench_pro.app import SWEBenchProResourcesServerConfig
+
+    shipped = OmegaConf.to_container(
+        OmegaConf.load(Path(__file__).resolve().parents[1] / "configs" / "swebench_pro.yaml")
+    )["swebench_pro_resources_server"]["resources_servers"]["swebench_pro"]
+    defaults = SWEBenchProResourcesServerConfig.model_fields
+    value = (lambda key: defaults[key].default) if source == "defaults" else shipped.get
+    evaluation_timeout = shipped["evaluation_timeout"]
+    # One attempt: sandbox creation, the test command, then the 60 s parser run that follows a timeout.
+    attempt = shipped["sandbox_config"]["ready_timeout_s"] + evaluation_timeout + 60
+    assert value("verification_attempt_timeout") > attempt
+    assert value("verification_total_timeout") >= value("verification_attempt_timeout")

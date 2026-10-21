@@ -442,7 +442,9 @@ class VerifiersAgent(SimpleResponsesAPIAgent):
         shared_client = self.client_cache[cache_key]
         rollout_id = self._rollout_id_for(body, request)
         if rollout_id is None:
-            return shared_client
+            # Evaluation reads a swallowed policy outage from a per-rollout recording client; training keeps
+            # the shared one.
+            return _ResponseIdRecordingClient(shared_client.client.copy()) if is_eval_mode() else shared_client
 
         model_server_url = self.resolve_model_base_url(self.config.model_server.name, rollout_id)
         headers = {"x-session-id": invocation_id} if invocation_id else {}

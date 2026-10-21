@@ -2234,3 +2234,44 @@ class TestApp:
         assert response.reward == 0.0
         assert response.verifier_metadata["osworld_score"] == 0.4
         assert response.verifier_metadata["osworld_finished"] is False
+
+
+@pytest.mark.parametrize(
+    ("policy_stop_reason", "failure_kind"),
+    [("model_context_overflow", None), ("model_call_failed", "provider_unavailable")],
+    ids=["context-budget-exhausted", "transport-failure"],
+)
+def test_a_context_overflow_mask_is_not_named_infra_in_evaluation(
+    monkeypatch: pytest.MonkeyPatch, policy_stop_reason: str, failure_kind: Optional[str]
+) -> None:
+    """Review finding 4339108867: an exhausted context budget is the model's, so evaluation does not retry it."""
+    from nemo_gym.rollout_collection import _masked_result_names_infra
+
+    monkeypatch.setattr("responses_api_agents.osworld_agent.app.is_eval_mode", lambda: True)
+    request = make_run_request(osworld_task=DEFAULT_OSWORLD_TASK)
+    result = {
+        **DEFAULT_RUN_RESULT,
+        "reward": 0.0,
+        "score": 0.0,
+        "finished": False,
+        "runtime_eligible": False,
+        "runtime_admission_reason": "model_call_failed",
+        "mask_sample": True,
+        "error": "Error code: 400 - maximum context length exceeded",
+        "termination_reason": "model_call_failed",
+        "policy_stop_reason": policy_stop_reason,
+    }
+
+    response = _build_response(request, result, "test-policy", 1.0, 0.9)
+
+    assert response.mask_sample is True
+    assert response.policy_stop_reason == policy_stop_reason
+    assert response.failure_kind == failure_kind
+    assert _masked_result_names_infra(response.model_dump()) is (failure_kind is not None)
+
+
+def test_the_context_overflow_stop_reason_is_the_adapters() -> None:
+    from responses_api_agents.osworld_agent.adapter_agents import MODEL_FAILURE_OUTCOMES
+    from responses_api_agents.osworld_agent.app import CONTEXT_OVERFLOW_STOP_REASON
+
+    assert MODEL_FAILURE_OUTCOMES["context_overflow"] == CONTEXT_OVERFLOW_STOP_REASON

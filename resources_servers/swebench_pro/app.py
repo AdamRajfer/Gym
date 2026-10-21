@@ -123,17 +123,20 @@ class SWEBenchProResourcesServerConfig(BaseResourcesServerConfig):
     inconclusive_verification_retries: int = 2
     # Ceiling on ONE verification attempt, covering sandbox creation as well as
     # the verification run. `evaluation_timeout` bounds only the test command
-    # inside the sandbox, so creation is otherwise unbounded here. 1200s is
-    # ~2.6x the p99 of observed per-rollout verification (461s) and above the
-    # healthy maximum (735s), while still cutting the multi-attempt pile-ups
-    # that leave dozens of verifications in flight at a job's wall clock.
-    verification_attempt_timeout: float | None = 1200.0
+    # inside the sandbox, so creation is otherwise unbounded here. The ceiling
+    # must leave room for a whole attempt, so a hung test reaches its own
+    # deadline and scores unresolved instead of being cancelled and retried as
+    # an infra failure: sandbox readiness (1200s) + the shipped evaluation_timeout
+    # (3600s) + the 60s parser run after a timeout = 4860s, plus a margin for the
+    # unbounded chmod and log reads. Healthy attempts finish far inside it (p99 461s).
+    verification_attempt_timeout: float | None = 5400.0
     # Ceiling on ALL attempts for one rollout. Without it the worst case is
     # `1 + inconclusive_verification_retries` times the per-attempt ceiling,
     # which can exceed what remains of the job's wall clock -- and a rollout
     # that never returns holds the whole run open, because collection ends only
     # when the last rollout does.
-    verification_total_timeout: float | None = 2700.0
+    # At least one whole attempt, plus room for retries after fast inconclusive attempts.
+    verification_total_timeout: float | None = 7200.0
     # Cleanup gets its own, smaller ceiling: a stop() that hangs in `finally`
     # would defeat the attempt timeout it runs after.
     verification_stop_timeout: float | None = 120.0

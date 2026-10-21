@@ -129,7 +129,12 @@ from nemo_gym.server_utils import (
 )
 from nemo_gym.skills import SkillsConfig, load_skill_directory
 from nemo_gym.task_materialization import TASK_ID_FIELDS
-from nemo_gym.time_limit_diagnostics import NG_ELAPSED_S_KEY, summarize_time_limits
+from nemo_gym.time_limit_diagnostics import (
+    NG_ELAPSED_S_KEY,
+    NG_FAILURE_POLICY_CALL_TIMED_OUT_KEY,
+    captured_policy_call_timed_out,
+    summarize_time_limits,
+)
 from nemo_gym.token_id_capture import (
     TokenCaptureStore,
     TokenIdCaptureConfig,
@@ -3492,6 +3497,11 @@ class RolloutCollectionHelper(BaseModel):
                         f"row={json.dumps(_rollout_request_debug_summary(row), sort_keys=True)} "
                         f"class={failure_class} error={detail}"
                     )
+                    # A row written without its captures keeps the one fact the time-limit section reads from
+                    # them, so gym eval aggregate, which has no capture store, counts the same timeouts.
+                    [read_back] = _with_captures_read_back([result], capture_dirs)
+                    if read_back is not result and captured_policy_call_timed_out(read_back):
+                        serialized = orjson.dumps({**result, NG_FAILURE_POLICY_CALL_TIMED_OUT_KEY: True})
                     write_started = perf_counter()
                     failures_file.write(serialized + b"\n")
                     failures_file.flush()

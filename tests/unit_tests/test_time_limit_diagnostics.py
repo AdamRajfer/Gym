@@ -287,3 +287,59 @@ async def test_run_examples_output_is_unchanged(monkeypatch: pytest.MonkeyPatch)
 
     assert results == [reply, reply]
     summarize.assert_not_called()
+
+
+class TestRecordedCaptureTimeout:
+    """Review finding 4339034965 (follow-up to #4841): gym eval aggregate counts capture-only timeouts."""
+
+    def test_a_recorded_policy_call_timeout_is_a_timeout_and_not_a_metric(self) -> None:
+        from nemo_gym.rollout_collection import _counted_failure_row
+        from nemo_gym.time_limit_diagnostics import NG_FAILURE_POLICY_CALL_TIMED_OUT_KEY
+
+        row = rollout(100, **{NG_FAILURE_CLASS_KEY: "agent_run_error", NG_FAILURE_POLICY_CALL_TIMED_OUT_KEY: True})
+        assert ran_out_of_time(row)
+        assert NG_FAILURE_POLICY_CALL_TIMED_OUT_KEY not in _counted_failure_row(row)
+
+    async def test_aggregate_counts_a_timeout_collection_read_back_from_captures(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, empty_global_config
+    ) -> None:
+        replies = iter([FakeResponse(200, {"reward": 1.0}), FakeResponse(500, {"error": "agent crashed"})])
+
+        async def post(server_name: str, url_path: str, json, **kwargs) -> FakeResponse:
+            if url_path == "/run":
+                return next(replies)
+            return FakeResponse(200, compute_aggregate_metrics([dict(r) for r in json.verify_responses]).model_dump())
+
+        def capture_store(record: dict, dirs, **kwargs) -> dict:
+            # The store holds a timed-out policy call only for the rollout that failed (task 1).
+            calls = [timed_out_policy_call()] if record.get(TASK_INDEX_KEY_NAME) == 1 else []
+            record["ng_model_call_capture"] = {"calls": calls}
+            return record
+
+        install_fake_server_client(monkeypatch, AsyncMock(side_effect=post))
+        monkeypatch.setattr(nemo_gym.rollout_collection, "model_call_capture_dirs_from_config", lambda _: [tmp_path])
+        monkeypatch.setattr(nemo_gym.rollout_collection, "merge_model_call_capture_into_record", capture_store)
+        output = tmp_path / "rollouts.jsonl"
+        await RolloutCollectionHelper().run_from_config(
+            RolloutCollectionConfig(
+                input_jsonl_fpath=str(_input(tmp_path, 2)),
+                output_jsonl_fpath=str(output),
+                disable_health_check=True,
+                num_samples_in_parallel=1,
+                route_failures_to_sidecar=True,
+            )
+        )
+        metrics_fpath = tmp_path / "rollouts_aggregate_metrics.json"
+        [entry] = orjson.loads(metrics_fpath.read_bytes())
+        assert (entry["time_limit"]["timed_out"], entry["time_limit"]["timed_out_share"]) == (1, 0.5)
+        [failure] = [orjson.loads(line) for line in (tmp_path / "rollouts_failures.jsonl").read_bytes().splitlines()]
+        assert "ng_model_call_capture" not in failure  # the sidecar still carries no captures
+
+        # Standalone aggregation has no capture store: the recorded evidence alone must give the same count.
+        metrics_fpath.unlink()
+        monkeypatch.setattr(nemo_gym.rollout_collection, "model_call_capture_dirs_from_config", lambda _: [])
+        await RolloutAggregationHelper().run_from_config(
+            RolloutAggregationConfig(input_glob=str(output), output_jsonl_fpath=str(output), disable_health_check=True)
+        )
+        [entry] = orjson.loads(metrics_fpath.read_bytes())
+        assert (entry["time_limit"]["timed_out"], entry["time_limit"]["timed_out_share"]) == (1, 0.5)

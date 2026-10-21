@@ -31,6 +31,9 @@ from nemo_gym.reward_profile import _stat
 
 # Collector key with the `/run` wall clock of one rollout, success or failure, in seconds.
 NG_ELAPSED_S_KEY = "_ng_elapsed_s"
+# Set by collection on a failures-sidecar row written without its captures when a captured policy call of that
+# rollout timed out, so `gym eval aggregate`, which has no capture store, sees the same evidence.
+NG_FAILURE_POLICY_CALL_TIMED_OUT_KEY = "_ng_failure_policy_call_timed_out"
 
 # Labels that already say a rollout ran out of time.
 _TIMEOUT_LABELS = frozenset({"timeout_exceeded", "agent_timeout", "transport_timeout"})
@@ -62,9 +65,16 @@ def rollout_elapsed_s(row: Mapping[str, Any]) -> Optional[float]:
 
 
 def _policy_call_timed_out(row: Mapping[str, Any]) -> bool:
+    if row.get(NG_FAILURE_POLICY_CALL_TIMED_OUT_KEY) is True:
+        return True
     capture = row.get("ng_model_call_capture")
     calls = capture.get("calls") if isinstance(capture, Mapping) else None
     return any(isinstance(call, Mapping) and call.get("error_category") == "timeout" for call in calls or [])
+
+
+def captured_policy_call_timed_out(row: Mapping[str, Any]) -> bool:
+    """Whether one of the row's captured model calls timed out."""
+    return _policy_call_timed_out(row)
 
 
 def ran_out_of_time(row: Mapping[str, Any]) -> bool:

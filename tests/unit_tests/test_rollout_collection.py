@@ -4827,12 +4827,14 @@ class TestRolloutCollection:
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, empty_global_config: MagicMock
     ) -> None:
         merged: list[int] = []
+
+        def merge(record: dict, *args, **kwargs) -> dict:
+            merged.append(record[TASK_INDEX_KEY_NAME])
+            record["ng_model_call_capture"] = {"calls": []}
+            return record
+
         monkeypatch.setattr(nemo_gym.rollout_collection, "clear_model_call_captures_for_rollouts", MagicMock())
-        monkeypatch.setattr(
-            nemo_gym.rollout_collection,
-            "merge_model_call_capture_into_record",
-            lambda record, *args, **kwargs: merged.append(record[TASK_INDEX_KEY_NAME]),
-        )
+        monkeypatch.setattr(nemo_gym.rollout_collection, "merge_model_call_capture_into_record", merge)
         monkeypatch.setattr(
             nemo_gym.rollout_collection, "model_call_capture_dirs_from_config", lambda _: [tmp_path / "capture"]
         )
@@ -4868,8 +4870,13 @@ class TestRolloutCollection:
 
         await TestRolloutCollectionHelper().run_from_config(config)
 
-        # The success and the failure that returned agent evidence are joined; the bare failure is not.
-        assert sorted(merged) == [0, 1]
+        # The success and the failure that returned agent evidence are joined; the bare failure is not. Its
+        # captures are only read back for the timeout evidence it records (review finding 4339034965).
+        rows = [orjson.loads(line) for line in (tmp_path / "output.jsonl").read_bytes().splitlines()]
+        failures = [orjson.loads(line) for line in (tmp_path / "output_failures.jsonl").read_bytes().splitlines()]
+        joined = {r[TASK_INDEX_KEY_NAME] for r in rows + failures if "ng_model_call_capture" in r}
+        assert joined == {0, 1}
+        assert sorted(merged) == [0, 1, 2]
 
     async def test_run_from_config_sanity(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, empty_global_config: MagicMock

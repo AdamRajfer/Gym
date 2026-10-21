@@ -537,6 +537,9 @@ def test_classify_task_failure(exc, expected, eval_mode, monkeypatch):
     # Outside evaluation every one of these keeps the class it always had: legitimate.
     if not eval_mode and expected == "provider_unavailable":
         expected = "legitimate"
+    # Evaluation caps a kill before the run started like every retry: kill_shaped would be re-dispatched forever.
+    if eval_mode and expected == "kill_shaped":
+        expected = "provider_unavailable"
     assert _classify_task_failure(exc) == expected
     row = {"_ng_failure_class": _classify_task_failure(exc), "grading_notes": f"run failed: {exc}"}
     if expected == "provider_unavailable":
@@ -716,3 +719,78 @@ def test_parse_result_empty_runs_defaults_grading_type(tmp_path):
     assert r["reward"] == pytest.approx(0.5)
     assert r["grading_type"] == "unknown"
     assert r["status"] == "success"
+
+
+# --- the sandbox rule: once the agent's run started, a dead or empty sandbox is the model's ---
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        SandboxKilledError("direct apptainer exec killed (rc=137)", run_started=True),
+        SandboxExecError("direct apptainer exec failed", run_started=True),
+        SandboxNoOutputError("direct apptainer exec did not produce out.tgz", run_started=True),
+    ],
+    ids=["killed", "exec-failed", "no-output"],
+)
+def test_a_sandbox_lost_after_the_run_started_is_the_models_final_zero(exc, monkeypatch):
+    # A memory bomb (137), kill -9 -1, or a deleted /sandbox/out: the model's commands can cause each one.
+    monkeypatch.setattr("responses_api_agents.pinchbench.app.is_eval_mode", lambda: True)
+    assert _classify_task_failure(exc) == "agent_run_error"
+
+
+def test_a_kill_before_the_run_started_is_retried_with_a_cap(monkeypatch):
+    # Never kill_shaped in evaluation: kill_shaped writes no sidecar row, so it is re-dispatched with no attempt cap.
+    monkeypatch.setattr("responses_api_agents.pinchbench.app.is_eval_mode", lambda: True)
+    assert _classify_task_failure(SandboxKilledError("rc=-15")) == "provider_unavailable"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("exc", "failure_class", "cause", "terminal", "no_persist"),
+    [
+        (SandboxKilledError("rc=137", run_started=True), "agent_run_error", "model", True, False),
+        (SandboxKilledError("rc=-15"), "provider_unavailable", "infra", False, False),
+        (SandboxExecError("create failed"), "provider_unavailable", "infra", False, False),
+    ],
+    ids=["killed-after-start", "killed-before-start", "exec-failed-before-start"],
+)
+async def test_evaluation_routes_sandbox_losses_by_whether_the_run_started(
+    exc, failure_class, cause, terminal, no_persist, tmp_path, monkeypatch
+):
+    monkeypatch.setattr("responses_api_agents.pinchbench.app.is_eval_mode", lambda: True)
+    agent = make_agent(work_root=str(tmp_path / "work"), transcripts_dir=str(tmp_path / "arch"))
+
+    async def fail(task_id, out_dir, rollout_id=None):
+        raise exc
+
+    monkeypatch.setattr(agent, "_run_in_sandbox", fail)
+    dumped = (await agent.run(body=_run_body())).model_dump()
+    assert dumped.get(NG_FAILURE_CLASS_KEY) == failure_class
+    assert dumped.get("_ng_failure_cause") == cause
+    assert bool(dumped.get(NG_TERMINAL_KEY)) is terminal
+    assert bool(dumped.get(NG_NO_PERSIST_KEY)) is no_persist
+    assert is_terminal_failure(dumped) is terminal
+
+
+@pytest.mark.asyncio
+async def test_the_direct_exec_marks_whether_the_agents_run_started(tmp_path):
+    agent = make_agent(
+        sandbox_spec={"image": "docker://test"},
+        sandbox_provider={"apptainer": {"direct_exec": True}},
+    )
+    proc = MagicMock()
+    proc.returncode = 137
+    proc.wait = AsyncMock(return_value=None)
+    proc.kill = MagicMock()
+
+    async def started_then_killed(*args, **kwargs):
+        (tmp_path / "sandbox" / ".agent_started").touch()
+        return proc
+
+    with patch("asyncio.create_subprocess_exec", side_effect=started_then_killed):
+        with pytest.raises(SandboxKilledError) as caught:
+            await agent._run_in_apptainer_direct("task_x", tmp_path, {"direct_exec": True})
+    assert caught.value.run_started is True
+    (tmp_path / "w").mkdir()
+    assert ".agent_started" in agent._write_direct_exec_wrapper(tmp_path / "w").read_text()

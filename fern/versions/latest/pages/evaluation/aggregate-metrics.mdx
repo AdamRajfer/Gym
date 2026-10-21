@@ -60,6 +60,7 @@ The output file is a JSON array with one entry per agent:
 | `key_metrics` | Headline numbers (default: all `mean/*` entries from `agent_metrics`) |
 | `group_level_metrics` | Per-task breakdown — one entry per task with stats across that task's rollouts |
 | `repeat_level_metrics` | Per-repeat breakdown — one entry per `_ng_rollout_index` with stats across that repeat's tasks. Empty unless the agent has two or more repeats |
+| `time_limit` | Evaluation only, written by `gym eval run` and `gym eval aggregate`. `timed_out` counts the rollouts whose row already says they ran out of time (a timeout failure class or `failure_kind`, an agent timeout flag, a `timeout` termination, an episode deadline, or a failed rollout with a timed-out model call); `timed_out_share` divides it by all rollouts. `timed_out_elapsed_s_p50` and `timed_out_elapsed_s_p95` are their `/run` wall clock, which `gym eval run` stamps on every rollout row it writes as `_ng_elapsed_s` |
 
 ---
 

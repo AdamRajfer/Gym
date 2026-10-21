@@ -128,6 +128,7 @@ from nemo_gym.server_utils import (
 )
 from nemo_gym.skills import SkillsConfig, load_skill_directory
 from nemo_gym.task_materialization import TASK_ID_FIELDS
+from nemo_gym.time_limit_diagnostics import NG_ELAPSED_S_KEY, summarize_time_limits
 from nemo_gym.token_id_capture import (
     TokenCaptureStore,
     TokenIdCaptureConfig,
@@ -437,6 +438,8 @@ class _CompletedRollout:
     rollout_latency_ms: Optional[float]
     environment_server: Optional[str] = None
     environment_server_type: Optional[str] = None
+    # The `/run` wall clock in seconds, success or failure; None for a row that never started.
+    elapsed_s: Optional[float] = None
 
 
 def _round_robin_by_agent(examples: List[Dict]) -> List[Dict]:
@@ -2117,6 +2120,64 @@ def _identity_key(row: Mapping[str, Any], group: Callable[[Mapping[str, Any]], O
     return (group(row), row.get(TASK_INDEX_KEY_NAME), row.get(ROLLOUT_INDEX_KEY_NAME))
 
 
+def _with_captures_read_back(rows: List[Mapping[str, Any]], capture_dirs: List[Path]) -> List[Mapping[str, Any]]:
+    """Rows with their model-call captures, read back from the capture store for a row that carries none.
+
+    A failure that returned no agent evidence (an episode deadline, a /run error) is written without
+    its captures, but the calls it made are still in the store. Copies only; no artifact changes.
+    """
+    if not capture_dirs:
+        return rows
+    restored = []
+    for row in rows:
+        if "ng_model_call_capture" not in row and NG_TRAJECTORY_KEY not in row:
+            row = merge_model_call_capture_into_record(dict(row), capture_dirs)
+        restored.append(row)
+    return restored
+
+
+def _write_time_limit_sections(
+    metrics_fpath: Optional[Path],
+    rows: List[Mapping[str, Any]],
+    group: Callable[[Mapping[str, Any]], Optional[str]],
+    capture_dirs: Optional[List[Path]] = None,
+) -> None:
+    """Add a ``time_limit`` section to each environment server's entry of the aggregate metrics file.
+
+    ``rows`` are the final record of every rollout that ran: its scored row, or the last failures-sidecar
+    attempt of a rollout that never succeeded. The section reads them and changes nothing else. It is a
+    diagnostic, so a failure to build it is logged and never fails the run.
+    """
+    if metrics_fpath is None or not metrics_fpath.exists():
+        return
+    try:
+        rows = _with_captures_read_back(rows, capture_dirs or [])
+        entries = orjson.loads(metrics_fpath.read_bytes())
+        # An entry that names no server (an aggregation error entry, an old file) gets no section.
+        if not any(isinstance(entry.get(NG_ENVIRONMENT_SERVER_KEY), str) for entry in entries):
+            return
+        rows_by_server: Dict[Optional[str], List[Mapping[str, Any]]] = defaultdict(list)
+        for row in rows:
+            rows_by_server[group(row)].append(row)
+        exported: Dict[str, Any] = {}
+        for entry in entries:
+            server_rows = rows_by_server.get(entry.get(NG_ENVIRONMENT_SERVER_KEY))
+            if not server_rows or AGGREGATION_ERROR_KEY in entry:
+                continue
+            name = entry[AGENT_REF_KEY_NAME]["name"]
+            section = summarize_time_limits(server_rows)
+            entry["time_limit"] = section
+            exported.update({f"time_limit/{name}/{key}": value for key, value in section.items()})
+        if not exported:
+            return
+        metrics_fpath.write_bytes(orjson.dumps(entries, option=orjson.OPT_INDENT_2))
+    except Exception:
+        logger.exception("Could not add the time-limit section to %s; the aggregate metrics stand.", metrics_fpath)
+        return
+    if exported:
+        export_metrics(exported)
+
+
 def _fill_task_fields(
     added_rows: List[Dict[str, Any]],
     real_rows: List[Dict[str, Any]],
@@ -3298,6 +3359,10 @@ class RolloutCollectionHelper(BaseModel):
                 if _materialized_taskset(row) is not None and _is_episode_response(result):
                     # The row went out as an episode request, so the reply is a BaseEpisodeResponse.
                     result = _episode_record(result)
+                if completed.elapsed_s is not None:
+                    # Read by the time-limit section of the aggregate metrics. Not `elapsed_seconds`,
+                    # which resume reads to order dispatch.
+                    result[NG_ELAPSED_S_KEY] = completed.elapsed_s
 
                 result[TASK_INDEX_KEY_NAME] = row[TASK_INDEX_KEY_NAME]
                 result[ROLLOUT_INDEX_KEY_NAME] = row[ROLLOUT_INDEX_KEY_NAME]
@@ -3670,6 +3735,21 @@ class RolloutCollectionHelper(BaseModel):
                 [metadata_rows[i] for i in order],
                 output_fpath,
                 raise_on_error=False,  # Write batch status before reporting aggregation failures below.
+            )
+            servers_by_agent_once = functools.cache(
+                lambda: _environment_servers_by_agent(self.setup_server_client().global_config_dict)
+            )
+            unscored_failures = [
+                row
+                for key, row in (await asyncio.to_thread(_latest_failure_rows, [failures_fpath])).items()
+                if key not in persisted_success_keys
+            ]
+            await asyncio.to_thread(
+                _write_time_limit_sections,
+                aggregate_metrics_fpath,
+                persisted_results + unscored_failures,
+                lambda row: _metrics_group(row, servers_by_agent_once),
+                capture_dirs,
             )
 
         if batch_tracker is not None:
@@ -4259,6 +4339,7 @@ Aggregate metrics: {aggregate_metrics_fpath}{coverage}""")
                         rollout_latency_ms=rollout_latency_ms,
                         environment_server=server_name,
                         environment_server_type=server_type,
+                        elapsed_s=time.monotonic() - started,
                     )
                 except Exception as e:
                     print(
@@ -4280,6 +4361,7 @@ Aggregate metrics: {aggregate_metrics_fpath}{coverage}""")
                         rollout_latency_ms=None,
                         environment_server=server_name,
                         environment_server_type=server_type,
+                        elapsed_s=time.monotonic() - started,
                     )
                 finally:
                     # Failed and timed-out tasks inform the adaptive margin too, but only by
@@ -4633,6 +4715,12 @@ class RolloutAggregationHelper(BaseModel):
         scored = sorted(results + counted, key=_rollout_order_key)
         aggregate_metrics_fpath = await helper._call_aggregate_metrics(
             scored, scored, output_fpath, raise_on_error=False
+        )
+        await asyncio.to_thread(
+            _write_time_limit_sections,
+            aggregate_metrics_fpath,
+            results + [row for identity, row in latest_failures.items() if identity not in result_ids],
+            group,
         )
         if batch_tracker is not None:
             batch_tracker.write_status(

@@ -593,6 +593,26 @@ class TestPolicyOutage:
         client.infra_error = None
         return client
 
+    @pytest.mark.parametrize("eval_mode", [False, True], ids=["training", "evaluation"])
+    def test_with_capture_off_evaluation_still_records_outages(self, monkeypatch, eval_mode: bool) -> None:
+        """No rollout id without capture: evaluation still needs a per-rollout client that records the outage."""
+        monkeypatch.setattr("responses_api_agents.verifiers_agent.app.is_eval_mode", lambda: eval_mode)
+        config = VerifiersAgentConfig(
+            host="0.0.0.0",
+            port=8080,
+            entrypoint="",
+            name="",
+            model_server=ModelServerRef(type="responses_api_models", name="policy_model"),
+        )
+        agent = VerifiersAgent(config=config, server_client=MagicMock(spec=ServerClient))
+        with patch.object(VerifiersAgent, "resolve_model_base_url", return_value="http://policy/v1"):
+            client = agent._get_client()
+            shared = agent.client_cache["policy_model"]
+            assert isinstance(client, _ResponseIdRecordingClient) is eval_mode
+            # Training keeps the shared client; evaluation's per-rollout client shares its transport settings.
+            assert (client is shared) is not eval_mode
+            assert str(client.client.base_url) == str(shared.client.base_url)
+
     def test_a_dead_policy_endpoint_is_recorded_as_infra(self) -> None:
         connection_error = ConnectionRefusedError(111, "Connection refused")
         client = self._client(connection_error)

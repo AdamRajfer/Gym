@@ -5079,7 +5079,8 @@ class RolloutAggregationHelper(BaseModel):
             latest_failures,
             failure_attempts,
             result_ids,
-            expected=len(results) + len(latest_failures) + len(missing if missing else no_row),
+            # A failure another shard recovered is not owed a second time.
+            expected=len(results) + len(set(latest_failures) - result_ids) + len(missing if missing else no_row),
             missing=len(missing if missing else no_row),
         )
         completeness = _annotate_infra_unresolved(aggregate_metrics_fpath, _infra_unresolved_metrics(unresolved, owed))

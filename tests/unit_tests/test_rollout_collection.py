@@ -8113,6 +8113,42 @@ class TestRolloutAggregationHelper:
         )
         await RolloutAggregationHelper().run_from_config(config)
 
+    async def _completeness(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *shards: Path) -> dict:
+        exported: list[dict] = []
+        monkeypatch.setattr(nemo_gym.rollout_collection, "get_exporters", lambda: [object()])
+        monkeypatch.setattr(nemo_gym.rollout_collection, "export_metrics", lambda m, **kw: exported.append(m))
+        self._serve(monkeypatch, {}, {"env_a": "agent_a"})
+        await RolloutAggregationHelper().run_from_config(
+            RolloutAggregationConfig(
+                input_glob=",".join(str(shard) for shard in shards),
+                output_jsonl_fpath=str(tmp_path / "merged.jsonl"),
+                disable_health_check=True,
+            )
+        )
+        [coverage] = [m for m in exported if "coverage/expected" in m]
+        return coverage
+
+    async def test_a_failure_another_shard_recovered_is_not_owed_twice(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, empty_global_config: MagicMock
+    ) -> None:
+        """Bot 4339235313: 49 rollouts are owed a score, one unresolved: 1/49 is past the 2% limit."""
+        original, retry = tmp_path / "a" / "rollouts.jsonl", tmp_path / "b" / "rollouts.jsonl"
+        server = {NG_ENVIRONMENT_SERVER_KEY: "env_a"}
+        judge = {NG_FAILURE_CLASS_KEY: "judge_failed", **server}
+        self._write_rows(materialized_path_for(original), *(self._rollout(i, "agent_a", **server) for i in range(49)))
+        self._write_rows(original, *(self._rollout(i, "agent_a", reward=1.0, **server) for i in range(1, 48)))
+        self._write_rows(
+            _failures_path_for(original), self._rollout(0, "agent_a", **judge), self._rollout(48, "agent_a", **judge)
+        )
+        self._write_rows(materialized_path_for(retry), self._rollout(0, "agent_a", **server))
+        self._write_rows(retry, self._rollout(0, "agent_a", reward=1.0, **server))
+
+        coverage = await self._completeness(tmp_path, monkeypatch, original, retry)
+
+        assert coverage["rollouts_infra_unresolved"] == 1
+        assert coverage["rollouts_infra_unresolved_rate"] == pytest.approx(1 / 49)
+        assert coverage["publishable"] is False
+
     async def test_gym_eval_aggregate_reports_infra_failures_that_persist(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, empty_global_config: MagicMock
     ) -> None:

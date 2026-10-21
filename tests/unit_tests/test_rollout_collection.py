@@ -7978,6 +7978,32 @@ class TestRolloutAggregationHelper:
         )
         await RolloutAggregationHelper().run_from_config(config)
 
+    async def test_two_attempts_of_one_final_failure_are_one_zero_with_the_default_selection(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, empty_global_config: MagicMock
+    ) -> None:
+        """Two shards hold attempts of one rollout: the older names only its agent, the newer its server too."""
+        old, new = tmp_path / "old" / "rollouts.jsonl", tmp_path / "new" / "rollouts.jsonl"
+        final = {NG_FAILURE_CLASS_KEY: "agent_run_error", "_ng_failure_cause": "model"}
+        self._write_rows(old)
+        self._write_rows(new)
+        self._write_rows(_failures_path_for(old), self._rollout(0, "agent_a", **final))
+        self._write_rows(
+            _failures_path_for(new), self._rollout(0, "agent_a", **final, **{NG_ENVIRONMENT_SERVER_KEY: "env_a"})
+        )
+        by_server: dict[str, list] = {}
+        self._serve(monkeypatch, by_server, {"env_a": "agent_a"})
+
+        await RolloutAggregationHelper().run_from_config(
+            RolloutAggregationConfig(
+                input_glob=f"{old},{new}",
+                output_jsonl_fpath=str(tmp_path / "rollouts.jsonl"),
+                count_failure_classes_as_zero=[],
+                disable_health_check=True,
+            )
+        )
+
+        assert self._scores(by_server["env_a"]) == [(0, 0, 0.0)]
+
     @pytest.mark.parametrize("run1_has", ["a row", "a failure"])
     async def test_runs_that_reuse_task_indices_do_not_hide_each_others_lost_rollouts(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, empty_global_config: MagicMock, run1_has: str

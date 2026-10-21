@@ -4749,7 +4749,14 @@ class RolloutAggregationHelper(BaseModel):
         def servers_by_agent() -> Mapping[str, list[str]]:
             # With nothing to score and nothing to count, only the coverage report keys rollouts, and an
             # agent's name does for that: the head server is reached for scoring alone.
-            if not (results or config.count_failure_classes_as_zero != [] or config.count_missing_rollouts_as_zero):
+            # A final failure is scored whatever the selection, so it needs the servers to be told apart too.
+            final_scored = any(is_terminal_failure(row) for row in _latest_failure_rows(failures_fpaths).values())
+            if not (
+                results
+                or config.count_failure_classes_as_zero != []
+                or config.count_missing_rollouts_as_zero
+                or final_scored
+            ):
                 return {}
             return _environment_servers_by_agent(helper.setup_server_client().global_config_dict)
 

@@ -699,11 +699,10 @@ class TestJudgeRetriedInPlaceOnTheSameAnswer:
 
 
 def _through_the_agent_and_collector(verify_reply: dict, tmp_path) -> tuple[dict, list, tuple, dict]:
-    """The simple agent's own response model first, then the shared helper every server's tests use."""
+    """The agent's verify response contract, the collector and aggregation, through the helper every server's
+    tests use."""
     from nemo_gym.testing.verify_reply import verify_reply_through_collection
-    from responses_api_agents.simple_agent.app import SimpleAgentVerifyResponse
 
-    SimpleAgentVerifyResponse.model_validate(verify_reply)
     return verify_reply_through_collection(verify_reply, tmp_path)
 
 

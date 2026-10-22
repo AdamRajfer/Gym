@@ -37,7 +37,7 @@ from __future__ import annotations
 
 import logging
 import re
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from typing import Literal
 
 
@@ -421,23 +421,38 @@ JUDGE_FAILURE_KINDS: frozenset[str] = frozenset({JUDGE_FAILED, JUDGE_UNPARSEABLE
 JUDGE_SETTLED_KEY = "_ng_failure_judge_settled"
 
 
-def judge_failure_after_retries(*, judge_error: str, cause: FailureCause, attempts: int) -> dict[str, object]:
+def judge_failure_after_retries(
+    *,
+    judge_error: str,
+    cause: FailureCause,
+    attempts: int,
+    attempt_causes: Sequence[FailureCause] = (),
+) -> dict[str, object]:
     """The evaluation rule for a judge failure that its in-place retries on the same answer did not fix.
 
     The rollout is never re-dispatched, whatever the cause: that would give the model another answer and score a
-    different one. What the row becomes depends on what the judge's last error says caused it:
+    different one. What the row becomes depends on the cause of each try (``attempt_causes``, one per try; without
+    them, ``cause``, the last error's):
 
-    - ``model``: the model's answer did it (an answer that overflows the judge's context, a verdict the answer
-      made unparseable). The row is the model's final failure and counts as 0.
-    - ``infra``: a service the model does not control (a spent budget, a rate limit, a gateway or a bad key).
-      The row is an unresolved infra row: left out of the score, counted in ``rollouts_infra_unresolved``, and
-      the run is not publishable above ``MAX_INFRA_UNRESOLVED_RATE``. In-place retries fix transient outages; a
-      bad key never recovers, and scoring it as the model's 0 would publish a score near 0.
+    - ``model`` on every try: the model's answer did it. The judge answered with text and no verdict it could
+      give, every time, so the answer was judged and got none; or the judge's own engine rejected an input the
+      answer alone made too long. The row is the model's final failure and counts as 0.
+    - ``infra`` on any try: a service the model does not control (a spent budget, a rate limit, a gateway, a
+      timeout or a bad key), or an empty reply, which a throttled judge or a provider-side filter sends as an
+      HTTP 200 with no text. The row is an unresolved infra row: left out of the score, counted in
+      ``rollouts_infra_unresolved``, and the run is not publishable above ``MAX_INFRA_UNRESOLVED_RATE``.
+      In-place retries fix transient outages; a bad key never recovers, and scoring it as the model's 0 would
+      publish a score near 0.
+
+    A mix, such as an empty reply and then text with no verdict, is infra: one try that the judge did not really
+    answer is enough doubt that the answer was judged at all, so the row stays out of the score and is counted.
 
     The judge's last error, the cause and the attempt count stay on the row either way. Returns the fields of the
     failures-sidecar row. Resume reads the same rule for every ``JUDGE_FAILURE_KINDS`` row, also one written
     before this rule existed.
     """
+    if attempt_causes:
+        cause = MODEL if all(attempt == MODEL for attempt in attempt_causes) else INFRA
     row: dict[str, object] = {
         "_ng_failure_class": JUDGE_FAILED,
         "_ng_failure_cause": cause,

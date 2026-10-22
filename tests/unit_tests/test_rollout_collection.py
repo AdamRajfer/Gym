@@ -7728,6 +7728,28 @@ class TestAJudgeFailureNeverReRunsTheRollout:
         # One of four owed rollouts is 25%, past the 2% cap: the run is not publishable.
         assert _infra_unresolved_metrics(unresolved, owed)["publishable"] is False
 
+    @pytest.mark.parametrize(
+        ("attempt_causes", "expected"),
+        [
+            ((MODEL, MODEL, MODEL), MODEL),  # Text and no verdict on every try: the answer was judged.
+            ((INFRA, INFRA, INFRA), INFRA),  # Empty replies or rate limits on every try.
+            ((INFRA, MODEL, MODEL), INFRA),  # Empty, then text with no verdict: not every try was really answered.
+            ((MODEL, MODEL, INFRA), INFRA),  # A last-try outage is infra too, whatever came before it.
+        ],
+        ids=["no-verdict-x3", "infra-x3", "empty-then-no-verdict", "no-verdict-then-infra"],
+    )
+    def test_the_rule_is_the_models_only_when_every_try_was(self, attempt_causes: tuple, expected: str) -> None:
+        from nemo_gym.failure_kinds import judge_failure_after_retries
+
+        # The last try's cause alone would say the opposite in the two mixed cases.
+        row = judge_failure_after_retries(
+            judge_error="last", cause=attempt_causes[-1], attempts=3, attempt_causes=attempt_causes
+        )
+
+        assert row[NG_FAILURE_CAUSE_KEY] == row["_ng_failure_judge_cause"] == expected
+        assert is_terminal_failure(row) is (expected == MODEL)
+        assert bool(row.get("_ng_failure_judge_settled")) is (expected == INFRA)
+
     def test_a_judge_failure_written_before_the_rule_is_settled_infra(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """An old masked judge_failed row names no cause; its kind's rule says infra, so it is never a model 0."""
         monkeypatch.setattr("nemo_gym.rollout_collection.is_eval_mode", lambda: True)

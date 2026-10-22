@@ -867,6 +867,27 @@ class TestArenaResourcesServer:
         assert not is_terminal_failure(row)  # Left out of the score, counted as infra-unresolved.
         assert row["_ng_failure_judge_attempts"] == 3
 
+    @mark.parametrize(
+        ("replies", "cause"),
+        [
+            (["", "", ""], "infra"),
+            (["", "no verdict", "no verdict"], "infra"),
+            ([429, 429, 429], "infra"),
+            (["no verdict"] * 3, "model"),
+        ],
+        ids=["empty-x3", "empty-then-no-verdict", "429-x3", "no-verdict-x3"],
+    )
+    async def test_a_reply_with_no_verdict_is_the_models_0_unless_a_try_was_empty_or_limited(
+        self, server: ArenaResourcesServer, judged_in_evaluation: None, replies: list, cause: str
+    ):
+        game1, _ = self._recording_judge(server, replies, ["Final: [[B>A]]"])
+
+        row = json.loads((await judge_failsafe(server.verify)(body=self._make_verify_request("Answer."))).body)
+
+        assert len(game1) == 3 and len(set(game1)) == 1
+        assert row["_ng_failure_cause"] == cause
+        assert is_terminal_failure(row) is (cause == "model")
+
     @mark.parametrize("status", [401, 429, 500])
     async def test_training_keeps_a_failed_judge_call_as_a_skipped_game(
         self, server: ArenaResourcesServer, status: int

@@ -235,6 +235,12 @@ _SPENT_BUDGET_PATTERN = re.compile(
     r"|credit balance is too low|max budget",
     re.IGNORECASE,
 )
+# A key or an authorization the model does not control, as providers word it, sometimes behind a 400 rather than a
+# 401 or 403: retried on any endpoint, never the model's 0.
+_BROKEN_CREDENTIAL_PATTERN = re.compile(
+    r"malformed[_ ]authorization|(?:incorrect|invalid|missing) api[_ ]key|requires approved access",
+    re.IGNORECASE,
+)
 
 # Matched against every class in an exception's MRO, so subclasses (aiohttp's ClientConnectorError,
 # LiteLLM's wrappers of the OpenAI SDK errors) count too. A bare TimeoutError is not listed: it is the
@@ -366,6 +372,8 @@ def failure_cause_of(error: BaseException) -> FailureCause:
             return INFRA
         if isinstance(status, int) and 400 <= status < 500 and _reports_spent_budget(current):
             return INFRA
+        if isinstance(status, int) and 400 <= status < 500 and _reports_broken_credential(current):
+            return INFRA
         if status == 404 and _is_model_server_call(current):
             return INFRA
         if any(cls.__name__ in _INFRA_EXCEPTION_NAMES for cls in type(current).__mro__):
@@ -386,7 +394,7 @@ def failure_cause_of_text(text: str) -> FailureCause:
         return INFRA
     if any(_is_infra_status(int(status)) for status in _RESPONSE_STATUS_PATTERN.findall(text)):
         return INFRA
-    if _SPENT_BUDGET_PATTERN.search(text):
+    if _SPENT_BUDGET_PATTERN.search(text) or _BROKEN_CREDENTIAL_PATTERN.search(text):
         return INFRA
     if _MODEL_ROUTE_404_TEXT_PATTERN.search(text):
         return INFRA
@@ -398,6 +406,14 @@ def _is_model_server_call(error: BaseException) -> bool:
     request_info = getattr(error, "request_info", None)
     url = str(getattr(request_info, "real_url", None) or getattr(request_info, "url", None) or "")
     return bool(_MODEL_ROUTE_PATTERN.search(url))
+
+
+def _reports_broken_credential(error: BaseException) -> bool:
+    """Whether an HTTP error's reason or body says the key or the authorization is broken."""
+    body = getattr(error, "response_content", None)
+    if isinstance(body, bytes):
+        body = body.decode("utf-8", errors="replace")
+    return bool(_BROKEN_CREDENTIAL_PATTERN.search(f"{getattr(error, 'message', '')} {body or ''}"))
 
 
 def _reports_spent_budget(error: BaseException) -> bool:

@@ -113,6 +113,26 @@ class TestWhereTheFailureHappened:
         assert failure_cause_of_text(f"{status}, message='Unprocessable Entity' {body.decode()}") == INFRA
 
     @pytest.mark.parametrize(
+        ("status", "body"),
+        [
+            (400, b'{"error": {"code": "malformed_authorization", "message": "Malformed authorization header"}}'),
+            (400, b'{"error": {"message": "Incorrect API key provided: sk-****"}}'),
+            (400, b'{"error": {"message": "Invalid API key"}}'),
+            (400, b'{"error": {"message": "Missing API key. Please provide an Authorization header."}}'),
+            (403, b'{"error": {"message": "This model requires approved access"}}'),
+        ],
+        ids=["malformed-authorization", "incorrect-key", "invalid-key", "missing-key", "requires-approved-access"],
+    )
+    def test_a_broken_credential_is_infra_on_any_endpoint(self, status: int, body: bytes) -> None:
+        """A key or route the model does not control: retried, never the model's 0, also on the policy endpoint."""
+        error = _http_error(status, body)
+        error.request_info = SimpleNamespace(
+            method="POST", url="http://policy/v1/responses", real_url="http://policy/v1/responses", headers={}
+        )
+        assert failure_cause_of(error) == INFRA
+        assert failure_cause_of_text(f"{status}, message='Bad Request' {body.decode()}") == INFRA
+
+    @pytest.mark.parametrize(
         "body",
         [b'{"error": "prompt is longer than the context window"}', b'{"error": "invalid tool schema"}', b""],
         ids=["context-overflow", "bad-request", "no-body"],

@@ -16,6 +16,7 @@ from collections import Counter, defaultdict
 from collections.abc import Iterator, Mapping, Sequence
 from concurrent.futures import ProcessPoolExecutor
 from concurrent.futures.process import BrokenProcessPool
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -45,6 +46,7 @@ from nemo_gym.health.checks import (
     _transcript_tokens,
     normalize_ignored_checks,
 )
+from nemo_gym.health.timeouts import read_rollout_timing, summarize_timeouts
 from nemo_gym.health.types import (
     CALL_BINDING_INPUTS,
     QUALITY_SUMMARY_FILENAME,
@@ -67,7 +69,6 @@ from nemo_gym.health.types import (
     _WorkerInput,
 )
 from nemo_gym.path_utils import failures_path_for, materialized_path_for
-from nemo_gym.time_limit_diagnostics import summarize_timeouts, timeout_view
 
 
 _PROCESS_POOL_CHUNKS_PER_WORKER = 4
@@ -273,7 +274,7 @@ def evaluate_record(
         transcript_completion_tokens=transcript_completion,
         capture_prompt_tokens=sum(_token_count(call, "tokens_in") for call in calls),
         capture_completion_tokens=sum(_token_count(call, "tokens_out") for call in calls),
-        timeout_view=timeout_view(record),
+        timing=read_rollout_timing(record),
     )
 
 
@@ -480,29 +481,23 @@ def _jsonl_rows(path: Path) -> Iterator[dict[str, Any]]:
                 yield row
 
 
-def _rollout_accounting(
-    landed: set[tuple[Any, ...]],
-    paths: Sequence[Path],
-    *,
-    limits: RunHealthLimits,
-    limits_source: LimitsSource | Mapping[str, LimitsSource],
-    duplicated: int,
-    failed_rows: list[dict[str, Any]] | None = None,
-) -> dict[str, Any]:
-    """Count the rollouts each input owed against those that landed, failed or left no row, and judge the run.
+@dataclass(frozen=True)
+class _Failures:
+    """The rollouts that failed and never landed, and the rollouts the run owed."""
 
-    ``landed`` holds ``(input index, task index, rollout index)`` of every persisted record. Failures come
-    from each input's ``_failures.jsonl`` sidecar, where the last attempt of a rollout stands; one that
-    later landed is not failed. ``is_terminal_failure`` splits them into
-    final ones, which are not retried, and not final ones, which are; the split says nothing of the cause. ``failed`` is null when no input has a sidecar.
-    ``expected``, ``missing`` and ``healthy`` need the ``_materialized_inputs.jsonl`` inventory and
-    are null when an input has none. A run is healthy when nothing is missing, no rollout is
-    recorded twice, and each kind of failure with a configured limit stays below it as a share of expected.
-    The limits are off (None) by default, so failures alone never make a run unhealthy unless configured.
+    # Each such rollout's last failed attempt, by (input index, task index, rollout index).
+    rows: dict[tuple[Any, ...], dict[str, Any]]
+    # None when an input has no `_materialized_inputs.jsonl` inventory.
+    owed: set[tuple[Any, ...]] | None
+    any_sidecar: bool
+
+
+def _read_failures(landed: set[tuple[Any, ...]], paths: Sequence[Path]) -> _Failures:
+    """Read every input's failures sidecar and inventory.
+
+    The last attempt of a rollout stands, and a rollout that later landed is not failed. With an inventory, only
+    owed rollouts count: an unreadable record or a sidecar row outside the inventory is not one.
     """
-    # Lazy: rollout_collection imports this module, and health workers need none of its dependencies.
-    from nemo_gym.rollout_collection import NG_FAILURE_CLASS_KEY, is_terminal_failure
-
     failed: dict[tuple[Any, ...], dict[str, Any]] = {}
     any_sidecar = False
     owed: set[tuple[Any, ...]] | None = set()
@@ -521,10 +516,33 @@ def _rollout_accounting(
     for key in landed:
         failed.pop(key, None)
     if owed is not None:
-        # Only owed rollouts count: an unreadable record or a sidecar row outside the inventory is not one.
         failed = {key: row for key, row in failed.items() if key in owed}
-    if failed_rows is not None:
-        failed_rows.extend(failed.values())
+    return _Failures(rows=failed, owed=owed, any_sidecar=any_sidecar)
+
+
+def _rollout_accounting(
+    landed: set[tuple[Any, ...]],
+    failures: _Failures,
+    *,
+    limits: RunHealthLimits,
+    limits_source: LimitsSource | Mapping[str, LimitsSource],
+    duplicated: int,
+) -> dict[str, Any]:
+    """Count the rollouts each input owed against those that landed, failed or left no row, and judge the run.
+
+    ``landed`` holds ``(input index, task index, rollout index)`` of every persisted record. Failures come
+    from each input's ``_failures.jsonl`` sidecar, where the last attempt of a rollout stands; one that
+    later landed is not failed. ``is_terminal_failure`` splits them into
+    final ones, which are not retried, and not final ones, which are; the split says nothing of the cause. ``failed`` is null when no input has a sidecar.
+    ``expected``, ``missing`` and ``healthy`` need the ``_materialized_inputs.jsonl`` inventory and
+    are null when an input has none. A run is healthy when nothing is missing, no rollout is
+    recorded twice, and each kind of failure with a configured limit stays below it as a share of expected.
+    The limits are off (None) by default, so failures alone never make a run unhealthy unless configured.
+    """
+    # Lazy: rollout_collection imports this module, and health workers need none of its dependencies.
+    from nemo_gym.rollout_collection import NG_FAILURE_CLASS_KEY, is_terminal_failure
+
+    failed, owed, any_sidecar = failures.rows, failures.owed, failures.any_sidecar
     expected = None if owed is None else len(owed)
     missing = None if owed is None else len(owed - landed - failed.keys())
     final = sum(is_terminal_failure(row) for row in failed.values())
@@ -702,23 +720,21 @@ def run_health_checks(
     _mark_duplicate_identities(digests, ignored)
     summary = _reduce(digests, ignored)
     artifacts = summary["run"]["artifacts"]
-    # Every rollout's final record: its saved row, or the last failed attempt of one that never landed.
-    unlanded: list[dict[str, Any]] = []
+    landed = {(line.source_index, d.task_index, d.rollout_index) for d, line in zip(digests, lines, strict=True)}
+    failures = _read_failures(landed, paths)
     artifacts.update(
         _rollout_accounting(
-            {(line.source_index, d.task_index, d.rollout_index) for d, line in zip(digests, lines, strict=True)},
-            paths,
+            landed,
+            failures,
             limits=limits,
             limits_source=limits_source,
             duplicated=summary["run"]["issues"]["rollout_duplicate_identity"],
-            failed_rows=unlanded,
         )
     )
-    summary["run"]["stats"]["timeouts"] = summarize_timeouts(
-        [d.timeout_view for d in digests if d.timeout_view is not None]
-        + [v for r in unlanded if (v := timeout_view(r))],
-        rollouts=len(digests) + len(unlanded),
-    )
+    # Every rollout's final record: its saved row, or the last failed attempt of one that never landed.
+    timings = [digest.timing for digest in digests if digest.timing is not None]
+    timings += [read_rollout_timing(row) for row in failures.rows.values()]
+    summary["run"]["stats"]["timeouts"] = summarize_timeouts(timings).model_dump(mode="json")
     run_findings, run_coverage = _run_excessive_failures(artifacts, limits, ignored)
     _judge_run(artifacts, run_findings, run_coverage)
     summary["run"]["issues"][_RUN_FAILURES_CHECK] = len(run_findings)
@@ -747,9 +763,10 @@ def write_provisional_summary(
     Duplicates come from the per-record pass, so ``healthy`` is false when the accounting already has a reason
     and null otherwise. ``gym eval health-check`` on the run dir writes the full summary.
     """
+    landed_keys = {(0, task, rollout) for task, rollout in landed}
     artifacts = _rollout_accounting(
-        {(0, task, rollout) for task, rollout in landed},
-        [rollout_path],
+        landed_keys,
+        _read_failures(landed_keys, [rollout_path]),
         limits=limits,
         limits_source="config",
         duplicated=0,

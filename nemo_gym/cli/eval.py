@@ -692,6 +692,7 @@ def _health_check_collected_rollouts(output_fpath: Path, config: Any, landed_key
     """
     if not output_fpath.exists():
         return
+    from nemo_gym.health.timeouts import export_run_health_timeouts
     from nemo_gym.rollout_health import format_health_report, run_health_checks, write_provisional_summary
 
     if _terminated and landed_keys is not None:
@@ -718,6 +719,7 @@ def _health_check_collected_rollouts(output_fpath: Path, config: Any, landed_key
         logger.exception("Rollout health checks failed after collection; rollout artifacts are still available.")
     else:
         print(format_health_report(health_result))
+        export_run_health_timeouts(health_result)
 
 
 @exit_cleanly_on_config_error

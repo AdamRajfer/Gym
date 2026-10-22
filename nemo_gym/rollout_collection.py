@@ -132,6 +132,7 @@ if TYPE_CHECKING:
 
 
 _failures_path_for = failures_path_for  # Backwards-compatible alias
+from nemo_gym.health.timeouts import ELAPSED_S_KEY, export_run_health_timeouts
 from nemo_gym.server_utils import (
     ServerClient,
     get_response_json,
@@ -144,7 +145,6 @@ from nemo_gym.server_utils import (
 )
 from nemo_gym.skills import SkillsConfig, load_skill_directory
 from nemo_gym.task_materialization import TASK_ID_FIELDS
-from nemo_gym.time_limit_diagnostics import NG_ELAPSED_S_KEY, flatten_for_export
 from nemo_gym.token_id_capture import (
     TokenCaptureStore,
     TokenIdCaptureConfig,
@@ -3499,7 +3499,7 @@ class RolloutCollectionHelper(BaseModel):
                 if completed.elapsed_s is not None:
                     # Read by the timeouts section of the run health summary. Not `elapsed_seconds`,
                     # which resume reads to order dispatch.
-                    result[NG_ELAPSED_S_KEY] = completed.elapsed_s
+                    result[ELAPSED_S_KEY] = completed.elapsed_s
 
                 result[TASK_INDEX_KEY_NAME] = row[TASK_INDEX_KEY_NAME]
                 result[ROLLOUT_INDEX_KEY_NAME] = row[ROLLOUT_INDEX_KEY_NAME]
@@ -3935,11 +3935,7 @@ Aggregate metrics: {aggregate_metrics_fpath}{coverage}""")
                 )
             else:
                 print(format_health_report(health_result))
-                # The run health section that tracking servers show next to the coverage counts.
-                try:
-                    export_metrics(flatten_for_export(health_result.summary["run"]["stats"]["timeouts"]))
-                except Exception:
-                    logger.exception("Could not export the run health timeouts after collection.")
+                export_run_health_timeouts(health_result)
 
         config.check_completion(expected=expected_rollouts, results=persisted_results)
         return results
@@ -4932,11 +4928,7 @@ Aggregate metrics: {aggregate_metrics_fpath}{coverage}""")
                 )
             else:
                 print(format_health_report(health_result))
-                # The run health section that tracking servers show next to the coverage counts.
-                try:
-                    export_metrics(flatten_for_export(health_result.summary["run"]["stats"]["timeouts"]))
-                except Exception:
-                    logger.exception("Could not export the run health timeouts after aggregation.")
+                export_run_health_timeouts(health_result)
 
         return aggregate_metrics_fpath
 

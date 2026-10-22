@@ -1456,6 +1456,25 @@ CONTEXT_OVERFLOWS = {
 
 
 @pytest.mark.parametrize("overflow", CONTEXT_OVERFLOWS.values(), ids=CONTEXT_OVERFLOWS.keys())
+def test_an_empty_turn_from_a_context_overflow_is_not_hollow(tmp_path, overflow):
+    """The empty turn is the model filling its context, so the rollout stays healthy."""
+    record = _record(0, 0, answer=None, include_response_output=False)
+    overflow_call = _call(**({"tokens_in": None, "tokens_out": 0, "response": {}} | overflow))
+    [digest] = run_health_checks(_write_fixture(tmp_path, [(record, [overflow_call])]), workers=1).rollouts
+
+    assert "agent_turn_hollow" not in {finding.check for finding in digest.findings}
+    assert digest.verdict != "unhealthy"
+
+
+def test_an_empty_turn_from_any_other_call_is_still_hollow(tmp_path):
+    record = _record(0, 0, answer=None, include_response_output=False)
+    empty_call = _call(tokens_out=0, response={})
+    [digest] = run_health_checks(_write_fixture(tmp_path, [(record, [empty_call])]), workers=1).rollouts
+
+    assert "agent_turn_hollow" in {finding.check for finding in digest.findings}
+
+
+@pytest.mark.parametrize("overflow", CONTEXT_OVERFLOWS.values(), ids=CONTEXT_OVERFLOWS.keys())
 def test_a_rollout_ending_on_a_context_overflow_is_not_flagged(tmp_path, overflow):
     """The model filled its context: a zero it earned, not an unhealthy rollout."""
     succeeded = _call(model_call_id="first", started_at=1.0)

@@ -514,7 +514,13 @@ def _rollout_missing_agent_turns(trajectory: dict[str, Any], subject: dict[str, 
     ]
 
 
-def _agent_turn_hollow(trajectory: dict[str, Any], subject: dict[str, int | str]) -> list[Finding]:
+def _agent_turn_hollow(
+    trajectory: dict[str, Any], bindings: _CallBindings, subject: dict[str, int | str]
+) -> list[Finding]:
+    # An empty turn whose own model call the upstream rejected for a full context is the model filling its
+    # context, as in `rollout_ended_on_failed_model_call`. The calls are optional evidence here: without
+    # captured calls, every empty turn is still flagged.
+    overflow_calls = {_call_identity(call) for call in bindings.matched_calls if _is_context_overflow_rejection(call)}
     return [
         Finding(
             check="agent_turn_hollow",
@@ -523,7 +529,7 @@ def _agent_turn_hollow(trajectory: dict[str, Any], subject: dict[str, int | str]
             detail={"reason": "agent turn has no message or tool calls"},
         )
         for step in _agent_steps(trajectory)
-        if not step.has_message and not step.has_tool_calls
+        if not step.has_message and not step.has_tool_calls and not overflow_calls.intersection(step.model_call_refs)
     ]
 
 
@@ -754,7 +760,9 @@ _ROLLOUT_CHECKS: dict[
     "rollout_ended_on_failed_model_call": lambda record, trajectory, bindings, subject: (
         _rollout_ended_on_failed_model_call(trajectory, subject)
     ),
-    "agent_turn_hollow": lambda record, trajectory, bindings, subject: _agent_turn_hollow(trajectory, subject),
+    "agent_turn_hollow": lambda record, trajectory, bindings, subject: _agent_turn_hollow(
+        trajectory, bindings, subject
+    ),
     "model_call_zero_completion_tokens": lambda record, trajectory, bindings, subject: (
         _model_call_zero_completion_tokens(bindings, subject)
     ),

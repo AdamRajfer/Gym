@@ -85,6 +85,7 @@ from nemo_gym.global_config import (
     GlobalConfigDictParserConfig,
     get_first_server_config_dict,
     get_global_config_dict,
+    maybe_get_global_config_dict,
 )
 from nemo_gym.profiling import Profiler
 from nemo_gym.rollout_correlation import (
@@ -362,11 +363,20 @@ def get_global_aiohttp_client(
     if _GLOBAL_AIOHTTP_CLIENT is not None:
         return _GLOBAL_AIOHTTP_CLIENT
 
-    global_config_dict = get_global_config_dict(
-        global_config_dict_parser_config=global_config_dict_parser_config,
-        global_config_dict_parser_cls=global_config_dict_parser_cls,
-    )
-    cfg = GlobalAIOHTTPAsyncClientConfig.model_validate(global_config_dict)
+    # Only consult the config: a process Gym did not launch (a Ray task worker) has none, and parsing its
+    # argv as Gym CLI overrides would exit the process. Such a process gets the default client limits.
+    global_config_dict = maybe_get_global_config_dict()
+    if global_config_dict is None and (
+        global_config_dict_parser_config is not None or global_config_dict_parser_cls is not GlobalConfigDictParser
+    ):
+        global_config_dict = get_global_config_dict(
+            global_config_dict_parser_config=global_config_dict_parser_config,
+            global_config_dict_parser_cls=global_config_dict_parser_cls,
+        )
+    if global_config_dict is None:
+        cfg = GlobalAIOHTTPAsyncClientConfig()
+    else:
+        cfg = GlobalAIOHTTPAsyncClientConfig.model_validate(global_config_dict)
 
     return set_global_aiohttp_client(cfg)
 

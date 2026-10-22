@@ -97,8 +97,8 @@ async def _lazy_client(monkeypatch, *, metrics_enabled: bool = True, workers: in
     monkeypatch.setattr(server_utils, "is_nemo_gym_fastapi_worker", lambda: True)
     monkeypatch.setattr(
         server_utils,
-        "get_global_config_dict",
-        lambda **_kwargs: {
+        "maybe_get_global_config_dict",
+        lambda: {
             "global_aiohttp_connector_limit": aggregate_limit,
             "global_aiohttp_connector_limit_per_host": aggregate_limit,
         },

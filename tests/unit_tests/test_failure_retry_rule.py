@@ -162,14 +162,15 @@ class TestWhereTheFailureHappened:
 
     def test_a_sandbox_exec_404_is_unchanged(self) -> None:
         """The sandbox rule decides an exec 404 while the sandbox is alive; the model-route 404 rule must not."""
-        from opensandbox.exceptions import SandboxApiException
-
         message = "Failed to run command: execution not found"
-        live = SandboxApiException(message, status_code=404)
-        without_status = SandboxApiException(message)
-        assert failure_cause_of(live) == failure_cause_of(without_status)
         relayed = f"SandboxApiException: {message} (status 404)"
         assert failure_cause_of_text(relayed) == failure_cause_of_text(f"SandboxApiException: {message}")
+
+        # The live exception needs the optional sandbox SDK; without it only the relayed-text check runs.
+        sdk = pytest.importorskip("opensandbox.exceptions", reason="opensandbox SDK is not installed")
+        live = sdk.SandboxApiException(message, status_code=404)
+        without_status = sdk.SandboxApiException(message)
+        assert failure_cause_of(live) == failure_cause_of(without_status)
 
     def test_a_connection_error_wrapped_in_an_agent_error_is_infra(self) -> None:
         try:

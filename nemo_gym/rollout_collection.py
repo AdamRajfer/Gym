@@ -2336,6 +2336,15 @@ def _annotate_infra_unresolved(metrics_fpath: Optional[Path], fields: Mapping[st
     return dict(fields)
 
 
+def _infra_zeros_count(opted_in: bool, *, has_result: bool, failure_rows: Iterable[Mapping[str, Any]]) -> bool:
+    """Whether a benchmark's own zeros for infra failures that persist (count_infra_unresolved_as_zero) count.
+
+    Only beside a real result, a saved row or a final failure: a run whose every rollout is infra-unresolved
+    measured nothing, so it has no score, at the attempt cap as below it, exactly as without the option.
+    """
+    return opted_in and (has_result or any(is_terminal_failure(row) for row in failure_rows))
+
+
 def _failure_attempts(failures_fpaths: List[Path]) -> Counter:
     """How many failed attempts the sidecars record for each ``(task_index, rollout_index)``."""
     attempts: Counter = Counter()
@@ -3931,13 +3940,20 @@ class RolloutCollectionHelper(BaseModel):
             # The scans of whole artifacts after collection run in a worker thread.
             # On the event loop they would stall telemetry, other tasks, and shutdown.
             # The reloads that keep every row use `_read_jsonl` instead.
+            infra_zeros = _infra_zeros_count(
+                config.count_infra_unresolved_as_zero,
+                has_result=persisted_count > 0,
+                failure_rows=(await asyncio.to_thread(_latest_failure_rows, [failures_fpath])).values()
+                if config.count_infra_unresolved_as_zero and persisted_count == 0
+                else (),
+            )
             counted = await asyncio.to_thread(
                 _failure_rows_counted_as_zero,
                 [failures_fpath],
                 config.count_failure_classes_as_zero,
                 persisted_success_keys,
                 retry_terminal_timeouts=config.retry_terminal_timeouts,
-                infra_unresolved_as_zero=config.count_infra_unresolved_as_zero,
+                infra_unresolved_as_zero=infra_zeros,
             )
             # Missing rollouts are always counted as unresolved infra. They are scored only when opted in, and
             # only when this run aggregates: otherwise it scores nothing, and an empty run must still fail.
@@ -3952,7 +3968,7 @@ class RolloutCollectionHelper(BaseModel):
                 if not config.disable_aggregation and config.materialized_jsonl_fpath.exists()
                 else []
             )
-            missing_scored = config.count_missing_rollouts_as_zero or config.count_infra_unresolved_as_zero
+            missing_scored = config.count_missing_rollouts_as_zero or infra_zeros
             missing: List[Dict[str, Any]] = no_row if missing_scored else []
             # The default counts every class as 0, but a run where only retryable rows landed has nothing to
             # report yet: a resume runs them. Only a final row, or a class the caller named, is a result. A
@@ -5051,9 +5067,12 @@ class RolloutAggregationHelper(BaseModel):
                     latest_failures[_identity_key(row, group)] = row
                     failure_attempts[_identity_key(row, group)] += shard_attempts[key]
         max_attempts = _get_max_rollout_attempts()
+        infra_zeros = _infra_zeros_count(
+            config.count_infra_unresolved_as_zero, has_result=bool(results), failure_rows=latest_failures.values()
+        )
         result_ids = (
             {_identity_key(r, group) for r in results}
-            if latest_failures or config.count_missing_rollouts_as_zero or config.count_infra_unresolved_as_zero
+            if latest_failures or config.count_missing_rollouts_as_zero or infra_zeros
             else set()
         )
         # A row that names no agent and no server cannot reach any server's metrics; it stays a dropped one.
@@ -5065,7 +5084,7 @@ class RolloutAggregationHelper(BaseModel):
                 row,
                 config.count_failure_classes_as_zero,
                 at_cap=failure_attempts[identity] >= max_attempts,
-                infra_unresolved_as_zero=config.count_infra_unresolved_as_zero,
+                infra_unresolved_as_zero=infra_zeros,
             )
             and _routing_identity(row) is not None
         ]
@@ -5090,7 +5109,7 @@ class RolloutAggregationHelper(BaseModel):
                 accounted.add(_identity_key(zero, group))
                 unaccounted.append(zero)
         missing: List[Dict[str, Any]] = []
-        if config.count_missing_rollouts_as_zero or config.count_infra_unresolved_as_zero:
+        if config.count_missing_rollouts_as_zero or infra_zeros:
             missing = unaccounted
             print(f"Counting {len(missing)} materialized rollout(s) with no row as scored zeros")
             counted.extend(missing)

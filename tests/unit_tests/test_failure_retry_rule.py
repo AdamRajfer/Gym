@@ -658,6 +658,58 @@ class TestInfraUnresolved:
         assert (key_metrics["mean/reward"], key_metrics["rollouts_infra_unresolved"]) == (0.5, 1)
         assert key_metrics["rollouts_complete"] is False
 
+    @pytest.mark.parametrize("landed", [False, True], ids=["all-infra-at-the-cap", "one-real-result"])
+    async def test_infra_zeros_at_the_cap_need_a_real_result_beside_them(
+        self, landed: bool, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """At the attempt cap the guard is not reached, so the opted-in zeros must stay out of an all-infra run."""
+        monkeypatch.setenv("NEMO_GYM_MAX_ROLLOUT_ATTEMPTS", "1")
+        monkeypatch.setattr("nemo_gym.rollout_collection.get_global_config_dict", lambda *args, **kwargs: {})
+        output = tmp_path / "out.jsonl"
+        rows = [{"responses_create_params": {"input": []}, "agent_ref": {"name": "agent"}, "i": i} for i in range(2)]
+        (tmp_path / "in.jsonl").write_bytes(b"".join(orjson.dumps(row) + b"\n" for row in rows))
+        scored: list = []
+
+        class Helper(RolloutCollectionHelper):
+            def _run_examples_with_metadata(self, examples, *args, **kwargs):
+                futures = []
+                for example in examples:
+                    future = asyncio.get_event_loop().create_future()
+                    real = landed and example[TASK_INDEX_KEY_NAME] == 0
+                    result = {"reward": 1.0} if real else {NG_FAILURE_CLASS_KEY: "judge_failed"}
+                    future.set_result(_CompletedRollout(row=example, result=result, rollout_latency_ms=None))
+                    futures.append(future)
+                return futures
+
+            async def _call_aggregate_metrics(self, results, rows, output_fpath, *, raise_on_error=True):
+                scored.extend(results)
+                if not results:
+                    return None  # As the real aggregation does: nothing to score.
+                metrics_fpath = output_fpath.with_name(output_fpath.stem + "_aggregate_metrics.json")
+                mean = sum(r["reward"] for r in results) / len(results)
+                entry = {"agent_ref": {"name": "agent"}, "agent_metrics": {}, "key_metrics": {"mean/reward": mean}}
+                metrics_fpath.write_bytes(orjson.dumps([entry]))
+                return metrics_fpath
+
+        await Helper().run_from_config(
+            RolloutCollectionConfig(
+                input_jsonl_fpath=str(tmp_path / "in.jsonl"),
+                output_jsonl_fpath=str(output),
+                disable_health_check=True,
+                count_infra_unresolved_as_zero=True,
+            )
+        )
+
+        [entry] = orjson.loads(output.with_name("out_aggregate_metrics.json").read_bytes())
+        key_metrics = entry["key_metrics"]
+        assert (key_metrics["rollouts_complete"], key_metrics["publishable"]) == (False, False)
+        if landed:
+            assert sorted(r["reward"] for r in scored) == [0.0, 1.0]
+            assert key_metrics["mean/reward"] == 0.5
+        else:
+            assert scored == []
+            assert "mean/reward" not in key_metrics
+
     async def test_a_resume_with_nothing_left_to_dispatch_still_reports_incomplete(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:

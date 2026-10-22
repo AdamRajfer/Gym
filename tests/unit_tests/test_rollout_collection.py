@@ -8238,6 +8238,39 @@ class TestRolloutAggregationHelper:
         assert key_metrics["rollouts_infra_unresolved"] == 1
         assert (key_metrics["rollouts_complete"], key_metrics["publishable"]) == (False, False)
 
+    @pytest.mark.parametrize("landed", [False, True], ids=["all-infra-at-the-cap", "one-real-result"])
+    async def test_gym_eval_aggregate_scores_infra_zeros_only_beside_a_real_result(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, empty_global_config: MagicMock, landed: bool
+    ) -> None:
+        """With count_infra_unresolved_as_zero, an all-infra run at the cap has no score, as without the option."""
+        monkeypatch.setenv("NEMO_GYM_MAX_ROLLOUT_ATTEMPTS", "1")
+        run = tmp_path / "run" / "rollouts.jsonl"
+        server = {NG_ENVIRONMENT_SERVER_KEY: "env_a"}
+        self._write_rows(materialized_path_for(run), *(self._rollout(i, "agent_a", **server) for i in range(2)))
+        self._write_rows(run, *([self._rollout(0, "agent_a", reward=1.0, **server)] if landed else []))
+        judge = {NG_FAILURE_CLASS_KEY: "judge_failed", **server}
+        self._write_rows(
+            _failures_path_for(run),
+            *(self._rollout(i, "agent_a", **judge) for i in ([1] if landed else [0, 1])),
+        )
+        self._serve(monkeypatch, {}, {"env_a": "agent_a"})
+
+        metrics_fpath = await RolloutAggregationHelper().run_from_config(
+            RolloutAggregationConfig(
+                input_glob=str(run),
+                output_jsonl_fpath=str(tmp_path / "out.jsonl"),
+                disable_health_check=True,
+                count_infra_unresolved_as_zero=True,
+            )
+        )
+
+        key_metrics = orjson.loads(metrics_fpath.read_bytes())[0]["key_metrics"]
+        assert (key_metrics["rollouts_complete"], key_metrics["publishable"]) == (False, False)
+        if landed:
+            assert key_metrics["mean/reward"] == 0.5  # The capped infra rollout counts as 0 beside the real one.
+        else:
+            assert "mean/reward" not in key_metrics
+
     async def test_gym_eval_aggregate_reports_infra_failures_that_persist(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, empty_global_config: MagicMock
     ) -> None:

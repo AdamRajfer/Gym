@@ -59,7 +59,7 @@ from typing import Any, Awaitable, Callable, Type, TypeVar
 
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 from nemo_gym.failure_kinds import INFRA, MODEL, FailureCause, failure_cause_of, judge_failure_after_retries
 from nemo_gym.global_config import is_eval_mode
@@ -93,14 +93,25 @@ def normalize_math_judge_verdict(text: str) -> str:
 class JudgeError(Exception):
     """A judge call failed; judge_failsafe routes the row to the failures sidecar.
 
-    ``attempts`` is how many times the judge was tried on the same answer before this error, once known.
+    ``attempts`` is how many times the judge was tried on the same answer before this error, once known, and
+    ``attempt_causes`` the cause of each of those tries.
     """
 
     attempts: int | None = None
+    attempt_causes: tuple[FailureCause, ...] = ()
 
 
 class JudgeInputTooLongError(JudgeError):
     """The judge rejected an input the model's own answer made too long: the model's final 0."""
+
+
+class JudgeEmptyReplyError(JudgeError):
+    """The judge answered with no text at all. A throttled judge or a provider-side filter can send an HTTP 200
+    with an empty body, so this is infra, never a verdict about the answer."""
+
+
+class JudgeNoVerdictError(JudgeError):
+    """The judge answered with text that carries no verdict the server can read: the answer was judged."""
 
 
 # How an OpenAI-compatible engine (vLLM, SGLang, the OpenAI API) words a request that exceeds its context window.
@@ -137,16 +148,22 @@ def _is_context_overflow(error: BaseException) -> bool:
 
 
 def _judge_failure_cause(error: JudgeError) -> FailureCause:
-    """What caused a judge failure, from its last error; ``judge_failure_after_retries`` decides the row by it.
+    """What caused one judge try; ``judge_failure_after_retries`` decides the row by the causes of every try.
 
-    A failed call reads its error chain: a spent budget, a rate limit, a gateway status, a timeout or a bad key is
-    infra. A judge that answered without a verdict (no error chain) did so on every attempt with the same answer,
-    so the answer is the cause, and so is any other 4xx the judge gave the request the answer shaped. A context
-    overflow reaches here only from a server that cannot tell the answer caused it (``overflow_is_the_models`` is
-    off: the judge input carries documents too), so it is not the model's and stays out of the score as infra.
+    - Text with no verdict (``JudgeNoVerdictError``): the judge answered, so the answer was judged. The model's.
+    - An empty reply (``JudgeEmptyReplyError``): infra. A throttled judge or a provider-side filter can send an
+      HTTP 200 with no text.
+    - A failed call reads its error chain: a spent budget, a rate limit, a gateway status, a timeout or a bad key is
+      infra, and any other 4xx the answer shaped is the model's.
+    - A context overflow reaches here only from a server that cannot tell the answer caused it
+      (``overflow_is_the_models`` is off: the judge input carries documents too). It is not the model's, so it is
+      infra. The model's own overflow is ``JudgeInputTooLongError``, read from the engine's context-length reply.
+    - Anything else with no chain (a server's own JudgeError) is infra: there is no evidence the answer caused it.
     """
-    if error.__cause__ is None:
+    if isinstance(error, JudgeNoVerdictError):
         return MODEL
+    if isinstance(error, JudgeEmptyReplyError) or error.__cause__ is None:
+        return INFRA
     if _is_context_overflow(error.__cause__):
         return INFRA
     return failure_cause_of(error)
@@ -156,9 +173,12 @@ def raise_unparseable_verdict(server: str, judge_output: str) -> None:
     """Raise the JudgeError for a judge reply that carries no verdict the server can read.
 
     In evaluation ``retry_judge_in_place`` asks the judge again on the same answer; ``judge_failsafe`` then records
-    a ``judge_failed`` row by ``judge_failure_after_retries``.
+    a ``judge_failed`` row by ``judge_failure_after_retries``. A reply with text and no verdict is the model's
+    (the answer was judged); an empty reply is infra (``JudgeEmptyReplyError``).
     """
-    raise JudgeError(f"{server}: judge verdict is unparseable: {judge_output[:500]!r}")
+    if not judge_output.strip():
+        raise JudgeEmptyReplyError(f"{server}: judge reply is empty")
+    raise JudgeNoVerdictError(f"{server}: judge verdict is unparseable: {judge_output[:500]!r}")
 
 
 async def reraise_judge_errors(coro: Awaitable[Any]) -> Any:
@@ -205,6 +225,7 @@ async def retry_judge_in_place(attempt: Callable[[], Awaitable[T]]) -> T:
 
 
 async def _retry_loop(attempt: Callable[[], Awaitable[T]], max_attempts: int) -> T:
+    causes: list[FailureCause] = []
     for attempt_number in range(1, max_attempts + 1):
         try:
             return await attempt()
@@ -212,8 +233,10 @@ async def _retry_loop(attempt: Callable[[], Awaitable[T]], max_attempts: int) ->
             e.attempts = attempt_number
             raise
         except JudgeError as e:
+            causes.append(_judge_failure_cause(e))
             if attempt_number == max_attempts:
                 e.attempts = attempt_number
+                e.attempt_causes = tuple(causes)
                 raise
             delay = JUDGE_RETRY_BACKOFF_SECONDS[min(attempt_number - 1, len(JUDGE_RETRY_BACKOFF_SECONDS) - 1)]
             logger.warning(
@@ -255,7 +278,19 @@ async def call_judge(
             if overflow_is_the_models and is_eval_mode() and _is_context_overflow(e):
                 raise JudgeInputTooLongError(f"{type(e).__name__}: {e} | judge reply: {_error_body(e)[:1000]}") from e
             raise
-        return response_model.model_validate(await get_response_json(http_response))
+        if not is_eval_mode():
+            return response_model.model_validate(await get_response_json(http_response))
+        # Evaluation: tell an empty 200 (a throttled judge, a provider-side filter) from text with no verdict.
+        try:
+            reply = await get_response_json(http_response)
+        except Exception as e:
+            raise JudgeEmptyReplyError(f"{type(e).__name__}: judge reply is empty or not JSON: {e}") from e
+        if not reply:
+            raise JudgeEmptyReplyError("judge reply is empty")
+        try:
+            return response_model.model_validate(reply)
+        except ValidationError as e:
+            raise JudgeNoVerdictError(f"judge reply carries no verdict: {str(reply)[:500]!r}") from e
 
     # A retry posts the same ``json`` object: the same answer, byte for byte.
     return await retry_judge_in_place(lambda: reraise_judge_errors(_call()))
@@ -296,7 +331,10 @@ def judge_failsafe(verify_fn: Callable) -> Callable:
             if is_eval_mode():
                 # The judge already had its in-place attempts on this answer; the rollout is never re-run for it.
                 data |= {"failure_kind": "judge_failed", "failure_reason": error} | judge_failure_after_retries(
-                    judge_error=error, cause=_judge_failure_cause(e), attempts=e.attempts or 1
+                    judge_error=error,
+                    cause=_judge_failure_cause(e),
+                    attempts=e.attempts or 1,
+                    attempt_causes=e.attempt_causes,
                 )
                 return JSONResponse(content=jsonable_encoder(data))
             instance_config = data.get("instance_config")

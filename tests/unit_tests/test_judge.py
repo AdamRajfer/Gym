@@ -572,6 +572,47 @@ class TestJudgeRetriedInPlaceOnTheSameAnswer:
         assert (row["_ng_failure_terminal"], row["reward"], row["mask_sample"]) == (True, 0.0, False)
         assert "_ng_failure_judge_settled" not in row
 
+    _NO_VERDICT = (200, b'{"no_verdict": "I cannot grade this."}')
+    _EMPTY = (200, b"")
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("replies", "expected"),
+        [
+            ([_NO_VERDICT] * 3, "model"),
+            ([_EMPTY] * 3, "infra"),
+            ([(200, b"{}")] * 3, "infra"),
+            ([_EMPTY, _NO_VERDICT, _NO_VERDICT], "infra"),
+            ([(429, b'{"error": "rate limited"}')] * 3, "infra"),
+        ],
+        ids=["no-verdict-x3", "empty-x3", "empty-json-x3", "empty-then-no-verdict", "429-x3"],
+    )
+    async def test_a_reply_with_no_verdict_is_the_models_0_unless_a_try_was_empty_or_limited(
+        self, replies: list, expected: str
+    ) -> None:
+        """Adam's refinement: a reply with no verdict after 3 tries is the model's 0, assuming it is not rate limiting."""
+        client, sent = _recording_judge(*replies)
+
+        row = await self._verify(client)
+
+        assert len(sent) == 3 and len(set(sent)) == 1
+        assert row["_ng_failure_cause"] == row["_ng_failure_judge_cause"] == expected
+        if expected == "model":
+            assert (row["_ng_failure_terminal"], row["reward"]) == (True, 0.0)
+        else:
+            assert (row["_ng_failure_judge_settled"], "_ng_failure_terminal" in row) == (True, False)
+
+    @pytest.mark.parametrize(
+        ("text", "error_type"),
+        [("", "JudgeEmptyReplyError"), ("  \n", "JudgeEmptyReplyError"), ("maybe", "JudgeNoVerdictError")],
+    )
+    def test_raise_unparseable_verdict_tells_an_empty_reply_from_text(self, text: str, error_type: str) -> None:
+        from nemo_gym.judge import raise_unparseable_verdict
+
+        with pytest.raises(JudgeError) as exc:
+            raise_unparseable_verdict("server", text)
+        assert type(exc.value).__name__ == error_type
+
     @pytest.mark.asyncio
     async def test_rule_branch_model_an_answer_caused_overflow_is_the_models_final_zero(self) -> None:
         judge = _overflow_client(400, _OVERFLOW_BODY)

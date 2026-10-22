@@ -78,15 +78,29 @@ _CONTEXT_OVERFLOW_PATTERN = re.compile(
 )
 
 
-def _is_context_overflow(error: BaseException) -> bool:
-    """Whether a judge call failed with a 4xx that says the request exceeds the judge's context window."""
-    status = getattr(error, "status", None)
-    if not isinstance(status, int) or not 400 <= status < 500:
-        return False
+# How a Gym model server relays an upstream failure it does not propagate: a 500 whose body carries the upstream
+# reply verbatim (``SimpleServer.setup_exception_middleware``).
+_GYM_RELAY_MARKER = "calling an inner server:"
+
+
+def _error_body(error: BaseException) -> str:
     body = getattr(error, "response_content", None)
     if isinstance(body, bytes):
         body = body.decode("utf-8", errors="replace")
-    return bool(_CONTEXT_OVERFLOW_PATTERN.search(f"{getattr(error, 'message', '')} {body or ''}"))
+    return body or ""
+
+
+def _is_context_overflow(error: BaseException) -> bool:
+    """Whether a judge call failed because the request exceeds the judge's context window.
+
+    The judge's engine answers with a 4xx. A Gym model server in front of it that does not propagate that status
+    answers with a 500 that carries the engine's reply, which says the same.
+    """
+    status = getattr(error, "status", None)
+    body = _error_body(error)
+    if not isinstance(status, int) or not (400 <= status < 500 or (status == 500 and _GYM_RELAY_MARKER in body)):
+        return False
+    return bool(_CONTEXT_OVERFLOW_PATTERN.search(f"{getattr(error, 'message', '')} {body}"))
 
 
 def raise_unparseable_verdict(server: str, judge_output: str) -> None:
@@ -104,7 +118,11 @@ async def reraise_judge_errors(coro: Awaitable[Any]) -> Any:
     except JudgeError:
         raise
     except Exception as e:
-        raise JudgeError(f"{type(e).__name__}: {e}") from e
+        # The judge's own reply (an engine's 400 body, relayed through a model server's 500) says why it failed;
+        # it goes on the row, so a context overflow and an unparseable verdict do not look alike.
+        body = _error_body(e)
+        reply = f" | judge reply: {body[:1000]}" if body else ""
+        raise JudgeError(f"{type(e).__name__}: {e}{reply}") from e
 
 
 async def call_judge(
@@ -132,7 +150,7 @@ async def call_judge(
             await raise_for_status(http_response)
         except Exception as e:
             if overflow_is_the_models and _is_context_overflow(e):
-                raise JudgeInputTooLongError(f"{type(e).__name__}: {e}") from e
+                raise JudgeInputTooLongError(f"{type(e).__name__}: {e} | judge reply: {_error_body(e)[:1000]}") from e
             raise
         return response_model.model_validate(await get_response_json(http_response))
 

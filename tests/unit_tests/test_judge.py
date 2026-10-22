@@ -225,3 +225,110 @@ class TestJudgeInputTooLong:
         data = orjson.loads((await judge_failsafe(verify)(_Req())).body)
         assert data["_ng_failure_class"] == "judge_failed"
         assert data["mask_sample"] is True
+
+
+class _JudgeRelay:
+    """A ServerClient whose post() reaches a real Gym judge model server over its HTTP app, as the real hop does."""
+
+    def __init__(self, judge_app) -> None:
+        from fastapi.testclient import TestClient
+
+        self._judge = TestClient(judge_app, raise_server_exceptions=False)
+
+    async def post(self, server_name: str, url_path: str, json=None, **kwargs):
+        from types import SimpleNamespace
+
+        from aiohttp import ClientResponseError
+
+        payload = json.model_dump(mode="json", exclude_unset=True) if hasattr(json, "model_dump") else json
+        reply = self._judge.post(url_path, json=payload)
+
+        def reject() -> None:
+            url = f"http://judge{url_path}"
+            info = SimpleNamespace(method="POST", url=url, real_url=url, headers={})
+            raise ClientResponseError(request_info=info, history=(), status=reply.status_code, message="Error")
+
+        relayed = MagicMock(ok=reply.is_success, status=reply.status_code, headers=dict(reply.headers))
+        relayed.read = AsyncMock(return_value=reply.content)
+        relayed.content.read = AsyncMock(return_value=reply.content)
+        relayed.raise_for_status = MagicMock(side_effect=None if reply.is_success else reject)
+        return relayed
+
+
+def _judge_model_server(upstream_error: BaseException):
+    """Gym's own OpenAI-compatible judge model server, whose upstream engine raises upstream_error."""
+    from omegaconf import OmegaConf
+
+    from nemo_gym.openai_utils import NeMoGymAsyncOpenAI
+    from nemo_gym.server_utils import ServerClient
+    from responses_api_models.openai_model.app import SimpleModelServer, SimpleModelServerConfig
+
+    config = SimpleModelServerConfig(
+        host="0.0.0.0",
+        port=8081,
+        openai_base_url="https://judge.example/v1",
+        openai_api_key="dummy_key",  # pragma: allowlist secret
+        openai_model="judge",
+        entrypoint="",
+        name="judge",
+    )
+    server = SimpleModelServer(
+        config=config, server_client=MagicMock(spec=ServerClient, global_config_dict=OmegaConf.create({}))
+    )
+    server._client = MagicMock(spec=NeMoGymAsyncOpenAI)
+    server._client.create_response = AsyncMock(side_effect=upstream_error)
+    app = server.setup_webserver()
+    server.setup_exception_middleware(app)
+    return app
+
+
+class TestJudgeReasonThroughTheModelServer:
+    """The judge's own reason survives Gym's judge model server, which answers 500 for an upstream 4xx it keeps."""
+
+    @staticmethod
+    def _upstream(status: int, body: bytes) -> BaseException:
+        from types import SimpleNamespace
+
+        from aiohttp import ClientResponseError
+
+        info = SimpleNamespace(method="POST", url="https://judge.example/v1", real_url="https://judge.example/v1")
+        error = ClientResponseError(request_info=info, history=(), status=status, message="Bad Request")
+        error.response_content = body
+        return error
+
+    async def _row(self, upstream_error: BaseException, *, overflow_is_the_models: bool) -> dict:
+        relay = _JudgeRelay(_judge_model_server(upstream_error))
+
+        async def verify(body):
+            return await call_judge(
+                relay,
+                server_name="judge",
+                url_path="/v1/responses",
+                json={"input": "grade this"},
+                response_model=_Verdict,
+                overflow_is_the_models=overflow_is_the_models,
+            )
+
+        return orjson.loads((await judge_failsafe(verify)(_Req(response={"final": "answer"}))).body)
+
+    @pytest.mark.asyncio
+    async def test_an_overflow_relayed_as_a_500_is_still_the_models_final_zero(self) -> None:
+        row = await self._row(self._upstream(400, _OVERFLOW_BODY), overflow_is_the_models=True)
+
+        assert (row["_ng_failure_class"], row["reward"], row["mask_sample"]) == ("judge_input_too_long", 0.0, False)
+        assert "context_length_exceeded" in row["_ng_failure_judge_error"]
+
+    @pytest.mark.asyncio
+    async def test_a_server_that_cannot_tell_keeps_the_judges_reason_on_the_row(self) -> None:
+        row = await self._row(self._upstream(400, _OVERFLOW_BODY), overflow_is_the_models=False)
+
+        assert row["_ng_failure_class"] == "judge_failed"
+        # The row says why the judge failed, so it no longer looks like any other judge failure.
+        assert "context_length_exceeded" in row["_ng_failure_judge_error"]
+
+    @pytest.mark.asyncio
+    async def test_a_relayed_server_error_without_an_overflow_stays_judge_failed(self) -> None:
+        row = await self._row(self._upstream(503, b'{"error": "overloaded"}'), overflow_is_the_models=True)
+
+        assert row["_ng_failure_class"] == "judge_failed"
+        assert row["mask_sample"] is True

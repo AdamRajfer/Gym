@@ -1095,14 +1095,23 @@ class TestApp:
     async def test_an_unparseable_judge_verdict_is_judge_failed_not_a_zero(
         self, config: LibraryJudgeMathResourcesServerConfig, judge_text: str, monkeypatch: MonkeyPatch
     ) -> None:
-        """The judge, not the model, failed: the row is retried as judge_failed and stays out of the score."""
+        """The judge, not the model, failed: it is asked again on the same answer, never by re-running the rollout."""
         from nemo_gym.judge import judge_failsafe
 
         monkeypatch.setattr("resources_servers.math_with_judge.app.is_eval_mode", lambda: True)
+        monkeypatch.setattr("nemo_gym.judge.is_eval_mode", lambda: True)
+        monkeypatch.setattr("nemo_gym.judge.JUDGE_RETRY_BACKOFF_SECONDS", (0.0,))
+        monkeypatch.delenv("NEMO_GYM_JUDGE_MAX_ATTEMPTS", raising=False)
 
         server_mock = MagicMock(spec=ServerClient)
         judge_reply = self._create_response("judge", self._create_response_output_message(judge_text))
-        server_mock.post = AsyncMock(return_value=MagicMock(read=AsyncMock(return_value=json.dumps(judge_reply))))
+        sent: list[str] = []
+
+        async def post(**kwargs):
+            sent.append(kwargs["json"].model_dump_json())
+            return MagicMock(read=AsyncMock(return_value=json.dumps(judge_reply)))
+
+        server_mock.post = AsyncMock(side_effect=post)
         resources_server = LibraryJudgeMathResourcesServer(
             config=config.model_copy(update={"should_use_judge": True}), server_client=server_mock
         )
@@ -1118,11 +1127,38 @@ class TestApp:
 
         row = json.loads((await judge_failsafe(resources_server.verify)(request)).body)
 
-        assert server_mock.post.await_count == 1
+        # Three in-place attempts on the byte-identical judge prompt, then the rule's final 0.
+        assert len(sent) == 3 and len(set(sent)) == 1
         assert row["_ng_failure_class"] == "judge_failed"
         assert row["failure_kind"] == "judge_failed"
-        assert row["mask_sample"] is True
+        assert (row["reward"], row["mask_sample"], row["_ng_failure_terminal"]) == (0.0, False, True)
+        assert row["_ng_failure_judge_attempts"] == 3
         assert "unparseable" in row["_ng_failure_judge_error"]
+
+    async def test_an_unparseable_verdict_recovers_in_place_when_the_judge_answers_again(
+        self, config: LibraryJudgeMathResourcesServerConfig, monkeypatch: MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr("resources_servers.math_with_judge.app.is_eval_mode", lambda: True)
+        monkeypatch.setattr("nemo_gym.judge.is_eval_mode", lambda: True)
+        monkeypatch.setattr("nemo_gym.judge.JUDGE_RETRY_BACKOFF_SECONDS", (0.0,))
+        replies = [
+            self._create_response("judge", self._create_response_output_message(text))
+            for text in ("I cannot decide.", "[[A=B]]")
+        ]
+        sent: list[str] = []
+
+        async def post(**kwargs):
+            sent.append(kwargs["json"].model_dump_json())
+            return MagicMock(read=AsyncMock(return_value=json.dumps(replies[len(sent) - 1])))
+
+        server_mock = MagicMock(spec=ServerClient)
+        server_mock.post = AsyncMock(side_effect=post)
+        resources_server = LibraryJudgeMathResourcesServer(config=config, server_client=server_mock)
+
+        equal, _ = await resources_server._generate_judge_evaluation("question", "first", "second")
+
+        assert equal is True
+        assert len(sent) == 2 and sent[0] == sent[1]
 
     @mark.parametrize("judge_text", ["no verdict at all", "I cannot decide."], ids=["no-marker", "prose"])
     async def test_training_scores_an_unparseable_judge_verdict_as_before(

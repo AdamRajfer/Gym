@@ -38,7 +38,12 @@ from nemo_gym.base_resources_server import (
 )
 from nemo_gym.config_types import ModelServerRef
 from nemo_gym.global_config import is_eval_mode
-from nemo_gym.judge import call_judge, normalize_math_judge_verdict, raise_unparseable_verdict
+from nemo_gym.judge import (
+    call_judge,
+    normalize_math_judge_verdict,
+    raise_unparseable_verdict,
+    retry_judge_in_place,
+)
 from nemo_gym.openai_utils import (
     NeMoGymEasyInputMessage,
     NeMoGymResponse,
@@ -616,9 +621,16 @@ Example output: "My final verdict is different [[A!=B]]"."""
             ),
         ]
 
+        # The call and its verdict parse are one attempt: in evaluation an unparseable verdict is retried in place on
+        # the same prompt (the same stored answer), never by re-running the rollout.
+        return await retry_judge_in_place(lambda: self._judge_once(responses_create_params))
+
+    async def _judge_once(
+        self, responses_create_params: NeMoGymResponseCreateParamsNonStreaming
+    ) -> tuple[bool, JudgeEvaluation]:
         judge_response = await call_judge(
             self.server_client,
-            server_name=config.judge_model_server.name,
+            server_name=self.config.judge_model_server.name,
             url_path="/v1/responses",
             json=responses_create_params,
             response_model=NeMoGymResponse,
@@ -626,8 +638,8 @@ Example output: "My final verdict is different [[A!=B]]"."""
         judge_evaluation = JudgeEvaluation(responses_create_params=responses_create_params, response=judge_response)
 
         # In evaluation, a reply that carries no verdict (no message, a refusal, neither label) is the judge's
-        # failure, not the model's: it is retried as judge_failed instead of being scored as unequal. Training
-        # treats it as unequal, as before.
+        # failure, not the model's: it is retried in place, then judge_failure_after_retries decides the row.
+        # Training treats it as unequal, as before.
         last_output = judge_response.output[-1]
         if last_output.type != "message":
             if is_eval_mode():

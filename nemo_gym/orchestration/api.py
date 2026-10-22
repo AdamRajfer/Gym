@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import copy
 import os
 import re
 import warnings
@@ -31,6 +32,8 @@ from pydantic import (
     field_validator,
     model_validator,
 )
+
+from nemo_gym.orchestration.executors.script_templates import bash_var
 
 
 # Reject unknown fields on all config models so typos in YAML surface immediately.
@@ -196,6 +199,18 @@ class VllmServiceConfig(BaseModelServiceConfig):
         return self
 
 
+class VllmNodeServiceConfig(VllmServiceConfig):
+    server_per_node: bool = False
+
+    def node_host_var(self, index: int) -> str:
+        """The env var the batch script exports with the host of one node of this service's pool."""
+        return f"GYM_POOL_{bash_var(self.node_pool)}_NODE_{index}"
+
+    def node_urls(self, count: int) -> list[str]:
+        """One base URL per node, with each host left for the driver to resolve from its env var."""
+        return [f"http://${{oc.env:{self.node_host_var(i)}}}:{self.port}/v1" for i in range(count)]
+
+
 def effective_ray_serve(service: "VllmServiceConfig", total_nodes: int, gpus_per_node_values: list[int]) -> bool:
     """Whether the Ray Serve gateway manages this service's instances/routing instead of vLLM's own DP."""
     if service.use_ray_serve:
@@ -333,7 +348,7 @@ class RayServiceConfig(BaseServiceConfig):
 
 # Discriminated union keyed on `type`; Pydantic rejects unknown type values at parse time.
 ServiceConfig = Annotated[
-    Annotated[VllmServiceConfig, Tag("vllm")]
+    Annotated[VllmNodeServiceConfig, Tag("vllm")]
     | Annotated[RayServiceConfig, Tag("ray")]
     | Annotated[VllmPDServiceConfig, Tag("vllm_pd")],
     Discriminator("type"),
@@ -648,6 +663,23 @@ class SubmitConfig(_StrictModel):
                     )
                 # Each node serves on its own, so size it as a single-node deployment.
                 service_nodes = 1
+            if isinstance(service, VllmNodeServiceConfig) and service.server_per_node:
+                if service.number_of_instances != 1:
+                    raise ValueError(
+                        f"Service '{service_name}' runs one server per node (server_per_node), so each node is one "
+                        f"instance; number_of_instances must be 1, got {service.number_of_instances}."
+                    )
+                if service.node_pool is None:
+                    raise ValueError(
+                        f"Service '{service_name}' runs one server per node (server_per_node) but has no node_pool. "
+                        "Pin it to the pool whose nodes should each run a server."
+                    )
+                if service.use_ray_serve:
+                    raise ValueError(
+                        f"Service '{service_name}' runs one server per node (server_per_node), which leaves no "
+                        "instances for the Ray Serve gateway to route; drop use_ray_serve."
+                    )
+                service_nodes = 1
             if isinstance(compute, SlurmComputeConfig):
                 service_gpus = [p.gpus_per_node for p in service_pools.values() if p.gpus_per_node is not None]
             else:
@@ -682,8 +714,12 @@ class SubmitConfig(_StrictModel):
                 )
             service = self.services[self.driver.policy_model]
             if isinstance(service, BaseModelServiceConfig):
+                if isinstance(service, VllmNodeServiceConfig) and service.server_per_node:
+                    policy_base_url = service.node_urls(compute.node_pools[service.node_pool].nodes)
+                else:
+                    policy_base_url = f"http://{self.driver.policy_host}:{service.port}/v1"
                 policy_run = {
-                    "policy_base_url": f"http://{self.driver.policy_host}:{service.port}/v1",
+                    "policy_base_url": policy_base_url,
                     "policy_model_name": service.served_model_name or service.model,
                     # vLLM doesn't require auth; dummy key satisfies clients that require the header.
                     "policy_api_key": "dummy",  # pragma: allowlist secret
@@ -701,7 +737,7 @@ class SubmitConfig(_StrictModel):
                             f"Benchmark '{bench_name}' run config already sets {conflicts} "
                             f"but driver.policy_model is also set. Remove one."
                         )
-                    benchmark.run.update(policy_run)
+                    benchmark.run.update(copy.deepcopy(policy_run))
 
         return self
 

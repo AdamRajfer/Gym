@@ -506,6 +506,25 @@ def test_a_run_with_a_policy_model_and_no_env_loads_back(tmp_path: Path) -> None
     assert reloaded.driver.benchmarks == config.driver.benchmarks
 
 
+def test_a_saved_per_node_policy_url_list_loads_back(tmp_path: Path) -> None:
+    """A `server_per_node` policy writes one URL per node; the saved list is the one the policy model derives again."""
+    raw = _policy_config(tmp_path, {})
+    raw["services"]["vllm_model"].update({"node_pool": "gpu", "tensor_parallel_size": 4, "server_per_node": True})
+    raw["compute"]["cluster"]["node_pools"] = {
+        "gpu": {"partition": "batch", "nodes": 2, "ntasks_per_node": 1, "gpus_per_node": 4}
+    }
+    config = SubmitConfig.model_validate(raw)
+    job_dir = _staged_run(tmp_path, config=config)
+
+    reloaded = _saved_config(job_dir)
+
+    assert reloaded.driver.benchmarks["gsm8k"].run["policy_base_url"] == [
+        "http://${oc.env:GYM_POOL_GPU_NODE_0}:8000/v1",
+        "http://${oc.env:GYM_POOL_GPU_NODE_1}:8000/v1",
+    ]
+    assert reloaded.driver.benchmarks == config.driver.benchmarks
+
+
 def test_a_saved_policy_key_that_differs_from_the_policy_model_is_still_refused(tmp_path: Path) -> None:
     raw = _policy_config(tmp_path, {})
     raw["driver"]["benchmarks"]["gsm8k"] = {"run": {"policy_model_name": "another/model"}}

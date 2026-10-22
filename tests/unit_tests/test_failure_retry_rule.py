@@ -658,6 +658,52 @@ class TestInfraUnresolved:
         assert (key_metrics["mean/reward"], key_metrics["rollouts_infra_unresolved"]) == (0.5, 1)
         assert key_metrics["rollouts_complete"] is False
 
+    @pytest.mark.parametrize("eval_mode", [True, False], ids=["evaluation", "training"])
+    async def test_an_all_infra_run_at_the_cap_fails_for_resubmit(
+        self, eval_mode: bool, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Every rollout lost to one infra cause (a dead policy server) at the attempt cap, with no infra-zero opt-in:
+        evaluation fails the run and says to resubmit; it never finishes with a score or as complete."""
+        monkeypatch.setenv("NEMO_GYM_MAX_ROLLOUT_ATTEMPTS", "1")
+        monkeypatch.setattr("nemo_gym.rollout_collection.get_global_config_dict", lambda *args, **kwargs: {})
+        monkeypatch.setattr("nemo_gym.rollout_collection.is_eval_mode", lambda: eval_mode)
+        output = tmp_path / "out.jsonl"
+        rows = [{"responses_create_params": {"input": []}, "agent_ref": {"name": "agent"}, "i": i} for i in range(3)]
+        (tmp_path / "in.jsonl").write_bytes(b"".join(orjson.dumps(row) + b"\n" for row in rows))
+        scored: list = []
+        dead_policy = {
+            NG_FAILURE_CLASS_KEY: "agent_run_error",
+            NG_FAILURE_CAUSE_KEY: INFRA,
+            "error": "ClientConnectorError: Cannot connect to host policy:8000",
+        }
+
+        class Helper(RolloutCollectionHelper):
+            def _run_examples_with_metadata(self, examples, *args, **kwargs):
+                futures = []
+                for example in examples:
+                    future = asyncio.get_event_loop().create_future()
+                    future.set_result(
+                        _CompletedRollout(row=example, result=dict(dead_policy), rollout_latency_ms=None)
+                    )
+                    futures.append(future)
+                return futures
+
+            async def _call_aggregate_metrics(self, results, rows, output_fpath, *, raise_on_error=True):
+                scored.extend(results)
+                return None
+
+        config = RolloutCollectionConfig(
+            input_jsonl_fpath=str(tmp_path / "in.jsonl"), output_jsonl_fpath=str(output), disable_health_check=True
+        )
+        if eval_mode:
+            with pytest.raises(RuntimeError, match="produced a result") as raised:
+                await Helper().run_from_config(config)
+            assert "resubmit" in str(raised.value)
+            assert scored == []
+            return
+        # Training keeps finishing a settled run.
+        await Helper().run_from_config(config)
+
     @pytest.mark.parametrize("landed", [False, True], ids=["all-infra-at-the-cap", "one-real-result"])
     async def test_infra_zeros_at_the_cap_need_a_real_result_beside_them(
         self, landed: bool, tmp_path: Path, monkeypatch: pytest.MonkeyPatch

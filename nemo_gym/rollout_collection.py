@@ -2464,9 +2464,23 @@ def _budget_masks_scored_as_zero(results: List[Dict[str, Any]]) -> List[Dict[str
 
 
 def _every_rollout_settled(rows: List[Dict[str, Any]], failures_fpath: Path, retry_terminal_timeouts: bool) -> bool:
-    """Whether a resume would dispatch none of these rows again: each failed for good or is at the attempt cap."""
+    """Whether a resume would dispatch none of these rows again: each failed for good or is at the attempt cap.
+
+    In evaluation, a run whose every rollout is only infra-unresolved (still failing for infra at the cap, or
+    settled judge infra) does not count: it measured nothing, and a resubmit once the service is back is the only
+    way to a score, so it fails instead of finishing. A data gap or any other settled row still lets it finish.
+    """
     settled = _settled_failure_keys(failures_fpath, retry_terminal_timeouts=retry_terminal_timeouts)
-    return all((row[TASK_INDEX_KEY_NAME], row[ROLLOUT_INDEX_KEY_NAME]) in settled for row in rows)
+    keys = {(row[TASK_INDEX_KEY_NAME], row[ROLLOUT_INDEX_KEY_NAME]) for row in rows}
+    if not keys <= settled:
+        return False
+    if not is_eval_mode():
+        return True
+    latest = _latest_failure_rows([failures_fpath])
+    return not all(
+        key in latest and is_infra_unresolved(latest[key], retry_terminal_timeouts=retry_terminal_timeouts)
+        for key in keys
+    )
 
 
 def _counted_failure_row(row: Dict[str, Any]) -> Dict[str, Any]:

@@ -532,6 +532,7 @@ async def request(
     url: str,
     _internal: bool = False,
     _max_connection_retries: Optional[int] = None,
+    _max_connection_retry_seconds: Optional[float] = None,
     _server_name: Optional[str] = None,
     _max_num_tries: Optional[int] = None,
     _control: bool = False,
@@ -552,6 +553,9 @@ async def request(
     ``_max_num_tries`` caps this call's total attempts on every exception path. It replaces the
     default generic-error limit (``MAX_NUM_TRIES`` attempts for external calls, unbounded for
     internal ones). A ``_max_connection_retries`` limit still applies as well.
+
+    ``_max_connection_retry_seconds`` bounds how long one call keeps retrying a connection that fails without a
+    break (refused, reset, dropped): a dead endpoint then fails the call instead of being retried forever.
 
     ``_resend_after_disconnect=False`` raises a dropped connection instead of sending the request again, because the
     server may already have received it. A connection that was never made is still retried.
@@ -578,6 +582,7 @@ async def request(
             _internal=_internal,
             _max_num_tries=_max_num_tries,
             _max_connection_retries=_max_connection_retries,
+            _max_connection_retry_seconds=_max_connection_retry_seconds,
             _server_name=_server_name,
             _control=_control,
             _resend_after_disconnect=_resend_after_disconnect,
@@ -592,6 +597,7 @@ async def request(
             _internal=_internal,
             _max_num_tries=_max_num_tries,
             _max_connection_retries=_max_connection_retries,
+            _max_connection_retry_seconds=_max_connection_retry_seconds,
             _server_name=_server_name,
             _control=_control,
             _resend_after_disconnect=_resend_after_disconnect,
@@ -606,6 +612,7 @@ async def _traced_request(
     url: str,
     _internal: bool = False,
     _max_connection_retries: Optional[int] = None,
+    _max_connection_retry_seconds: Optional[float] = None,
     _server_name: Optional[str] = None,
     _max_num_tries: Optional[int] = None,
     _control: bool = False,
@@ -650,6 +657,7 @@ async def _traced_request(
             _internal=_internal,
             _max_num_tries=_max_num_tries,
             _max_connection_retries=_max_connection_retries,
+            _max_connection_retry_seconds=_max_connection_retry_seconds,
             _server_name=_server_name,
             _control=_control,
             _resend_after_disconnect=_resend_after_disconnect,
@@ -697,11 +705,27 @@ def _format_upstream_error_log(server_name: str, error: ClientResponseError) -> 
     )
 
 
+def _connection_retry_time_is_up(retry_start: float, max_seconds: Optional[float]) -> bool:
+    """Whether a call's connection failures have lasted past its time cap (``None`` is no cap)."""
+    if max_seconds is None:
+        return False
+    elapsed = time.monotonic() - retry_start
+    if elapsed < max_seconds:
+        return False
+    logger.error(
+        "Giving up on a connection that kept failing for %.0fs (cap %.0fs): the endpoint looks dead.",
+        elapsed,
+        max_seconds,
+    )
+    return True
+
+
 async def _request_with_retries(
     method: str,
     url: str,
     _internal: bool = False,
     _max_connection_retries: Optional[int] = None,
+    _max_connection_retry_seconds: Optional[float] = None,
     _server_name: Optional[str] = None,
     _max_num_tries: Optional[int] = None,
     _control: bool = False,
@@ -739,6 +763,8 @@ async def _request_with_retries(
                 # Retrying forever is wrong if the endpoint is expected to sometimes die and move.
                 if _max_connection_retries is not None and retries >= _max_connection_retries:
                     raise
+                if _connection_retry_time_is_up(retry_start, _max_connection_retry_seconds):
+                    raise
 
                 await asyncio.sleep(0.5)
             except ClientOSError as error:
@@ -757,6 +783,8 @@ async def _request_with_retries(
                     )
 
                 if _max_connection_retries is not None and retries >= _max_connection_retries:
+                    raise
+                if _connection_retry_time_is_up(retry_start, _max_connection_retry_seconds):
                     raise
 
                 await asyncio.sleep(0.5)

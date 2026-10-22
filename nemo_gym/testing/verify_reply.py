@@ -27,6 +27,7 @@ def verify_reply_through_collection(
     """``(record, counted rows, (unresolved, owed), completeness fields)`` for one rollout out of ``expected``."""
     from nemo_gym.rollout_collection import (
         NG_FAILURE_CAUSE_KEY,
+        NG_FAILURE_CLASS_KEY,
         _episode_record,
         _failure_rows_counted_as_zero,
         _failures_path_for,
@@ -39,10 +40,14 @@ def verify_reply_through_collection(
     agent_reply = _AgentVerifyResponse.model_validate(verify_reply).model_dump(mode="json")
     record = _episode_record({"task_id": "t0", "result": agent_reply})
     record |= {"_ng_task_index": 0, "_ng_rollout_index": 0}
-    # The collector stamps the cause its rule reads on every failure row it writes.
-    record[NG_FAILURE_CAUSE_KEY] = failure_cause_of_row(record)
     failures = _failures_path_for(output_dir / "rollouts.jsonl")
-    failures.write_bytes(orjson.dumps(record) + b"\n")
+    if record.get(NG_FAILURE_CLASS_KEY) is not None:
+        # A failure row goes to the sidecar, with the cause the rule reads, as the collector stamps it.
+        record[NG_FAILURE_CAUSE_KEY] = failure_cause_of_row(record)
+        failures.write_bytes(orjson.dumps(record) + b"\n")
+    else:
+        # A result stays in the rollouts file; it scores by its own reward and mask.
+        failures.write_bytes(b"")
     counted = _failure_rows_counted_as_zero([failures], None, set())
     latest = _latest_failure_rows([failures])
     counts = _infra_unresolved_counts(latest, dict.fromkeys(latest, 1), set(), expected=expected, missing=0)

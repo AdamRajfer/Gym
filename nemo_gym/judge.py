@@ -61,7 +61,13 @@ from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ValidationError
 
-from nemo_gym.failure_kinds import INFRA, MODEL, FailureCause, judge_failure_after_retries
+from nemo_gym.failure_kinds import (
+    INFRA,
+    MODEL,
+    FailureCause,
+    JudgeNoVerdictOutcome,
+    judge_failure_after_retries,
+)
 from nemo_gym.global_config import is_eval_mode
 from nemo_gym.server_utils import ServerClient, get_response_json, raise_for_status
 
@@ -111,7 +117,12 @@ class JudgeEmptyReplyError(JudgeError):
 
 
 class JudgeNoVerdictError(JudgeError):
-    """The judge answered with text that carries no verdict the server can read: the answer was judged."""
+    """The judge answered with text that carries no verdict the server can read: the answer was judged.
+
+    ``judge_response`` is the judge's reply, when the server keeps it for a game it records with no verdict.
+    """
+
+    judge_response: Any = None
 
 
 # How an OpenAI-compatible engine (vLLM, SGLang, the OpenAI API) words a request that exceeds its context window.
@@ -292,12 +303,15 @@ async def call_judge(
     return await retry_judge_in_place(lambda: reraise_judge_errors(_call()))
 
 
-def judge_failsafe(verify_fn: Callable) -> Callable:
+def judge_failsafe(verify_fn: Callable, *, no_verdict: JudgeNoVerdictOutcome = "drop") -> Callable:
     """Wrap verify() so a JudgeError returns a sidecar-routed row (reward 0.0, the
     routing keys, the request's ``response`` carried) instead of propagating.
     functools.wraps keeps verify's signature so FastAPI injects the same params
     (``body``, and ``request`` for servers that take it); ``*args, **kwargs`` pass
-    them straight through."""
+    them straight through.
+
+    ``no_verdict`` is what the benchmark's official grader does with a judge reply that has no verdict:
+    ``wrong`` scores it 0, ``drop`` (the default) leaves it out of the score. Evaluation only."""
 
     @functools.wraps(verify_fn)
     async def wrapper(*args, **kwargs):
@@ -331,6 +345,7 @@ def judge_failsafe(verify_fn: Callable) -> Callable:
                     cause=_judge_failure_cause(e),
                     attempts=e.attempts or 1,
                     attempt_causes=e.attempt_causes,
+                    no_verdict=no_verdict,
                 )
                 return JSONResponse(content=jsonable_encoder(data))
             instance_config = data.get("instance_config")

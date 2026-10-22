@@ -7694,7 +7694,7 @@ class TestAJudgeFailureNeverReRunsTheRollout:
         from nemo_gym.failure_kinds import judge_failure_after_retries
 
         return {TASK_INDEX_KEY_NAME: task, ROLLOUT_INDEX_KEY_NAME: 0} | judge_failure_after_retries(
-            judge_error="last judge error", cause=cause, attempts=3
+            judge_error="last judge error", cause=cause, attempts=3, no_verdict="wrong"
         )
 
     def test_rule_branch_model_is_the_models_final_zero(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -7743,7 +7743,7 @@ class TestAJudgeFailureNeverReRunsTheRollout:
 
         # The last try's cause alone would say the opposite in the two mixed cases.
         row = judge_failure_after_retries(
-            judge_error="last", cause=attempt_causes[-1], attempts=3, attempt_causes=attempt_causes
+            judge_error="last", cause=attempt_causes[-1], attempts=3, attempt_causes=attempt_causes, no_verdict="wrong"
         )
 
         assert row[NG_FAILURE_CAUSE_KEY] == row["_ng_failure_judge_cause"] == expected

@@ -437,7 +437,7 @@ class TestJudgeRetriedInPlaceOnTheSameAnswer:
         monkeypatch.setattr("nemo_gym.judge.JUDGE_RETRY_BACKOFF_SECONDS", (0.0,))
         monkeypatch.delenv("NEMO_GYM_JUDGE_MAX_ATTEMPTS", raising=False)
 
-    async def _verify(self, client) -> object:
+    async def _verify(self, client, *, no_verdict: str = "drop") -> object:
         async def verify(body):
             return await call_judge(
                 client,
@@ -447,7 +447,7 @@ class TestJudgeRetriedInPlaceOnTheSameAnswer:
                 response_model=_Verdict,
             )
 
-        out = await judge_failsafe(verify)(_Req(response={"final": self.ANSWER}))
+        out = await judge_failsafe(verify, no_verdict=no_verdict)(_Req(response={"final": self.ANSWER}))
         return out if isinstance(out, _Verdict) else orjson.loads(out.body)
 
     @pytest.mark.asyncio
@@ -573,7 +573,7 @@ class TestJudgeRetriedInPlaceOnTheSameAnswer:
     async def test_rule_branch_model_an_unparseable_verdict_is_the_models_final_zero(self) -> None:
         client, sent = _recording_judge(*[(200, b'{"no_verdict": "I cannot grade this."}')] * 3)
 
-        row = await self._verify(client)
+        row = await self._verify(client, no_verdict="wrong")
 
         assert len(sent) == 3 and len(set(sent)) == 1
         assert row["_ng_failure_cause"] == row["_ng_failure_judge_cause"] == "model"
@@ -601,7 +601,7 @@ class TestJudgeRetriedInPlaceOnTheSameAnswer:
         """Adam's refinement: a reply with no verdict after 3 tries is the model's 0, assuming it is not rate limiting."""
         client, sent = _recording_judge(*replies)
 
-        row = await self._verify(client)
+        row = await self._verify(client, no_verdict="wrong")
 
         assert len(sent) == 3 and len(set(sent)) == 1
         assert row["_ng_failure_cause"] == row["_ng_failure_judge_cause"] == expected
@@ -663,7 +663,7 @@ class TestJudgeRetriedInPlaceOnTheSameAnswer:
     def test_the_rule_function_splits_by_cause(self, cause: str, terminal: bool, settled: bool) -> None:
         from nemo_gym.failure_kinds import judge_failure_after_retries
 
-        row = judge_failure_after_retries(judge_error="last error", cause=cause, attempts=3)
+        row = judge_failure_after_retries(judge_error="last error", cause=cause, attempts=3, no_verdict="wrong")
 
         assert row["_ng_failure_cause"] == row["_ng_failure_judge_cause"] == cause
         assert bool(row.get("_ng_failure_terminal")) is terminal
@@ -766,9 +766,65 @@ class TestTheRulesRowReachesTheScore:
                 client, server_name="judge", url_path="/v1/responses", json={"input": "x"}, response_model=_Verdict
             )
 
-        reply = orjson.loads((await judge_failsafe(verify)(self._request())).body)
+        reply = orjson.loads((await judge_failsafe(verify, no_verdict="wrong")(self._request())).body)
         record, counted, (unresolved, _), metrics = _through_the_agent_and_collector(reply, tmp_path)
 
         assert record["_ng_failure_cause"] == "model"
         assert [row["reward"] for row in counted] == [0.0]
         assert unresolved == 0 and metrics["publishable"] is True
+
+
+class TestNoVerdictFollowsTheOfficialGrader:
+    """A judge reply with no verdict after the tries: the server's own grader decides, never re-dispatched."""
+
+    @pytest.fixture(autouse=True)
+    def _evaluation(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr("nemo_gym.judge.is_eval_mode", lambda: True)
+        monkeypatch.setattr("nemo_gym.rollout_collection.is_eval_mode", lambda: True)
+        monkeypatch.setattr("nemo_gym.judge.JUDGE_RETRY_BACKOFF_SECONDS", (0.0,))
+
+    async def _reply(self, **failsafe_kwargs) -> dict:
+        client, _ = _recording_judge(*[(200, b'{"no_verdict": "I cannot grade this."}')] * 3)
+
+        async def verify(body):
+            return await call_judge(
+                client, server_name="judge", url_path="/v1/responses", json={"input": "x"}, response_model=_Verdict
+            )
+
+        return orjson.loads(
+            (await judge_failsafe(verify, **failsafe_kwargs)(TestTheRulesRowReachesTheScore._request())).body
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_server_with_no_stated_behaviour_drops_it(self, tmp_path) -> None:
+        reply = await self._reply()  # The default: drop.
+
+        record, counted, (unresolved, owed), metrics = _through_the_agent_and_collector(reply, tmp_path)
+
+        # A result, not a failure row: kept in the rollouts file, never re-dispatched, and no measurement.
+        assert "_ng_failure_class" not in record
+        assert (record["mask_sample"], record["failure_kind"]) == (True, "judge_no_verdict")
+        assert record.get("mask_reason") is None  # No reason: aggregation leaves the masked answer out of the score.
+        assert (record["judge_failure_cause"], record["judge_attempts"]) == ("model", 3)
+        assert counted == [] and unresolved == 0  # Not a failure row, so neither a 0 nor infra.
+
+        from nemo_gym.reward_profile import compute_aggregate_metrics
+
+        aggregate = compute_aggregate_metrics([record | {"_ng_task_index": 0}])
+        # Left out of the score, and counted.
+        assert aggregate.agent_metrics.get("coverage/masked_rollouts") == 1
+        assert "mean/reward" not in aggregate.agent_metrics
+
+    @pytest.mark.asyncio
+    async def test_a_server_whose_grader_scores_it_wrong_counts_it_as_0(self, tmp_path) -> None:
+        reply = await self._reply(no_verdict="wrong")
+
+        record, counted, _, _ = _through_the_agent_and_collector(reply, tmp_path)
+
+        assert (record["_ng_failure_class"], record["_ng_failure_cause"]) == ("judge_failed", "model")
+        assert [row["reward"] for row in counted] == [0.0]
+
+    def test_the_server_setting_defaults_to_drop(self) -> None:
+        from nemo_gym.base_resources_server import BaseResourcesServerConfig
+
+        assert BaseResourcesServerConfig.model_fields["judge_no_verdict_outcome"].default == "drop"

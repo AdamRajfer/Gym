@@ -421,12 +421,21 @@ JUDGE_FAILURE_KINDS: frozenset[str] = frozenset({JUDGE_FAILED, JUDGE_UNPARSEABLE
 JUDGE_SETTLED_KEY = "_ng_failure_judge_settled"
 
 
+# What a benchmark's official grader does with a judge reply that carries no verdict. ``wrong`` scores the answer as
+# wrong (NeMo-Skills, SimpleQA, BrowseComp, MultiChallenge); ``drop`` leaves it out of the score (Arena-Hard-Auto
+# drops a null judgment). ``drop`` is the default: a server with no stated official behaviour never scores it 0.
+JudgeNoVerdictOutcome = Literal["wrong", "drop"]
+# The failure kind of an answer left out of the score because its judge gave no verdict.
+JUDGE_NO_VERDICT = "judge_no_verdict"
+
+
 def judge_failure_after_retries(
     *,
     judge_error: str,
     cause: FailureCause,
     attempts: int,
     attempt_causes: Sequence[FailureCause] = (),
+    no_verdict: JudgeNoVerdictOutcome = "drop",
 ) -> dict[str, object]:
     """The evaluation rule for a judge failure that its in-place retries on the same answer did not fix.
 
@@ -434,9 +443,11 @@ def judge_failure_after_retries(
     different one. What the row becomes depends on the cause of each try (``attempt_causes``, one per try; without
     them, ``cause``, the last error's):
 
-    - ``model`` on every try: the model's answer did it. The judge answered with text and no verdict it could
-      give, every time, so the answer was judged and got none; or the judge's own engine rejected an input the
-      answer alone made too long. The row is the model's final failure and counts as 0.
+    - ``model`` on every try: the judge answered with text and no verdict it could give, every time, so the answer
+      was judged and got none. The benchmark's official grader decides (``no_verdict``, a server setting):
+      ``wrong`` makes the row the model's final failure, counted as 0; ``drop`` keeps the answer as a result that
+      is no measurement (``mask_sample``, ``failure_kind="judge_no_verdict"``): left out of the score, counted
+      in ``coverage/masked_rollouts``, and never re-dispatched.
     - ``infra`` on any try: a service the model does not control (a spent budget, a rate limit, a gateway, a
       timeout or a bad key), or an empty reply, which a throttled judge or a provider-side filter sends as an
       HTTP 200 with no text. The row is an unresolved infra row: left out of the score, counted in
@@ -461,6 +472,17 @@ def judge_failure_after_retries(
         "_ng_failure_judge_attempts": attempts,
         "mask_sample": False,
     }
+    if cause == MODEL and no_verdict == "drop":
+        # A result, not a failure row: the answer was judged, and the official method leaves it out of the score.
+        return {
+            "reward": 0.0,
+            "mask_sample": True,
+            "failure_kind": JUDGE_NO_VERDICT,
+            "failure_reason": judge_error,
+            "judge_error": judge_error,
+            "judge_failure_cause": MODEL,
+            "judge_attempts": attempts,
+        }
     if cause == MODEL:
         return row | {"_ng_failure_terminal": True, "reward": 0.0}
     # A verify reply must carry a reward. This one is no measurement: mask_sample says so, and evaluation leaves the

@@ -66,6 +66,7 @@ from nemo_gym.failure_kinds import (
     INFRA,
     JUDGE_FAILED,
     JUDGE_FAILURE_KINDS,
+    JUDGE_NO_VERDICT,
     JUDGE_SETTLED_KEY,
     MODEL,
     RETRY,
@@ -1704,7 +1705,8 @@ def _masked_result_names_infra(result: Mapping[str, Any]) -> bool:
     cause = result.get(NG_FAILURE_CAUSE_KEY)
     if cause in (INFRA, MODEL):
         return cause == INFRA
-    if result.get(MASK_REASON_KEY) == MASK_REASON_BUDGET:
+    # A budget mask, and an answer the judge gave no verdict where the official grader drops it, are the model's.
+    if result.get(MASK_REASON_KEY) == MASK_REASON_BUDGET or result.get("failure_kind") == JUDGE_NO_VERDICT:
         return False
     rule = FAILURE_RULES.get(result.get("failure_kind"))
     if rule in (RETRY, FINAL):

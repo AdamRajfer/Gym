@@ -23,9 +23,10 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
+import yaml
 
 from nemo_gym.cli.main import COMMANDS, _eval_resubmit
-from nemo_gym.orchestration.api import ResumeConfig, SubmitConfig
+from nemo_gym.orchestration.api import SAVED_CONFIG, ResumeConfig, SubmitConfig
 from nemo_gym.orchestration.executors.base import BaseExecutor, UnsupportedOperationError
 from nemo_gym.orchestration.executors.connection import LocalConnection
 from nemo_gym.orchestration.executors.kubernetes import KubernetesExecutor
@@ -34,6 +35,7 @@ from nemo_gym.orchestration.executors.slurm import SlurmExecutor
 from nemo_gym.orchestration.executors.slurm_script import build_sbatch_script
 from nemo_gym.orchestration.jobs import (
     MANIFEST_NAME,
+    RESOLVED_CONFIG_NAME,
     BenchmarkJob,
     SubmissionRecord,
     load_submission_record,
@@ -408,3 +410,113 @@ def test_resubmit_with_telemetry_off_needs_no_token(
     monkeypatch.delenv("OTEL_TOKEN", raising=False)
 
     assert resubmit(*_handle(job_dir)).job_id == "4242"
+
+
+# --- The saved config round trip: what submit persists, resubmit loads -----------------------------------------
+
+_ENV = {"HF_HOME": "lit:/cache/huggingface", "API_KEY": "host:GYM_TEST_SECRET", "LATE": "runtime:LATE"}
+
+
+def _policy_config(tmp_path: Path, env: dict[str, str]) -> dict:
+    """A submit config as written by hand: every env form, and a policy wired by `driver.policy_model`."""
+    return {
+        "services": {"vllm_model": {"type": "vllm", "container": "vllm:latest", "model": "org/model", "env": env}},
+        "compute": {"cluster": {"type": "slurm", "account": "a", "hostname": None}},
+        "driver": {
+            "container": "python:3.12",
+            "policy_model": "vllm_model",
+            "benchmarks": {"gsm8k": {}, "mmlu": {}},
+            "env": env,
+        },
+        "job": {"output_path": str(tmp_path)},
+        "otel": {"enabled": False},
+    }
+
+
+def _saved_config(job_dir: Path) -> SubmitConfig:
+    """Load the run's saved config the way `gym eval resubmit` does."""
+    return SlurmExecutor._saved_config(LocalConnection(), job_dir.parent)
+
+
+def test_the_config_submit_saves_loads_back_as_resubmit_loads_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("GYM_TEST_SECRET", "s3cr3t-value")
+    config = SubmitConfig.model_validate(_policy_config(tmp_path, _ENV))
+    job_dir = _staged_run(tmp_path, config=config)
+    saved_text = (job_dir.parent / RESOLVED_CONFIG_NAME).read_text()
+
+    reloaded = _saved_config(job_dir)
+
+    # The record keeps every prefix, and the secret only as its reference.
+    assert "s3cr3t-value" not in saved_text
+    saved = yaml.safe_load(saved_text)
+    assert saved["driver"]["env"] == saved["services"]["vllm_model"]["env"] == _ENV
+    # Resubmit gets what submit had: resolved env and the injected policy wiring.
+    assert reloaded.driver.env == config.driver.env
+    assert reloaded.services["vllm_model"].env == config.services["vllm_model"].env
+    assert reloaded.driver.benchmarks == config.driver.benchmarks
+    # Saving the reloaded config again writes the same record.
+    _staged_run(tmp_path / "again", config=reloaded)
+    assert (tmp_path / "again" / "gym-job-x" / RESOLVED_CONFIG_NAME).read_text() == saved_text
+
+
+def test_resubmit_queues_a_run_submitted_with_lit_env_and_a_policy_model(
+    tmp_path: Path, slurm_bin: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("GYM_TEST_SECRET", "s3cr3t-value")
+    job_dir = _staged_run(tmp_path, config=SubmitConfig.model_validate(_policy_config(tmp_path, _ENV)))
+
+    assert resubmit(*_handle(job_dir)).job_id == "4242"
+
+
+def test_a_config_saved_with_bare_literals_still_loads(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Configs saved before the dump kept `lit:` hold `HF_HOME: /cache/huggingface`."""
+    monkeypatch.setenv("GYM_TEST_SECRET", "s3cr3t-value")
+    job_dir = _staged_run(tmp_path, config=SubmitConfig.model_validate(_policy_config(tmp_path, _ENV)))
+    resolved = job_dir.parent / RESOLVED_CONFIG_NAME
+    saved = yaml.safe_load(resolved.read_text())
+    for env in (saved["driver"]["env"], saved["services"]["vllm_model"]["env"]):
+        env["HF_HOME"] = "/cache/huggingface"
+    resolved.write_text(yaml.safe_dump(saved, sort_keys=False))
+
+    reloaded = _saved_config(job_dir)
+
+    assert reloaded.driver.env["HF_HOME"] == "/cache/huggingface"
+    assert reloaded.services["vllm_model"].env["HF_HOME"] == "/cache/huggingface"
+
+
+def test_a_bare_env_value_is_still_refused_in_a_config_written_by_hand(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="must start with one of the prefixes"):
+        SubmitConfig.model_validate(_policy_config(tmp_path, {"HF_HOME": "/cache/huggingface"}))
+
+
+def test_a_run_with_a_policy_model_and_no_env_loads_back(tmp_path: Path) -> None:
+    """Submit writes the derived policy keys into each benchmark's run, and the saved config keeps them."""
+    config = SubmitConfig.model_validate(_policy_config(tmp_path, {}))
+    job_dir = _staged_run(tmp_path, config=config)
+
+    reloaded = _saved_config(job_dir)
+
+    assert reloaded.driver.benchmarks["gsm8k"].run == {
+        "policy_base_url": "http://localhost:8000/v1",
+        "policy_model_name": "org/model",
+        "policy_api_key": "dummy",  # pragma: allowlist secret
+    }
+    assert reloaded.driver.benchmarks == config.driver.benchmarks
+
+
+def test_a_saved_policy_key_that_differs_from_the_policy_model_is_still_refused(tmp_path: Path) -> None:
+    raw = _policy_config(tmp_path, {})
+    raw["driver"]["benchmarks"]["gsm8k"] = {"run": {"policy_model_name": "another/model"}}
+
+    with pytest.raises(ValueError, match=r"already sets \['policy_model_name'\]"):
+        SubmitConfig.model_validate(raw, context={SAVED_CONFIG: True})
+
+
+def test_policy_keys_written_by_hand_still_conflict_with_the_policy_model(tmp_path: Path) -> None:
+    raw = _policy_config(tmp_path, {})
+    raw["driver"]["benchmarks"]["gsm8k"] = {"run": {"policy_model_name": "org/model"}}
+
+    with pytest.raises(ValueError, match="driver.policy_model is also set"):
+        SubmitConfig.model_validate(raw)

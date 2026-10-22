@@ -26,6 +26,7 @@ from pydantic import (
     PrivateAttr,
     SerializationInfo,
     Tag,
+    ValidationInfo,
     field_serializer,
     field_validator,
     model_validator,
@@ -47,6 +48,9 @@ RUNTIME_ENV_PREFIX = "runtime:"
 # `model_dump` context flag: write each `host:` env value as its `host:VAR` reference, so a
 # record meant for other readers never holds the submitter's resolved secrets.
 HOST_ENV_REFS = "host_env_refs"
+# `model_validate` context flag for reading a config that `persist()` saved. Records written before
+# `lit:` was kept on the dump hold literals without a prefix; this reads such a value as `lit:`.
+SAVED_CONFIG = "saved_config"
 
 
 class _HostEnvRefs(BaseModel):
@@ -66,13 +70,19 @@ class _HostEnvRefs(BaseModel):
     @field_serializer("env", check_fields=False)
     def _serialize_env(self, env: dict[str, str], info: SerializationInfo) -> dict[str, str]:
         if info.context and info.context.get(HOST_ENV_REFS):
-            return {k: self._host_env_refs.get(k, v) for k, v in env.items()}
+            # Every value keeps a prefix so the record validates again. A resolved `runtime:` value already
+            # carries its own; anything else that did not come from `host:` is a literal.
+            return {
+                k: self._host_env_refs.get(k) or (v if v.startswith(RUNTIME_ENV_PREFIX) else f"lit:{v}")
+                for k, v in env.items()
+            }
         return env
 
 
-def resolve_env_dict(env: dict[str, str]) -> dict[str, str]:
+def resolve_env_dict(env: dict[str, str], *, saved_config: bool = False) -> dict[str, str]:
     """Resolve `lit:`/`host:`/`runtime:` prefixes on `env` values. Every value must use one
     of these prefixes; a missing or misspelled prefix raises rather than being guessed at.
+    `saved_config` reads a value without a prefix as `lit:` (see SAVED_CONFIG).
 
     - `lit:VALUE` -> literal VALUE.
     - `host:VAR` -> read from os.environ[VAR] on the machine running `gym eval submit`;
@@ -99,6 +109,8 @@ def resolve_env_dict(env: dict[str, str]) -> dict[str, str]:
             if not _ENV_VAR_NAME_RE.match(var):
                 raise ValueError(f"env[{key!r}]: {var!r} is not a valid environment variable name for runtime:{var}")
             resolved[key] = f"{RUNTIME_ENV_PREFIX}{var}"
+        elif saved_config:
+            resolved[key] = raw
         else:
             raise ValueError(
                 f"env[{key!r}]: {raw!r} must start with one of the prefixes 'lit:', 'host:', or 'runtime:'"
@@ -142,8 +154,8 @@ class BaseServiceConfig(_HostEnvRefs, _StrictModel):
 
     @field_validator("env")
     @classmethod
-    def _resolve_env_prefixes(cls, v: dict[str, str]) -> dict[str, str]:
-        return resolve_env_dict(v)
+    def _resolve_env_prefixes(cls, v: dict[str, str], info: ValidationInfo) -> dict[str, str]:
+        return resolve_env_dict(v, saved_config=bool(info.context and info.context.get(SAVED_CONFIG)))
 
 
 class BaseModelServiceConfig(BaseServiceConfig):
@@ -480,8 +492,8 @@ class DriverConfig(_HostEnvRefs, _StrictModel):
 
     @field_validator("env")
     @classmethod
-    def _resolve_env_prefixes(cls, v: dict[str, str]) -> dict[str, str]:
-        return resolve_env_dict(v)
+    def _resolve_env_prefixes(cls, v: dict[str, str], info: ValidationInfo) -> dict[str, str]:
+        return resolve_env_dict(v, saved_config=bool(info.context and info.context.get(SAVED_CONFIG)))
 
 
 class JobConfig(_StrictModel):
@@ -562,7 +574,7 @@ class SubmitConfig(_StrictModel):
         return deployed
 
     @model_validator(mode="after")
-    def _resolve_and_validate_placements(self) -> "SubmitConfig":
+    def _resolve_and_validate_placements(self, info: ValidationInfo) -> "SubmitConfig":
         compute_names = set(self.compute)
 
         if len(compute_names) > 1:
@@ -670,19 +682,26 @@ class SubmitConfig(_StrictModel):
                 )
             service = self.services[self.driver.policy_model]
             if isinstance(service, BaseModelServiceConfig):
+                policy_run = {
+                    "policy_base_url": f"http://{self.driver.policy_host}:{service.port}/v1",
+                    "policy_model_name": service.served_model_name or service.model,
+                    # vLLM doesn't require auth; dummy key satisfies clients that require the header.
+                    "policy_api_key": "dummy",  # pragma: allowlist secret
+                }
+                # A saved config holds the keys this block wrote at submit; only a value that differs conflicts.
+                saved_config = bool(info.context and info.context.get(SAVED_CONFIG))
                 for bench_name, benchmark in self.driver.benchmarks.items():
                     conflicts = [
-                        k for k in ("policy_base_url", "policy_model_name", "policy_api_key") if k in benchmark.run
+                        k
+                        for k, v in policy_run.items()
+                        if k in benchmark.run and not (saved_config and benchmark.run[k] == v)
                     ]
                     if conflicts:
                         raise ValueError(
                             f"Benchmark '{bench_name}' run config already sets {conflicts} "
                             f"but driver.policy_model is also set. Remove one."
                         )
-                    benchmark.run["policy_base_url"] = f"http://{self.driver.policy_host}:{service.port}/v1"
-                    benchmark.run["policy_model_name"] = service.served_model_name or service.model
-                    # vLLM doesn't require auth; dummy key satisfies clients that require the header.
-                    benchmark.run["policy_api_key"] = "dummy"  # pragma: allowlist secret
+                    benchmark.run.update(policy_run)
 
         return self
 

@@ -637,19 +637,22 @@ Example output: "My final verdict is different [[A!=B]]"."""
         )
         judge_evaluation = JudgeEvaluation(responses_create_params=responses_create_params, response=judge_response)
 
-        # In evaluation, a reply that carries no verdict (no message, a refusal, neither label) is the judge's
-        # failure, not the model's: it is retried in place, then judge_failure_after_retries decides the row.
-        # Training treats it as unequal, as before.
+        # In evaluation, a reply that carries no verdict is retried in place, then judge_failure_after_retries decides
+        # the row: text with no verdict (a refusal, neither label) is the model's 0, and a reply with no text (no
+        # message, reasoning only) is an empty reply, which is infra. Training treats both as unequal, as before.
+        if is_eval_mode() and not judge_response.output:
+            raise_unparseable_verdict("math_with_judge", "")
         last_output = judge_response.output[-1]
         if last_output.type != "message":
             if is_eval_mode():
-                raise_unparseable_verdict("math_with_judge", f"judge output item of type {last_output.type!r}")
+                raise_unparseable_verdict("math_with_judge", "")
             return False, judge_evaluation
 
         last_content = last_output.content[-1]
         if last_content.type != "output_text":
             if is_eval_mode():
-                raise_unparseable_verdict("math_with_judge", f"judge content of type {last_content.type!r}")
+                refusal = getattr(last_content, "refusal", None) or f"judge content of type {last_content.type!r}"
+                raise_unparseable_verdict("math_with_judge", refusal)
             return False, judge_evaluation
 
         output_text = normalize_math_judge_verdict(last_content.text)

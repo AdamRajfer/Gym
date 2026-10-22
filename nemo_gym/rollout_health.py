@@ -67,6 +67,7 @@ from nemo_gym.health.types import (
     _WorkerInput,
 )
 from nemo_gym.path_utils import failures_path_for, materialized_path_for
+from nemo_gym.time_limit_diagnostics import summarize_timeouts, timeout_view
 
 
 _PROCESS_POOL_CHUNKS_PER_WORKER = 4
@@ -272,6 +273,7 @@ def evaluate_record(
         transcript_completion_tokens=transcript_completion,
         capture_prompt_tokens=sum(_token_count(call, "tokens_in") for call in calls),
         capture_completion_tokens=sum(_token_count(call, "tokens_out") for call in calls),
+        timeout_view=timeout_view(record),
     )
 
 
@@ -485,6 +487,7 @@ def _rollout_accounting(
     limits: RunHealthLimits,
     limits_source: LimitsSource | Mapping[str, LimitsSource],
     duplicated: int,
+    failed_rows: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Count the rollouts each input owed against those that landed, failed or left no row, and judge the run.
 
@@ -520,6 +523,8 @@ def _rollout_accounting(
     if owed is not None:
         # Only owed rollouts count: an unreadable record or a sidecar row outside the inventory is not one.
         failed = {key: row for key, row in failed.items() if key in owed}
+    if failed_rows is not None:
+        failed_rows.extend(failed.values())
     expected = None if owed is None else len(owed)
     missing = None if owed is None else len(owed - landed - failed.keys())
     final = sum(is_terminal_failure(row) for row in failed.values())
@@ -697,6 +702,8 @@ def run_health_checks(
     _mark_duplicate_identities(digests, ignored)
     summary = _reduce(digests, ignored)
     artifacts = summary["run"]["artifacts"]
+    # Every rollout's final record: its saved row, or the last failed attempt of one that never landed.
+    unlanded: list[dict[str, Any]] = []
     artifacts.update(
         _rollout_accounting(
             {(line.source_index, d.task_index, d.rollout_index) for d, line in zip(digests, lines, strict=True)},
@@ -704,7 +711,13 @@ def run_health_checks(
             limits=limits,
             limits_source=limits_source,
             duplicated=summary["run"]["issues"]["rollout_duplicate_identity"],
+            failed_rows=unlanded,
         )
+    )
+    summary["run"]["stats"]["timeouts"] = summarize_timeouts(
+        [d.timeout_view for d in digests if d.timeout_view is not None]
+        + [v for r in unlanded if (v := timeout_view(r))],
+        rollouts=len(digests) + len(unlanded),
     )
     run_findings, run_coverage = _run_excessive_failures(artifacts, limits, ignored)
     _judge_run(artifacts, run_findings, run_coverage)

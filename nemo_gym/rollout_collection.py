@@ -34,7 +34,6 @@ from datetime import timedelta
 from difflib import get_close_matches
 from itertools import repeat
 from pathlib import Path
-from tempfile import TemporaryDirectory
 from time import perf_counter
 from typing import TYPE_CHECKING, Any, Callable, Dict, Iterator, List, Literal, Optional, Tuple, Union
 
@@ -145,7 +144,7 @@ from nemo_gym.server_utils import (
 )
 from nemo_gym.skills import SkillsConfig, load_skill_directory
 from nemo_gym.task_materialization import TASK_ID_FIELDS
-from nemo_gym.time_limit_diagnostics import NG_ELAPSED_S_KEY, summarize_time_limits
+from nemo_gym.time_limit_diagnostics import NG_ELAPSED_S_KEY, flatten_for_export
 from nemo_gym.token_id_capture import (
     TokenCaptureStore,
     TokenIdCaptureConfig,
@@ -696,6 +695,11 @@ def _build_trajectory_record(row: dict[str, Any], result: dict[str, Any]) -> Tra
                         tools[position] = projected
         except Exception as exc:
             gaps.append(ObservationGap(code="agent_observations_invalid", detail=type(exc).__name__))
+
+    # With neither a producer trajectory nor observations, the empty tool list below is the collector's
+    # default, not a report that no tool ran.
+    if not isinstance(raw_trajectory, dict) and raw_observations is None:
+        gaps.append(ObservationGap(code="tool_timing_unavailable"))
 
     turns.sort(key=lambda turn: (turn.timestamp, turn.invocation_id, turn.turn_no))
 
@@ -2244,68 +2248,6 @@ def _identity_key(row: Mapping[str, Any], group: Callable[[Mapping[str, Any]], O
     return (group(row), row.get(TASK_INDEX_KEY_NAME), row.get(ROLLOUT_INDEX_KEY_NAME))
 
 
-def _with_captures_read_back(rows: List[Mapping[str, Any]], capture_dirs: List[Path]) -> List[Mapping[str, Any]]:
-    """Rows with their model-call captures, read back from the capture store for a row that carries none.
-
-    A failure that returned no agent evidence (an episode deadline, a /run error) is written without
-    its captures, but the calls it made are still in the store. Copies only; no artifact changes.
-    """
-    if not capture_dirs:
-        return rows
-    restored = []
-    for row in rows:
-        if "ng_model_call_capture" not in row and NG_TRAJECTORY_KEY not in row:
-            row = merge_model_call_capture_into_record(dict(row), capture_dirs)
-        restored.append(row)
-    return restored
-
-
-def _write_time_limit_sections(
-    metrics_fpath: Optional[Path],
-    rows: List[Mapping[str, Any]],
-    group: Callable[[Mapping[str, Any]], Optional[str]],
-    capture_dirs: Optional[List[Path]] = None,
-) -> None:
-    """Add a ``time_limit`` section to each environment server's entry of the aggregate metrics file.
-
-    ``rows`` are the final record of every rollout that ran: its scored row, or the last failures-sidecar
-    attempt of a rollout that never succeeded. The section reads them and changes nothing else. It is a
-    diagnostic, so a failure to build it is logged and never fails the run.
-    """
-    if metrics_fpath is None or not metrics_fpath.exists():
-        return
-    try:
-        rows = _with_captures_read_back(rows, capture_dirs or [])
-        entries = orjson.loads(metrics_fpath.read_bytes())
-        # An entry that names no server (an aggregation error entry, an old file) gets no section.
-        if not any(isinstance(entry.get(NG_ENVIRONMENT_SERVER_KEY), str) for entry in entries):
-            return
-        rows_by_server: Dict[Optional[str], List[Mapping[str, Any]]] = defaultdict(list)
-        for row in rows:
-            rows_by_server[group(row)].append(row)
-        exported: Dict[str, Any] = {}
-        for entry in entries:
-            server_rows = rows_by_server.get(entry.get(NG_ENVIRONMENT_SERVER_KEY))
-            if not server_rows or AGGREGATION_ERROR_KEY in entry:
-                continue
-            name = entry[AGENT_REF_KEY_NAME]["name"]
-            section = summarize_time_limits(server_rows)
-            entry["time_limit"] = section
-            exported.update({f"time_limit/{name}/{key}": value for key, value in section.items()})
-        if not exported:
-            return
-        # Replaced only once the new document is written whole: a failed write leaves the metrics as they were.
-        with TemporaryDirectory(dir=metrics_fpath.parent) as tmp_dir:
-            pending = Path(tmp_dir) / metrics_fpath.name
-            pending.write_bytes(orjson.dumps(entries, option=orjson.OPT_INDENT_2))
-            pending.replace(metrics_fpath)
-    except Exception:
-        logger.exception("Could not add the time-limit section to %s; the aggregate metrics stand.", metrics_fpath)
-        return
-    if exported:
-        export_metrics(exported)
-
-
 def _fill_task_fields(
     added_rows: List[Dict[str, Any]],
     real_rows: List[Dict[str, Any]],
@@ -3555,7 +3497,7 @@ class RolloutCollectionHelper(BaseModel):
                     # The row went out as an episode request, so the reply is a BaseEpisodeResponse.
                     result = _episode_record(result)
                 if completed.elapsed_s is not None:
-                    # Read by the time-limit section of the aggregate metrics. Not `elapsed_seconds`,
+                    # Read by the timeouts section of the run health summary. Not `elapsed_seconds`,
                     # which resume reads to order dispatch.
                     result[NG_ELAPSED_S_KEY] = completed.elapsed_s
 
@@ -3933,21 +3875,6 @@ class RolloutCollectionHelper(BaseModel):
                 output_fpath,
                 raise_on_error=False,  # Write batch status before reporting aggregation failures below.
             )
-            servers_by_agent_once = functools.cache(
-                lambda: _environment_servers_by_agent(self.setup_server_client().global_config_dict)
-            )
-            unscored_failures = [
-                row
-                for key, row in (await asyncio.to_thread(_latest_failure_rows, [failures_fpath])).items()
-                if key not in persisted_success_keys
-            ]
-            await asyncio.to_thread(
-                _write_time_limit_sections,
-                aggregate_metrics_fpath,
-                persisted_results + unscored_failures,
-                lambda row: _metrics_group(row, servers_by_agent_once),
-                capture_dirs,
-            )
 
         if batch_tracker is not None:
             batch_tracker.write_status(
@@ -4008,6 +3935,11 @@ Aggregate metrics: {aggregate_metrics_fpath}{coverage}""")
                 )
             else:
                 print(format_health_report(health_result))
+                # The run health section that tracking servers show next to the coverage counts.
+                try:
+                    export_metrics(flatten_for_export(health_result.summary["run"]["stats"]["timeouts"]))
+                except Exception:
+                    logger.exception("Could not export the run health timeouts after collection.")
 
         config.check_completion(expected=expected_rollouts, results=persisted_results)
         return results
@@ -4935,12 +4867,6 @@ class RolloutAggregationHelper(BaseModel):
         aggregate_metrics_fpath = await helper._call_aggregate_metrics(
             scored, scored, output_fpath, raise_on_error=False
         )
-        await asyncio.to_thread(
-            _write_time_limit_sections,
-            aggregate_metrics_fpath,
-            results + [row for identity, row in latest_failures.items() if identity not in result_ids],
-            group,
-        )
         if batch_tracker is not None:
             batch_tracker.write_status(
                 batch_completed_rows,
@@ -5006,6 +4932,11 @@ Aggregate metrics: {aggregate_metrics_fpath}{coverage}""")
                 )
             else:
                 print(format_health_report(health_result))
+                # The run health section that tracking servers show next to the coverage counts.
+                try:
+                    export_metrics(flatten_for_export(health_result.summary["run"]["stats"]["timeouts"]))
+                except Exception:
+                    logger.exception("Could not export the run health timeouts after aggregation.")
 
         return aggregate_metrics_fpath
 

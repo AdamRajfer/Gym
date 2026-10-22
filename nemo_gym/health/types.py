@@ -173,6 +173,8 @@ class RolloutDigest(BaseModel):
     transcript_completion_tokens: int = 0
     capture_prompt_tokens: int = 0
     capture_completion_tokens: int = 0
+    # What the run's timeouts section reads of this row; None when the row adds nothing to it.
+    timeout_view: dict[str, Any] | None = None
 
 
 class HealthCheckResult(BaseModel):

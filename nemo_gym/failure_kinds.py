@@ -277,6 +277,14 @@ _INFRA_TIMEOUT_MODULES = ("aiohttp.", "nemo_gym.sandbox.")
 _EXCEPTION_NAME_PATTERN = re.compile(r"\b([A-Z]\w*(?:Error|Exception|Failure|Expired))\b")
 # aiohttp's ClientResponseError as text: "503, message='Service Unavailable', url=...".
 _RESPONSE_STATUS_PATTERN = re.compile(r"\b(\d{3}), message=")
+# The API routes of Gym's model servers, which the policy and the judge are called on. A 404 there is a model that is
+# not deployed or a wrong route: a deployment or config error. Only a call to one of these routes is read this way; a
+# sandbox exec 404 is a provider SDK error, not an aiohttp response, and the sandbox rule decides it.
+_MODEL_ROUTE_PATTERN = re.compile(r"/v1/(?:responses|chat/completions|completions|messages|embeddings)\b")
+_MODEL_ROUTE_404_TEXT_PATTERN = re.compile(
+    r"\b404, message=(?:'[^']*'|\"[^\"]*\"), url='[^']*/v1/(?:responses|chat/completions|completions|messages"
+    r"|embeddings)\b"
+)
 # The infra exception classes by their subclass names, which appear in text where the MRO does not.
 _INFRA_SUBCLASS_NAMES = frozenset(
     {
@@ -358,6 +366,8 @@ def failure_cause_of(error: BaseException) -> FailureCause:
             return INFRA
         if isinstance(status, int) and 400 <= status < 500 and _reports_spent_budget(current):
             return INFRA
+        if status == 404 and _is_model_server_call(current):
+            return INFRA
         if any(cls.__name__ in _INFRA_EXCEPTION_NAMES for cls in type(current).__mro__):
             return INFRA
         if isinstance(current, TimeoutError) and _raised_in_infra_module(current):
@@ -378,7 +388,16 @@ def failure_cause_of_text(text: str) -> FailureCause:
         return INFRA
     if _SPENT_BUDGET_PATTERN.search(text):
         return INFRA
+    if _MODEL_ROUTE_404_TEXT_PATTERN.search(text):
+        return INFRA
     return MODEL
+
+
+def _is_model_server_call(error: BaseException) -> bool:
+    """Whether an HTTP error answered a call to a model server's API route (the policy or the judge)."""
+    request_info = getattr(error, "request_info", None)
+    url = str(getattr(request_info, "real_url", None) or getattr(request_info, "url", None) or "")
+    return bool(_MODEL_ROUTE_PATTERN.search(url))
 
 
 def _reports_spent_budget(error: BaseException) -> bool:

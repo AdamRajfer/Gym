@@ -121,6 +121,36 @@ class TestWhereTheFailureHappened:
         assert failure_cause_of(_http_error(422, body)) == MODEL
         assert failure_cause_of_text(f"422, message='Unprocessable Entity' {body.decode()}") == MODEL
 
+    @pytest.mark.parametrize(
+        "url",
+        ["http://policy:8000/v1/responses", "http://judge:8000/v1/chat/completions", "http://judge/v1/completions"],
+        ids=["policy-responses", "judge-chat", "completions"],
+    )
+    def test_a_404_from_a_model_or_judge_route_is_infra(self, url: str) -> None:
+        """Model not found or a wrong route is a deployment or config error, never the model's output."""
+        error = _http_error(404, b'{"error": "The model `policy` does not exist."}')
+        error.request_info = SimpleNamespace(method="POST", url=url, real_url=url, headers={})
+        assert failure_cause_of(error) == INFRA
+        # The same failure relayed as text, as aiohttp words it and the sidecar keeps it.
+        assert failure_cause_of_text(str(error)) == INFRA
+
+    def test_a_404_from_another_call_keeps_its_label(self) -> None:
+        # The agent's own /run route, and a 404 that names no route.
+        assert failure_cause_of(_http_error(404)) == MODEL
+        assert failure_cause_of_text("404, message='Not Found', url='http://agent/run'") == MODEL
+        assert failure_cause_of_text("404, message='Not Found'") == MODEL
+
+    def test_a_sandbox_exec_404_is_unchanged(self) -> None:
+        """The sandbox rule decides an exec 404 while the sandbox is alive; the model-route 404 rule must not."""
+        from opensandbox.exceptions import SandboxApiException
+
+        message = "Failed to run command: execution not found"
+        live = SandboxApiException(message, status_code=404)
+        without_status = SandboxApiException(message)
+        assert failure_cause_of(live) == failure_cause_of(without_status)
+        relayed = f"SandboxApiException: {message} (status 404)"
+        assert failure_cause_of_text(relayed) == failure_cause_of_text(f"SandboxApiException: {message}")
+
     def test_a_connection_error_wrapped_in_an_agent_error_is_infra(self) -> None:
         try:
             try:

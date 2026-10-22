@@ -19,7 +19,7 @@ import multiprocessing as mp
 import re
 import unicodedata
 from io import StringIO
-from typing import Any, ClassVar, Dict, List, Optional, Union
+from typing import Any, ClassVar, Dict, List, Literal, Optional, Union
 
 from fastapi import FastAPI
 from math_verify import grader
@@ -56,6 +56,8 @@ from nemo_gym.telemetry.resources_operations import resources_operation
 
 class LibraryJudgeMathResourcesServerConfig(BaseResourcesServerConfig):
     REVERIFY_MODE: ClassVar[ReverifyMode] = ReverifyMode.STATELESS
+    # NeMo-Skills' math judge scores a judgement with no verdict as not equal: the answer is wrong.
+    judge_no_verdict_outcome: Literal["wrong", "drop"] = "wrong"
     judge_model_server: ModelServerRef
     judge_responses_create_params: NeMoGymResponseCreateParamsNonStreaming
     should_use_judge: bool = True

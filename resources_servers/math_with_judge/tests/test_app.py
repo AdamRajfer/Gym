@@ -1139,7 +1139,13 @@ class TestApp:
             expected_answer="3",
         )
 
-        row = json.loads((await judge_failsafe(resources_server.verify)(request)).body)
+        row = json.loads(
+            (
+                await judge_failsafe(
+                    resources_server.verify, no_verdict=resources_server.config.judge_no_verdict_outcome
+                )(request)
+            ).body
+        )
 
         # Three in-place attempts on the byte-identical judge prompt, then the rule decides by cause.
         assert len(sent) == 3 and len(set(sent)) == 1

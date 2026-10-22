@@ -638,19 +638,21 @@ def _chain_ended_on_failure(chain: Sequence[dict[str, Any]]) -> bool:
     the position in the merged trajectory list, so a producer-supplied retry
     can precede the attempt it retried. Say nothing rather than call a
     recovered rollout unhealthy.
+
+    A last call the upstream rejected because the context was full is the
+    model's own end, scored like any other answer, so it is not a failure here.
+    An unordered chain of only failures ended on one of them, so it is flagged
+    unless every one was such an overflow.
     """
     if not chain:
         return False
     failed = [call for call in chain if _is_failed(call)]
     if not failed:
         return False
-    if len(failed) == len(chain):
-        # Nothing to order: whichever went last, it failed.
-        return True
-    if any(call.get("started_at") is None for call in chain):
-        return False
-    ordered = sorted(chain, key=lambda call: (call.get("started_at") or 0.0, call.get("call_index") or 0))
-    return _is_failed(ordered[-1])
+    if all(call.get("started_at") is not None for call in chain):
+        last = sorted(chain, key=lambda call: (call.get("started_at") or 0.0, call.get("call_index") or 0))[-1]
+        return _is_failed(last) and not _is_context_overflow_rejection(last)
+    return len(failed) == len(chain) and not all(_is_context_overflow_rejection(call) for call in chain)
 
 
 def _ended_on_failed_call(calls: Sequence[dict[str, Any]]) -> bool:
@@ -670,7 +672,9 @@ def _rollout_ended_on_failed_model_call(trajectory: dict[str, Any], subject: dic
     Judged per model and in time order -- see `_chain_ended_on_failure`. Only
     the chain's last call counts, so a failure the client retried successfully
     stays healthy; the signal is that the rollout ENDED on a failure, which is
-    what makes its reward indistinguishable from a genuine zero.
+    what makes its reward indistinguishable from a genuine zero. A last call
+    the upstream rejected as a context-length overflow is not flagged: that
+    zero is the model's own result.
     """
     findings = []
     for key, chain in _model_chains(_normalized_trajectory_calls(trajectory)).items():

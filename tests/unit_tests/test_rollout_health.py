@@ -1429,6 +1429,117 @@ def test_a_rollout_ending_on_a_failed_attempt_is_unhealthy_for_that_reason_only(
     assert {finding.check for finding in digest.findings} == {"rollout_ended_on_failed_model_call"}
 
 
+# The two shapes a context-length overflow takes in the capture.
+CONTEXT_OVERFLOWS = {
+    # vLLM answers locally with an empty "length" completion when overflow errors are not propagated.
+    "answered_locally": {
+        "status_code": 200,
+        "upstream_status_code": 400,
+        "upstream_attempted": True,
+        "error_category": "context_length_exceeded",
+        "local_response_reason": "context_length_exceeded",
+        "response_source": "local",
+        "response_status": None,
+        "finish_reason": "length",
+    },
+    # Propagated to the client as the upstream's own 400.
+    "propagated": {
+        "status_code": 400,
+        "upstream_status_code": 400,
+        "upstream_attempted": True,
+        "error_category": "context_length_exceeded",
+        "response_source": "upstream",
+        "response": {"error": {"code": "context_length_exceeded"}},
+        **_NO_GENERATION,
+    },
+}
+
+
+@pytest.mark.parametrize("overflow", CONTEXT_OVERFLOWS.values(), ids=CONTEXT_OVERFLOWS.keys())
+def test_a_rollout_ending_on_a_context_overflow_is_not_flagged(tmp_path, overflow):
+    """The model filled its context: a zero it earned, not an unhealthy rollout."""
+    succeeded = _call(model_call_id="first", started_at=1.0)
+    last = _call(model_call_id="last", started_at=2.0, tokens_in=None, tokens_out=0, **overflow)
+    rollout_path = _write_fixture(tmp_path, [(_owned_attempts(succeeded, last), [succeeded, last])])
+
+    result = run_health_checks(rollout_path, workers=1)
+    [digest] = result.rollouts
+
+    assert "rollout_ended_on_failed_model_call" not in {finding.check for finding in digest.findings}
+    assert result.summary["run"]["stats"]["model_call_errors"]["ended_on_error"] == 0
+    # The call is still a failed call in the error counts.
+    assert digest.model_call_errors == 1
+
+
+@pytest.mark.parametrize("overflow", CONTEXT_OVERFLOWS.values(), ids=CONTEXT_OVERFLOWS.keys())
+def test_a_chain_of_only_context_overflows_is_not_flagged(tmp_path, overflow):
+    calls = [
+        _call(call_index=index, model_call_id=None, response_id=None, tokens_out=0, **overflow) for index in range(2)
+    ]
+    rollout_path = _write_fixture(tmp_path, [(_unreferenced_failure_record([]), calls)])
+
+    [digest] = run_health_checks(rollout_path, workers=1).rollouts
+
+    assert "rollout_ended_on_failed_model_call" not in {finding.check for finding in digest.findings}
+
+
+@pytest.mark.parametrize("failure", FAILED_ATTEMPTS.values(), ids=FAILED_ATTEMPTS.keys())
+def test_a_failure_after_a_context_overflow_still_flags(tmp_path, failure):
+    """Only the last call decides: an overflow earlier in the chain hides nothing that came after it."""
+    overflow = _call(model_call_id="first", started_at=1.0, tokens_out=0, **CONTEXT_OVERFLOWS["propagated"])
+    failed = _call(model_call_id="last", started_at=2.0, tokens_in=None, tokens_out=None, **failure)
+    rollout_path = _write_fixture(tmp_path, [(_owned_attempts(overflow, failed), [overflow, failed])])
+
+    [digest] = run_health_checks(rollout_path, workers=1).rollouts
+
+    assert "rollout_ended_on_failed_model_call" in {finding.check for finding in digest.findings}
+
+
+@pytest.mark.parametrize("failure", FAILED_ATTEMPTS.values(), ids=FAILED_ATTEMPTS.keys())
+def test_a_context_overflow_after_failed_calls_is_not_flagged(tmp_path, failure):
+    """Every call failed, but in time order the rollout ended on the model's own overflow."""
+    failed = _call(model_call_id="first", started_at=1.0, tokens_in=None, tokens_out=None, **failure)
+    overflow = _call(model_call_id="last", started_at=2.0, tokens_out=0, **CONTEXT_OVERFLOWS["propagated"])
+    rollout_path = _write_fixture(tmp_path, [(_owned_attempts(failed, overflow), [failed, overflow])])
+
+    [digest] = run_health_checks(rollout_path, workers=1).rollouts
+
+    assert "rollout_ended_on_failed_model_call" not in {finding.check for finding in digest.findings}
+
+
+def test_an_unordered_chain_of_an_overflow_and_a_transport_failure_still_flags(tmp_path: Path) -> None:
+    calls = [
+        _call(call_index=0, model_call_id=None, response_id=None, tokens_out=0, **CONTEXT_OVERFLOWS["propagated"]),
+        _call(call_index=1, model_call_id=None, response_id=None, **FAILED_ATTEMPTS["cancelled"]),
+    ]
+    rollout_path = _write_fixture(tmp_path, [(_unreferenced_failure_record([]), calls)])
+
+    [digest] = run_health_checks(rollout_path, workers=1).rollouts
+
+    assert "rollout_ended_on_failed_model_call" in {finding.check for finding in digest.findings}
+
+
+def test_a_400_without_the_overflow_category_still_flags(tmp_path: Path) -> None:
+    """The overflow is read from the recorded category, never inferred from a 400 alone."""
+    succeeded = _call(model_call_id="first", started_at=1.0)
+    rejected = _call(
+        model_call_id="last",
+        started_at=2.0,
+        status_code=400,
+        upstream_status_code=400,
+        upstream_attempted=True,
+        error_category="client_error",
+        tokens_in=None,
+        tokens_out=None,
+        **_NO_GENERATION,
+    )
+    rollout_path = _write_fixture(tmp_path, [(_owned_attempts(succeeded, rejected), [succeeded, rejected])])
+
+    [digest] = run_health_checks(rollout_path, workers=1).rollouts
+
+    assert "rollout_ended_on_failed_model_call" in {finding.check for finding in digest.findings}
+
+
 def test_a_body_capture_could_not_parse_still_needs_token_counts(tmp_path: Path) -> None:
     """`capture_parse_error` marks a 2xx call whose body was unreadable: a capture defect, not a failed call."""
     unparsed = _call(

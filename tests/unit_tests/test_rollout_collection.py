@@ -51,7 +51,7 @@ from nemo_gym.config_types import (
     ConfigError,
     ConfigPathNotFoundError,
 )
-from nemo_gym.failure_kinds import CANCELLED, INFRA
+from nemo_gym.failure_kinds import CANCELLED, INFRA, MODEL
 from nemo_gym.global_config import (
     AGENT_REF_KEY_NAME,
     ATTEMPT_INDEX_KEY_NAME,
@@ -90,6 +90,7 @@ from nemo_gym.rollout_collection import (
     _build_trajectory_record,
     _CompletedRollout,
     _drop_truncated_tail,
+    _episode_record,
     _expand_input_glob,
     _failure_rows_counted_as_zero,
     _failures_path_for,
@@ -7658,6 +7659,62 @@ class TestLongestFirstDispatch:
             input_rows, *_ = RolloutCollectionHelper()._load_from_cache(config)
 
             assert 1 not in [r[TASK_INDEX_KEY_NAME] for r in input_rows]
+
+
+class TestAJudgeFailureNeverReRunsTheRollout:
+    """Evaluation: re-dispatching the prompt for a judge failure would score a different answer; it never happens."""
+
+    @staticmethod
+    def _judge_rows() -> list:
+        key = lambda i: {TASK_INDEX_KEY_NAME: i, ROLLOUT_INDEX_KEY_NAME: 0}
+        return [
+            # A judge_failsafe row as written before the in-place retry, with no terminal stamp.
+            {**key(1), NG_FAILURE_CLASS_KEY: "judge_failed", "failure_kind": "judge_failed", "mask_sample": True},
+            # An unparseable verdict, by kind.
+            {**key(2), NG_FAILURE_CLASS_KEY: "masked_sample", "failure_kind": "judge_unparseable"},
+        ]
+
+    def test_a_judge_failure_is_never_re_dispatched_in_evaluation(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr("nemo_gym.rollout_collection.is_eval_mode", lambda: True)
+        config = TestLongestFirstDispatch._write_resume_state(tmp_path, self._judge_rows())
+
+        input_rows, *_ = RolloutCollectionHelper()._load_from_cache(config)
+
+        assert [r[TASK_INDEX_KEY_NAME] for r in input_rows] == [0, 3]
+
+    def test_the_rules_row_is_final_and_counts_as_zero(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from nemo_gym.failure_kinds import judge_failure_after_retries
+
+        monkeypatch.setattr("nemo_gym.rollout_collection.is_eval_mode", lambda: False)  # The stamp alone decides.
+        row = {TASK_INDEX_KEY_NAME: 0, ROLLOUT_INDEX_KEY_NAME: 0} | judge_failure_after_retries(
+            judge_error="HTTP 503", cause=INFRA, attempts=3
+        )
+
+        assert is_terminal_failure(row)
+        assert (row["reward"], row["mask_sample"], row[NG_FAILURE_CAUSE_KEY]) == (0.0, False, MODEL)
+        assert (row["_ng_failure_judge_cause"], row["_ng_failure_judge_attempts"]) == (INFRA, 3)
+
+    def test_training_keeps_retrying_a_judge_failure(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr("nemo_gym.rollout_collection.is_eval_mode", lambda: False)
+        config = TestLongestFirstDispatch._write_resume_state(tmp_path, self._judge_rows())
+
+        input_rows, *_ = RolloutCollectionHelper()._load_from_cache(config)
+
+        assert [r[TASK_INDEX_KEY_NAME] for r in input_rows] == [0, 1, 2, 3]
+
+    def test_the_collector_keeps_the_rules_stamp_on_a_judge_failsafe_result(self) -> None:
+        from nemo_gym.failure_kinds import judge_failure_after_retries
+
+        result = {"reward": 0.0, "response": {}} | judge_failure_after_retries(
+            judge_error="HTTP 503", cause=INFRA, attempts=3
+        )
+
+        record = _episode_record({"task_id": "t", "result": result})
+
+        assert (record[NG_TERMINAL_KEY], record[NG_FAILURE_CAUSE_KEY]) == (True, MODEL)
+        assert (record["_ng_failure_judge_cause"], record["_ng_failure_judge_attempts"]) == (INFRA, 3)
 
 
 class TestIsTerminalFailure:

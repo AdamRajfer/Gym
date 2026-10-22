@@ -65,6 +65,7 @@ from nemo_gym.failure_kinds import (
     FINAL,
     INFRA,
     JUDGE_FAILED,
+    JUDGE_FAILURE_KINDS,
     MODEL,
     RETRY,
     RETRY_THEN_UNSCORED,
@@ -93,6 +94,7 @@ from nemo_gym.global_config import (
     environment_server_agent_names,
     environment_server_attributed_agent,
     get_global_config_dict,
+    is_eval_mode,
     label_runs,
     pairing_override_enabled,
     resolve_dataset_agent,
@@ -450,6 +452,11 @@ def _episode_record(response: Dict[str, Any]) -> Dict[str, Any]:
             NG_FAILURE_CLASS_KEY: JUDGE_FAILED,
             NG_FAILURE_JUDGE_ERROR_KEY: result.get(NG_FAILURE_JUDGE_ERROR_KEY),
         }
+        # In evaluation judge_failure_after_retries decided the row (final, never re-dispatched) and recorded the
+        # judge's attempts and cause; keep those as written.
+        for key in (NG_TERMINAL_KEY, NG_FAILURE_CAUSE_KEY, "_ng_failure_judge_cause", "_ng_failure_judge_attempts"):
+            if key in result:
+                judge_failure[key] = result[key]
         # drop the judge failure keys from the result so it doesn't raise in _is_collector_key
         # we don't want to modify the check itself because we want it to raise for other values
         # of `NG_FAILURE_CLASS_KEY` field
@@ -1729,6 +1736,12 @@ def is_terminal_failure(record: Mapping[str, Any], *, retry_terminal_timeouts: b
     if retry_terminal_timeouts and failure_class == "timeout_exceeded":
         return False
     if record.get(NG_TERMINAL_KEY):
+        return True
+    # Evaluation: a judge failure is never re-dispatched, so the model never gets another answer scored
+    # (judge_failure_after_retries). Training keeps the table's retry.
+    if is_eval_mode() and (
+        record.get(NG_FAILURE_CLASS_KEY) in JUDGE_FAILURE_KINDS or record.get("failure_kind") in JUDGE_FAILURE_KINDS
+    ):
         return True
     return not is_retryable(_rule_kind(record), cause=failure_cause_of_row(record))
 

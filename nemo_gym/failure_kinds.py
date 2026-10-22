@@ -412,6 +412,33 @@ def is_retryable(kind: str | None, *, cause: FailureCause | None) -> bool:
     return rule in (RETRY, RETRY_THEN_UNSCORED)
 
 
+# The judge failed on an answer the model already gave. In evaluation such a row is never re-dispatched on resume,
+# whatever the table above says for training (``judge_failure_after_retries``).
+JUDGE_FAILURE_KINDS: frozenset[str] = frozenset({JUDGE_FAILED, JUDGE_UNPARSEABLE})
+
+
+def judge_failure_after_retries(*, judge_error: str, cause: FailureCause, attempts: int) -> dict[str, object]:
+    """The evaluation rule for a judge failure that its in-place retries on the same answer did not fix.
+
+    The rollout is never re-dispatched: that would give the model another answer and score a different one.
+    The judge already had every attempt on the stored answer, so the row is the model's final failure and counts
+    as 0. ``cause`` is what the last error looked like (infra or model); it stays on the row so a judge outage stays
+    visible in the counts, and so this one rule can change once real runs show how often outages reach it.
+    Returns the fields of the failures-sidecar row. Resume reads the same rule for every row of a
+    ``JUDGE_FAILURE_KINDS`` kind, also one written before this rule existed (``is_terminal_failure``).
+    """
+    return {
+        "_ng_failure_class": JUDGE_FAILED,
+        "_ng_failure_terminal": True,
+        "_ng_failure_cause": MODEL,
+        "_ng_failure_judge_error": judge_error,
+        "_ng_failure_judge_cause": cause,
+        "_ng_failure_judge_attempts": attempts,
+        "reward": 0.0,
+        "mask_sample": False,
+    }
+
+
 def is_unscored(kind: str | None) -> bool:
     """Whether a failure of ``kind`` is left out of the score: never retried and never counted as 0."""
     return FAILURE_RULES.get(kind) == UNSCORED

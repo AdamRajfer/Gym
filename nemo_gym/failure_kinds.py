@@ -260,6 +260,7 @@ _INFRA_EXCEPTION_NAMES = frozenset(
         # SandboxOperationTimeoutError, SandboxPtyError, a lost exec daemon, an OOM kill) is not listed: the model can
         # cause those, so they are the model's unless the platform names its own cause.
         "SandboxCreateError",
+        "SandboxCreateTimeoutError",
         "OpenSandboxCreateError",
         "SandboxPlatformEvictionError",
         "SandboxPtyPlatformEvictionError",

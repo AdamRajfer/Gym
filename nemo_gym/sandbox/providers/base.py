@@ -245,6 +245,10 @@ class SandboxCreateVerificationError(SandboxCreateError):
     """Raised when a newly-created sandbox fails provider readiness checks."""
 
 
+class SandboxCreateTimeoutError(SandboxCreateError, TimeoutError):
+    """Raised when creating or starting a sandbox timed out; still a TimeoutError for callers that catch one."""
+
+
 class SandboxProvider(Protocol):
     """Runtime/infra provider contract used by the public sandbox API."""
 

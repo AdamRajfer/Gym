@@ -31,12 +31,14 @@ from nemo_gym.rollout_collection import (
     _masked_result_names_infra,
     is_terminal_failure,
 )
+from nemo_gym.sandbox.api import AsyncSandbox, SandboxSpec
 from nemo_gym.sandbox.providers.base import (
     SandboxCreateError,
     SandboxOperationTimeoutError,
     SandboxPlatformEvictionError,
     SandboxPtyError,
 )
+from tests.unit_tests.test_sandbox import FakeSandboxProvider
 
 
 class TestExecTimeSandboxErrorsAreTheModels:
@@ -161,3 +163,95 @@ class TestAMaskWithNoReasonIsUnresolvedInEvaluation:
         monkeypatch.setattr("nemo_gym.rollout_collection.is_eval_mode", lambda: False)
         counts = _infra_unresolved_counts({}, {}, self.SCORED, expected=3, missing=0, results=self.RESULTS)
         assert counts == (0, 3)
+
+
+class _FailingProvider(FakeSandboxProvider):
+    """A provider whose create, upload or exec fails the way the OpenSandbox SDK does."""
+
+    def __init__(
+        self,
+        *,
+        create_error: BaseException | None = None,
+        upload_error: BaseException | None = None,
+        exec_error: BaseException | None = None,
+    ) -> None:
+        super().__init__()
+        self._create_error, self._upload_error, self._exec_error = create_error, upload_error, exec_error
+
+    async def create(self, spec):
+        if self._create_error is not None:
+            raise self._create_error
+        return await super().create(spec)
+
+    async def upload_file(self, handle, source_path, target_path):
+        if self._upload_error is not None:
+            raise self._upload_error
+        return await super().upload_file(handle, source_path, target_path)
+
+    async def exec(self, handle, command, **kwargs):
+        if self._exec_error is not None:
+            raise self._exec_error
+        return await super().exec(handle, command, **kwargs)
+
+
+def _sdk_error(message: str, status: int):
+    from opensandbox.exceptions import SandboxApiException
+
+    return SandboxApiException(message, status_code=status)
+
+
+class TestASandboxThatNeverStartedIsInfra:
+    """Every failure inside create or start is before the model's first command, whatever the provider raised."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "failure",
+        [
+            {"create_error": _sdk_error("Sandbox ready timeout after create retries", 504)},
+            {"create_error": SandboxOperationTimeoutError("Timed out during OpenSandbox create after 600s")},
+            {"create_error": RuntimeError("provider control plane refused the request")},
+            {"upload_error": _sdk_error("upload of the task files failed", 500)},
+        ],
+        ids=["create-504-ready-timeout", "start-timeout", "unexpected-create-error", "start-upload"],
+    )
+    async def test_a_create_or_start_failure_is_a_retried_create_error(self, failure: dict) -> None:
+        sandbox = AsyncSandbox(_FailingProvider(**failure), spec=SandboxSpec(image="task", files={"/task.txt": "x"}))
+
+        with pytest.raises(SandboxCreateError) as raised:
+            await sandbox.start()
+
+        assert failure_cause_of(raised.value) == INFRA
+        assert failure_cause_of_text(f"{type(raised.value).__name__}: {raised.value}") == INFRA
+        row = {NG_FAILURE_CLASS_KEY: "agent_run_error", NG_FAILURE_CAUSE_KEY: failure_cause_of(raised.value)}
+        assert not is_terminal_failure(row)
+
+    @pytest.mark.asyncio
+    async def test_a_start_timeout_is_still_a_timeout_for_callers_that_catch_one(self) -> None:
+        sandbox = AsyncSandbox(_FailingProvider(create_error=SandboxOperationTimeoutError("create timed out")))
+
+        with pytest.raises(TimeoutError):
+            await sandbox.start(SandboxSpec(image="task"))
+
+    @pytest.mark.asyncio
+    async def test_a_provider_create_error_passes_through_unwrapped(self) -> None:
+        from nemo_gym.sandbox.providers.opensandbox import OpenSandboxCreateError
+
+        original = OpenSandboxCreateError("pool exhausted")
+        sandbox = AsyncSandbox(_FailingProvider(create_error=original))
+
+        with pytest.raises(OpenSandboxCreateError) as raised:
+            await sandbox.start(SandboxSpec(image="task"))
+
+        assert raised.value is original
+
+    @pytest.mark.asyncio
+    async def test_an_exec_error_after_start_is_unchanged(self) -> None:
+        exec_error = _sdk_error("Failed to run command failed: execution not found", 404)
+        sandbox = AsyncSandbox(_FailingProvider(exec_error=exec_error))
+        await sandbox.start(SandboxSpec(image="task"))
+
+        with pytest.raises(type(exec_error)) as raised:
+            await sandbox.exec("python solve.py")
+
+        assert raised.value is exec_error
+        assert failure_cause_of(raised.value) == MODEL

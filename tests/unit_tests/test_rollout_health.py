@@ -1455,11 +1455,22 @@ CONTEXT_OVERFLOWS = {
 }
 
 
+_POLICY_REF = {"type": "responses_api_models", "name": "policy_model"}
+# A turn points at its call by the call id, or, as Terminal-Bench 4's turns do, by the model and response id.
+TURN_CALL_REFERENCES = {
+    "by_call_id": {"model_call_id": "c1"},
+    "by_response_id": {"model_ref": _POLICY_REF, "response_id": "r1"},
+}
+
+
+@pytest.mark.parametrize("reference", TURN_CALL_REFERENCES.values(), ids=TURN_CALL_REFERENCES.keys())
 @pytest.mark.parametrize("overflow", CONTEXT_OVERFLOWS.values(), ids=CONTEXT_OVERFLOWS.keys())
-def test_an_empty_turn_from_a_context_overflow_is_not_hollow(tmp_path, overflow):
-    """The empty turn is the model filling its context, so the rollout stays healthy."""
-    record = _record(0, 0, answer=None, include_response_output=False)
-    overflow_call = _call(**({"tokens_in": None, "tokens_out": 0, "response": {}} | overflow))
+def test_an_empty_turn_from_a_context_overflow_is_not_hollow(tmp_path, overflow, reference):
+    """The empty turn is the model filling its context, so the rollout is not unhealthy."""
+    record = _record(0, 0, answer=None, refs=[reference], include_response_output=False)
+    overflow_call = _call(
+        **({"tokens_in": None, "tokens_out": 0, "response": {}, "model_ref": _POLICY_REF} | overflow)
+    )
     [digest] = run_health_checks(_write_fixture(tmp_path, [(record, [overflow_call])]), workers=1).rollouts
 
     assert "agent_turn_hollow" not in {finding.check for finding in digest.findings}

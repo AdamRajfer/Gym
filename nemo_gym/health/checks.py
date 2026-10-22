@@ -340,6 +340,17 @@ def _is_failed_attempt(call: dict[str, Any]) -> bool:
     )
 
 
+def _call_reference_keys(call: dict[str, Any]) -> set[str]:
+    """Every ``_call_ref_key`` that a turn can use to point at this call: its call id, or its model and response id."""
+    keys = set()
+    if call.get("model_call_id"):
+        keys.add(f"call:{call['model_call_id']}")
+    model_ref = call.get("model_ref")
+    if isinstance(model_ref, dict) and call.get("response_id"):
+        keys.add(f"response:{model_ref.get('type')}:{model_ref.get('name')}:{call['response_id']}")
+    return keys
+
+
 def _call_identity(call: dict[str, Any]) -> str | None:
     if call.get("model_call_id"):
         return f"call:{call['model_call_id']}"
@@ -520,7 +531,12 @@ def _agent_turn_hollow(
     # An empty turn whose own model call the upstream rejected for a full context is the model filling its
     # context, as in `rollout_ended_on_failed_model_call`. The calls are optional evidence here: without
     # captured calls, every empty turn is still flagged.
-    overflow_calls = {_call_identity(call) for call in bindings.matched_calls if _is_context_overflow_rejection(call)}
+    overflow_calls = {
+        key
+        for call in bindings.matched_calls
+        if _is_context_overflow_rejection(call)
+        for key in _call_reference_keys(call)
+    }
     return [
         Finding(
             check="agent_turn_hollow",

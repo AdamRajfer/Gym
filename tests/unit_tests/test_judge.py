@@ -250,14 +250,15 @@ class TestJudgeInputTooLong:
 
         data = orjson.loads((await judge_failsafe(verify)(_Req())).body)
         assert data["_ng_failure_class"] == "judge_failed"
-        assert data["mask_sample"] is False
-        if (overflow_is_the_models, status) == (True, 400):
-            # A 4xx the model's answer shaped: the model's final 0.
-            assert (data["_ng_failure_terminal"], data["reward"], data["_ng_failure_cause"]) == (True, 0.0, "model")
-        else:
-            # A 5xx, or an overflow on a server that cannot tell the answer caused it: settled infra, out of the score.
-            assert (data["_ng_failure_judge_settled"], data["_ng_failure_cause"]) == (True, "infra")
-            assert "_ng_failure_terminal" not in data
+        assert data["reward"] == 0.0  # Every verify reply carries one.
+        # A failed judge call never answered, so the answer got no verdict: settled infra, out of the score. That is
+        # a 5xx, a 4xx such as an invalid request, and an overflow on a server that cannot tell the answer caused it.
+        assert (data["mask_sample"], data["_ng_failure_judge_settled"], data["_ng_failure_cause"]) == (
+            True,
+            True,
+            "infra",
+        )
+        assert "_ng_failure_terminal" not in data
 
 
 class _JudgeRelayClient(ServerClient):
@@ -394,7 +395,7 @@ class TestJudgeReasonThroughTheModelServer:
         assert row["_ng_failure_class"] == "judge_failed"
         assert (row["_ng_failure_judge_settled"], row["mask_sample"], row["_ng_failure_cause"]) == (
             True,
-            False,
+            True,
             "infra",
         )
         assert "_ng_failure_terminal" not in row
@@ -508,7 +509,7 @@ class TestJudgeRetriedInPlaceOnTheSameAnswer:
         # A gateway outage is infra: settled (never re-dispatched), left out of the score, counted as unresolved.
         assert (row["_ng_failure_judge_settled"], row["mask_sample"], "_ng_failure_terminal" in row) == (
             True,
-            False,
+            True,
             False,
         )
         assert row["_ng_failure_cause"] == row["_ng_failure_judge_cause"] == "infra"
@@ -540,15 +541,22 @@ class TestJudgeRetriedInPlaceOnTheSameAnswer:
     # The cases the real-run audit saw. Each one fails all three attempts, then judge_failure_after_retries
     # decides the row by its cause.
     _INFRA_CASES = [
+        (422, b'{"error": "Budget has been exceeded! Current cost: 50.1, Max budget: 50.0"}'),
+        (422, b'{"error": "unprocessable"}'),
         (429, b'{"error": "rate limited"}'),
         (401, b'{"error": "Incorrect API key provided"}'),
+        (400, b'{"error": {"code": "malformed_authorization", "message": "bad header"}}'),
         (408, b'{"error": "request timeout"}'),
         (502, b'{"error": "bad gateway"}'),
         (503, b'{"error": "overloaded"}'),
     ]
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize(("status", "body"), _INFRA_CASES, ids=["429", "401", "408", "502", "503"])
+    @pytest.mark.parametrize(
+        ("status", "body"),
+        _INFRA_CASES,
+        ids=["422-budget", "422-plain", "429", "401", "400-bad-key", "408", "502", "503"],
+    )
     async def test_rule_branch_infra_is_an_unresolved_row_never_re_dispatched(self, status: int, body: bytes) -> None:
         client, sent = _recording_judge(*[(status, body)] * 3)
 
@@ -558,7 +566,7 @@ class TestJudgeRetriedInPlaceOnTheSameAnswer:
         assert row["_ng_failure_cause"] == row["_ng_failure_judge_cause"] == "infra"
         assert row["_ng_failure_judge_settled"] is True  # Resume never re-dispatches it.
         assert "_ng_failure_terminal" not in row  # Not the model's 0: it stays out of the score.
-        assert row["mask_sample"] is False
+        assert (row["reward"], row["mask_sample"]) == (0.0, True)  # A valid verify reply that is no measurement.
         assert row["_ng_failure_judge_attempts"] == 3
 
     @pytest.mark.asyncio
@@ -661,7 +669,8 @@ class TestJudgeRetriedInPlaceOnTheSameAnswer:
         assert bool(row.get("_ng_failure_terminal")) is terminal
         assert bool(row.get("_ng_failure_judge_settled")) is settled
         assert (row["_ng_failure_judge_error"], row["_ng_failure_judge_attempts"]) == ("last error", 3)
-        assert ("reward" in row) is terminal
+        assert row["reward"] == 0.0  # Every verify reply carries one; the infra row's is no measurement.
+        assert row["mask_sample"] is settled
 
     @pytest.mark.asyncio
     async def test_a_nested_judge_call_does_not_multiply_the_cap(self) -> None:
@@ -687,3 +696,79 @@ class TestJudgeRetriedInPlaceOnTheSameAnswer:
 
         assert len(sent) == 1
         assert (row["mask_sample"], "_ng_failure_terminal" in row) == (True, False)
+
+
+def _through_the_agent_and_collector(verify_reply: dict, tmp_path) -> tuple[dict, list, tuple, dict]:
+    """The simple agent's own response model first, then the shared helper every server's tests use."""
+    from nemo_gym.testing.verify_reply import verify_reply_through_collection
+    from responses_api_agents.simple_agent.app import SimpleAgentVerifyResponse
+
+    SimpleAgentVerifyResponse.model_validate(verify_reply)
+    return verify_reply_through_collection(verify_reply, tmp_path)
+
+
+class TestTheRulesRowReachesTheScore:
+    """End to end: the rule's row survives the agent's response model, the collector and aggregation."""
+
+    @pytest.fixture(autouse=True)
+    def _evaluation(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr("nemo_gym.judge.is_eval_mode", lambda: True)
+        monkeypatch.setattr("nemo_gym.rollout_collection.is_eval_mode", lambda: True)
+        monkeypatch.setattr("nemo_gym.judge.JUDGE_RETRY_BACKOFF_SECONDS", (0.0,))
+        monkeypatch.delenv("NEMO_GYM_JUDGE_MAX_ATTEMPTS", raising=False)
+
+    @staticmethod
+    def _request():
+        from nemo_gym.base_resources_server import BaseVerifyRequest
+        from nemo_gym.openai_utils import NeMoGymResponse, NeMoGymResponseCreateParamsNonStreaming
+
+        response = NeMoGymResponse(
+            id="r",
+            created_at=0.0,
+            model="policy",
+            object="response",
+            output=[],
+            parallel_tool_calls=False,
+            tool_choice="none",
+            tools=[],
+        )
+        return BaseVerifyRequest(
+            responses_create_params=NeMoGymResponseCreateParamsNonStreaming(input=[]), response=response
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_judge_budget_422_after_the_tries_is_an_unresolved_infra_row(self, tmp_path) -> None:
+        client, sent = _recording_judge(*[(422, b'{"error": "Budget has been exceeded!"}')] * 3)
+
+        async def verify(body):
+            return await call_judge(
+                client, server_name="judge", url_path="/v1/responses", json={"input": "x"}, response_model=_Verdict
+            )
+
+        reply = orjson.loads((await judge_failsafe(verify)(self._request())).body)
+        record, counted, (unresolved, owed), metrics = _through_the_agent_and_collector(reply, tmp_path)
+
+        assert len(sent) == 3
+        assert (record["_ng_failure_class"], record["failure_kind"]) == ("judge_failed", "judge_failed")
+        assert record["_ng_failure_cause"] == record["_ng_failure_judge_cause"] == "infra"
+        assert (record["_ng_failure_judge_attempts"], record["_ng_failure_judge_settled"]) == (3, True)
+        assert "422" in record["_ng_failure_judge_error"]
+        assert counted == []  # Left out of the score.
+        assert (unresolved, owed) == (1, 10)  # Counted as unresolved infra.
+        assert metrics["publishable"] is False  # 10% is past the 2% gate.
+
+    @pytest.mark.asyncio
+    async def test_a_reply_with_no_verdict_after_the_tries_is_the_models_counted_zero(self, tmp_path) -> None:
+        client, _ = _recording_judge(*[(200, b'{"no_verdict": "I cannot grade this."}')] * 3)
+
+        async def verify(body):
+            return await call_judge(
+                client, server_name="judge", url_path="/v1/responses", json={"input": "x"}, response_model=_Verdict
+            )
+
+        reply = orjson.loads((await judge_failsafe(verify)(self._request())).body)
+        record, counted, (unresolved, _), metrics = _through_the_agent_and_collector(reply, tmp_path)
+
+        assert record["_ng_failure_cause"] == "model"
+        assert [row["reward"] for row in counted] == [0.0]
+        assert unresolved == 0 and metrics["publishable"] is True

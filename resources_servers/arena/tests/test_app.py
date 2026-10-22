@@ -888,6 +888,25 @@ class TestArenaResourcesServer:
         assert row["_ng_failure_cause"] == cause
         assert is_terminal_failure(row) is (cause == "model")
 
+    async def test_a_judge_422_after_the_tries_reaches_the_score_as_unresolved_infra(
+        self, server: ArenaResourcesServer, judged_in_evaluation: None, monkeypatch, tmp_path: Path
+    ):
+        """End to end: arena's judge_failsafe reply, the agent's response model, the collector, then aggregation."""
+        from nemo_gym.testing.verify_reply import verify_reply_through_collection
+
+        monkeypatch.setattr("nemo_gym.rollout_collection.is_eval_mode", lambda: True)
+        self._recording_judge(server, [422, 422, 422], ["Final: [[B>A]]"])
+
+        reply = json.loads((await judge_failsafe(server.verify)(body=self._make_verify_request("Answer."))).body)
+        record, counted, (unresolved, owed), metrics = verify_reply_through_collection(reply, tmp_path)
+
+        assert (record["_ng_failure_class"], record["failure_kind"]) == ("judge_failed", "judge_failed")
+        assert record["_ng_failure_cause"] == record["_ng_failure_judge_cause"] == "infra"
+        assert (record["_ng_failure_judge_attempts"], record["_ng_failure_judge_settled"]) == (3, True)
+        assert counted == []  # Left out of the score, not a lost game.
+        assert (unresolved, owed) == (1, 10)
+        assert metrics["publishable"] is False
+
     @mark.parametrize("status", [401, 429, 500])
     async def test_training_keeps_a_failed_judge_call_as_a_skipped_game(
         self, server: ArenaResourcesServer, status: int

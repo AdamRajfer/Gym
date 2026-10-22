@@ -61,7 +61,7 @@ from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ValidationError
 
-from nemo_gym.failure_kinds import INFRA, MODEL, FailureCause, failure_cause_of, judge_failure_after_retries
+from nemo_gym.failure_kinds import INFRA, MODEL, FailureCause, judge_failure_after_retries
 from nemo_gym.global_config import is_eval_mode
 from nemo_gym.server_utils import ServerClient, get_response_json, raise_for_status
 
@@ -153,20 +153,16 @@ def _judge_failure_cause(error: JudgeError) -> FailureCause:
     - Text with no verdict (``JudgeNoVerdictError``): the judge answered, so the answer was judged. The model's.
     - An empty reply (``JudgeEmptyReplyError``): infra. A throttled judge or a provider-side filter can send an
       HTTP 200 with no text.
-    - A failed call reads its error chain: a spent budget, a rate limit, a gateway status, a timeout or a bad key is
-      infra, and any other 4xx the answer shaped is the model's.
-    - A context overflow reaches here only from a server that cannot tell the answer caused it
-      (``overflow_is_the_models`` is off: the judge input carries documents too). It is not the model's, so it is
-      infra. The model's own overflow is ``JudgeInputTooLongError``, read from the engine's context-length reply.
+    - A failed call (any HTTP status, a timeout, a transport error) is infra: the judge never answered, so the answer
+      got no verdict to be scored by. That covers a spent budget (a 422 or 402 whatever its body says), a rate
+      limit, a gateway status, a bad key, and a context overflow from a server that cannot tell the answer caused
+      it (the judge input carries documents too). The model's own overflow never reaches here: the server that can
+      tell raises ``JudgeInputTooLongError``, read from the judge engine's context-length reply.
     - Anything else with no chain (a server's own JudgeError) is infra: there is no evidence the answer caused it.
     """
     if isinstance(error, JudgeNoVerdictError):
         return MODEL
-    if isinstance(error, JudgeEmptyReplyError) or error.__cause__ is None:
-        return INFRA
-    if _is_context_overflow(error.__cause__):
-        return INFRA
-    return failure_cause_of(error)
+    return INFRA
 
 
 def raise_unparseable_verdict(server: str, judge_output: str) -> None:

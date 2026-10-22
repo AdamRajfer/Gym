@@ -16,6 +16,7 @@ import asyncio
 import json
 import multiprocessing as mp
 from copy import deepcopy
+from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -1100,7 +1101,12 @@ class TestApp:
         ids=["no-marker", "prose", "empty"],
     )
     async def test_an_unparseable_judge_verdict_is_judge_failed_not_a_zero(
-        self, config: LibraryJudgeMathResourcesServerConfig, judge_text: str, cause: str, monkeypatch: MonkeyPatch
+        self,
+        config: LibraryJudgeMathResourcesServerConfig,
+        judge_text: str,
+        cause: str,
+        monkeypatch: MonkeyPatch,
+        tmp_path: Path,
     ) -> None:
         """Asked again on the same answer, never by re-running the rollout; then text with no verdict is the model's
         0, and an empty reply is infra, left out of the score."""
@@ -1147,6 +1153,17 @@ class TestApp:
         else:
             assert (row["_ng_failure_judge_settled"], "_ng_failure_terminal" in row) == (True, False)
             assert "empty" in row["_ng_failure_judge_error"]
+
+        # End to end: the reply passes the agent's verify response model and reaches aggregation as the rule said.
+        from nemo_gym.testing.verify_reply import verify_reply_through_collection
+
+        monkeypatch.setattr("nemo_gym.rollout_collection.is_eval_mode", lambda: True)
+        record, counted, (unresolved, _), metrics = verify_reply_through_collection(row, tmp_path)
+        assert record["_ng_failure_cause"] == cause
+        if cause == "model":
+            assert [counted_row["reward"] for counted_row in counted] == [0.0] and unresolved == 0
+        else:
+            assert counted == [] and unresolved == 1 and metrics["publishable"] is False
 
     async def test_an_unparseable_verdict_recovers_in_place_when_the_judge_answers_again(
         self, config: LibraryJudgeMathResourcesServerConfig, monkeypatch: MonkeyPatch

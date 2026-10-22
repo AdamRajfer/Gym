@@ -463,7 +463,9 @@ def judge_failure_after_retries(
     }
     if cause == MODEL:
         return row | {"_ng_failure_terminal": True, "reward": 0.0}
-    return row | {JUDGE_SETTLED_KEY: True}
+    # A verify reply must carry a reward. This one is no measurement: mask_sample says so, and evaluation leaves the
+    # row out of the score as infra-unresolved whatever reward it carries.
+    return row | {JUDGE_SETTLED_KEY: True, "reward": 0.0, "mask_sample": True}
 
 
 def is_unscored(kind: str | None) -> bool:

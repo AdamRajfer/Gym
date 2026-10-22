@@ -22,9 +22,11 @@ rollout_collection routes to ``<output>_failures.jsonl`` — excluded from the
 aggregate metrics and from the file-based re-aggregation (``gym eval
 aggregate``), and retryable on resume.
 
-Boundary: a failed *call* (transport/timeout/auth/HTTP) → JudgeError → sidecar; a
-*received-but-unparseable* response is a legitimate wrong answer (let the parser
-score it, don't raise). Empty output is a per-benchmark call, so servers differ.
+Boundary: a failed *call* (transport/timeout/auth/HTTP) → JudgeError → sidecar, and
+so is a *received-but-unparseable* verdict: the judge, not the model, failed to
+produce a usable answer, so the row is retried as ``judge_failed`` and never scored
+0 for the model. A server raises it with ``raise_unparseable_verdict`` from the
+branch that finds no verdict. Empty output is a per-benchmark call, so servers differ.
 
 Wrap the call, not the scoring around it: ``reraise_judge_errors`` relabels every
 exception it sees, so covering a whole ``verify()`` would misfile ordinary bugs
@@ -56,6 +58,14 @@ def normalize_math_judge_verdict(text: str) -> str:
 
 class JudgeError(Exception):
     """A judge call failed; judge_failsafe routes the row to the failures sidecar."""
+
+
+def raise_unparseable_verdict(server: str, judge_output: str) -> None:
+    """Raise the JudgeError for a judge reply that carries no verdict the server can read.
+
+    ``judge_failsafe`` turns it into a ``judge_failed`` row: retried on resume, outside the score.
+    """
+    raise JudgeError(f"{server}: judge verdict is unparseable: {judge_output[:500]!r}")
 
 
 async def reraise_judge_errors(coro: Awaitable[Any]) -> Any:

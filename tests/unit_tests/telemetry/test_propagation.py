@@ -279,8 +279,8 @@ async def test_lazy_client_initialization_failure_is_inside_the_client_span(
     monkeypatch.setattr(server_utils, "is_nemo_gym_fastapi_worker", lambda: True)
     monkeypatch.setattr(
         server_utils,
-        "get_global_config_dict",
-        lambda **_kwargs: {"global_aiohttp_connector_limit": 1, "global_aiohttp_connector_limit_per_host": 1},
+        "maybe_get_global_config_dict",
+        lambda: {"global_aiohttp_connector_limit": 1, "global_aiohttp_connector_limit_per_host": 1},
     )
 
     with pytest.raises(ValueError, match="must remain at least 1"):

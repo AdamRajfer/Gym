@@ -183,6 +183,7 @@ class TestJudgeInputTooLong:
     def _evaluation(self, monkeypatch: pytest.MonkeyPatch) -> None:
         # The judge-overflow rule and the judge's reply on the row are evaluation-only.
         monkeypatch.setattr("nemo_gym.judge.is_eval_mode", lambda: True)
+        monkeypatch.setattr("nemo_gym.judge.JUDGE_RETRY_BACKOFF_SECONDS", (0.0,))
 
     @pytest.mark.asyncio
     async def test_training_keeps_an_answer_caused_overflow_judge_failed(
@@ -249,7 +250,8 @@ class TestJudgeInputTooLong:
 
         data = orjson.loads((await judge_failsafe(verify)(_Req())).body)
         assert data["_ng_failure_class"] == "judge_failed"
-        assert data["mask_sample"] is True
+        # Evaluation: after its in-place retries the judge failure is final and never re-dispatches the rollout.
+        assert (data["_ng_failure_terminal"], data["mask_sample"], data["reward"]) == (True, False, 0.0)
 
 
 class _JudgeRelayClient(ServerClient):
@@ -324,6 +326,7 @@ class TestJudgeReasonThroughTheModelServer:
     def _evaluation(self, monkeypatch: pytest.MonkeyPatch) -> None:
         # The judge-overflow rule and the judge's reply on the row are evaluation-only.
         monkeypatch.setattr("nemo_gym.judge.is_eval_mode", lambda: True)
+        monkeypatch.setattr("nemo_gym.judge.JUDGE_RETRY_BACKOFF_SECONDS", (0.0,))
 
     @pytest.mark.asyncio
     async def test_training_keeps_the_row_as_before(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -383,4 +386,167 @@ class TestJudgeReasonThroughTheModelServer:
         row = await self._row(self._upstream(503, b'{"error": "overloaded"}'), overflow_is_the_models=True)
 
         assert row["_ng_failure_class"] == "judge_failed"
-        assert row["mask_sample"] is True
+        assert (row["_ng_failure_terminal"], row["mask_sample"], row["_ng_failure_judge_cause"]) == (
+            True,
+            False,
+            "infra",
+        )
+
+
+def _recording_judge(*replies: tuple[int, bytes]) -> tuple[MagicMock, list[bytes]]:
+    """A judge that answers ``replies`` in order and records the exact bytes it was sent each time."""
+    from types import SimpleNamespace
+
+    from aiohttp import ClientResponseError
+
+    sent: list[bytes] = []
+    responses = []
+    for status, body in replies:
+        resp = MagicMock(ok=status < 400, status=status)
+        resp.read = AsyncMock(return_value=body)
+        resp.content.read = AsyncMock(return_value=body)
+        info = SimpleNamespace(method="POST", url="http://judge/v1", real_url="http://judge/v1", headers={})
+        resp.raise_for_status = MagicMock(
+            side_effect=ClientResponseError(request_info=info, history=(), status=status, message=f"HTTP {status}")
+        )
+        responses.append(resp)
+
+    async def post(*, server_name, url_path, json):
+        sent.append(orjson.dumps(json))
+        return responses[len(sent) - 1]
+
+    return MagicMock(post=AsyncMock(side_effect=post)), sent
+
+
+class TestJudgeRetriedInPlaceOnTheSameAnswer:
+    """Evaluation: a judge failure is retried in place on the stored answer, never by re-running the rollout."""
+
+    ANSWER = "the model's answer, é \U0001f600"
+
+    @pytest.fixture(autouse=True)
+    def _evaluation(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr("nemo_gym.judge.is_eval_mode", lambda: True)
+        monkeypatch.setattr("nemo_gym.judge.JUDGE_RETRY_BACKOFF_SECONDS", (0.0,))
+        monkeypatch.delenv("NEMO_GYM_JUDGE_MAX_ATTEMPTS", raising=False)
+
+    async def _verify(self, client) -> object:
+        async def verify(body):
+            return await call_judge(
+                client,
+                server_name="judge",
+                url_path="/v1/responses",
+                json={"input": "grade: " + body.response["final"]},
+                response_model=_Verdict,
+            )
+
+        out = await judge_failsafe(verify)(_Req(response={"final": self.ANSWER}))
+        return out if isinstance(out, _Verdict) else orjson.loads(out.body)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "first",
+        [(503, b'{"error": "overloaded"}'), (429, b'{"error": "rate limited"}'), (200, b"{}"), (200, b"")],
+        ids=["http-5xx", "http-429", "unparseable", "empty"],
+    )
+    async def test_a_failed_judge_call_is_retried_on_the_byte_identical_answer(self, first) -> None:
+        client, sent = _recording_judge(first, (200, b'{"verdict": "CORRECT"}'))
+
+        verdict = await self._verify(client)
+
+        assert verdict == _Verdict(verdict="CORRECT")
+        assert len(sent) == 2
+        assert sent[0] == sent[1]  # The judge saw the same stored answer, byte for byte.
+        assert self.ANSWER.encode() in sent[0]
+
+    @pytest.mark.asyncio
+    async def test_a_timeout_is_retried_in_place(self) -> None:
+        sent: list[bytes] = []
+        ok = MagicMock(ok=True, status=200)
+        ok.read = AsyncMock(return_value=b'{"verdict": "CORRECT"}')
+
+        async def post(*, server_name, url_path, json):
+            sent.append(orjson.dumps(json))
+            if len(sent) == 1:
+                raise TimeoutError("judge timed out")
+            return ok
+
+        verdict = await self._verify(MagicMock(post=AsyncMock(side_effect=post)))
+
+        assert verdict == _Verdict(verdict="CORRECT")
+        assert len(sent) == 2 and sent[0] == sent[1]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("max_attempts", [None, "1", "5"])
+    async def test_the_attempt_cap(self, monkeypatch: pytest.MonkeyPatch, max_attempts: str | None) -> None:
+        if max_attempts is not None:
+            monkeypatch.setenv("NEMO_GYM_JUDGE_MAX_ATTEMPTS", max_attempts)
+        expected = int(max_attempts or 3)
+        client, sent = _recording_judge(*[(503, b'{"error": "overloaded"}')] * 10)
+
+        row = await self._verify(client)
+
+        assert len(sent) == expected
+        assert row["_ng_failure_judge_attempts"] == expected
+        assert len(set(sent)) == 1
+
+    @pytest.mark.asyncio
+    async def test_the_final_outcome_is_the_models_zero_with_the_judges_last_error(self) -> None:
+        client, _ = _recording_judge(
+            (503, b'{"error": "overloaded"}'), (503, b'{"error": "overloaded"}'), (502, b'{"error": "bad gateway"}')
+        )
+
+        row = await self._verify(client)
+
+        assert row["_ng_failure_class"] == "judge_failed"
+        assert (row["reward"], row["mask_sample"], row["_ng_failure_terminal"]) == (0.0, False, True)
+        assert row["_ng_failure_cause"] == "model"  # Counted as the model's failure, as the rule says.
+        assert row["_ng_failure_judge_cause"] == "infra"  # What the judge's last error looked like.
+        assert row["_ng_failure_judge_attempts"] == 3
+        assert "HTTP 502" in row["_ng_failure_judge_error"]  # The last attempt's error, not the first.
+        assert row["response"] == {"final": self.ANSWER}
+
+    @pytest.mark.asyncio
+    async def test_an_answer_caused_overflow_is_recorded_and_not_retried(self) -> None:
+        judge = _overflow_client(400, _OVERFLOW_BODY)
+
+        async def verify(body):
+            return await call_judge(
+                judge,
+                server_name="judge",
+                url_path="/v1/responses",
+                json={"input": "grade this"},
+                response_model=_Verdict,
+                overflow_is_the_models=True,
+            )
+
+        row = orjson.loads((await judge_failsafe(verify)(_Req(response={"final": "x" * 50}))).body)
+
+        assert judge.post.await_count == 1  # The answer itself is too long: asking the judge again cannot help.
+        assert (row["_ng_failure_class"], row["reward"], row["mask_sample"]) == ("judge_input_too_long", 0.0, False)
+        assert row["_ng_failure_judge_attempts"] == 1
+        assert "context_length_exceeded" in row["_ng_failure_judge_error"]
+
+    @pytest.mark.asyncio
+    async def test_a_nested_judge_call_does_not_multiply_the_cap(self) -> None:
+        from nemo_gym.judge import retry_judge_in_place
+
+        client, sent = _recording_judge(*[(503, b'{"error": "overloaded"}')] * 10)
+
+        async def call_and_parse():
+            return await call_judge(
+                client, server_name="judge", url_path="/v1/responses", json={}, response_model=_Verdict
+            )
+
+        with pytest.raises(JudgeError) as exc:
+            await retry_judge_in_place(call_and_parse)
+        assert len(sent) == 3 and exc.value.attempts == 3
+
+    @pytest.mark.asyncio
+    async def test_training_makes_one_attempt_and_keeps_the_masked_row(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr("nemo_gym.judge.is_eval_mode", lambda: False)
+        client, sent = _recording_judge(*[(503, b'{"error": "overloaded"}')] * 3)
+
+        row = await self._verify(client)
+
+        assert len(sent) == 1
+        assert (row["mask_sample"], "_ng_failure_terminal" in row) == (True, False)

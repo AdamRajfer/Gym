@@ -18,14 +18,20 @@ A failed judge call is a distinct outcome, not a wrong answer. Resources servers
 issue judge calls through ``call_judge``, or wrap a bespoke call in
 ``reraise_judge_errors``; ``judge_failsafe`` wraps every verify endpoint so a
 JudgeError becomes a row tagged ``_ng_failure_class="judge_failed"``, which
-rollout_collection routes to ``<output>_failures.jsonl`` — excluded from the
-aggregate metrics and from the file-based re-aggregation (``gym eval
-aggregate``), and retryable on resume.
+rollout_collection routes to ``<output>_failures.jsonl``. In training the row is
+masked and retried on resume, as before.
+
+In evaluation the rollout is never re-run for a judge failure: that would give the
+model another answer and score a different one. ``retry_judge_in_place`` asks the
+judge again about the same stored answer (``NEMO_GYM_JUDGE_MAX_ATTEMPTS``, default
+3, with backoff), and when every attempt fails
+``failure_kinds.judge_failure_after_retries`` decides the row: today a final 0 for
+the model, with the judge's last error, its cause and the attempt count recorded.
 
 Boundary: a failed *call* (transport/timeout/auth/HTTP) → JudgeError → sidecar. In
 evaluation, so is a *received-but-unparseable* verdict: the judge, not the model,
-failed to produce a usable answer, so the row is retried as ``judge_failed`` and
-never scored 0 for the model. A server raises it with ``raise_unparseable_verdict``
+failed to produce a usable answer, so it is retried in place like a failed call.
+A server raises it with ``raise_unparseable_verdict``
 from the branch that finds no verdict, only when ``is_eval_mode()``; in training a
 received-but-unparseable reply stays the wrong answer it always was. Empty output is
 a per-benchmark call, so servers differ.
@@ -41,7 +47,11 @@ exception it sees, so covering a whole ``verify()`` would misfile ordinary bugs
 (a KeyError in prompt assembly, say) as judge failures.
 """
 
+import asyncio
+import contextvars
 import functools
+import logging
+import os
 import re
 from typing import Any, Awaitable, Callable, Type, TypeVar
 
@@ -49,11 +59,24 @@ from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
+from nemo_gym.failure_kinds import INFRA, FailureCause, failure_cause_of, judge_failure_after_retries
 from nemo_gym.global_config import is_eval_mode
 from nemo_gym.server_utils import ServerClient, get_response_json, raise_for_status
 
 
+logger = logging.getLogger(__name__)
+
 ResponseT = TypeVar("ResponseT", bound=BaseModel)
+T = TypeVar("T")
+
+# Evaluation only: how often one judge call (with its verdict parse) is tried on the same stored answer before
+# judge_failure_after_retries decides the row. Training keeps a single attempt.
+JUDGE_MAX_ATTEMPTS_ENV = "NEMO_GYM_JUDGE_MAX_ATTEMPTS"
+DEFAULT_JUDGE_MAX_ATTEMPTS = 3
+# Seconds to wait before the 2nd, 3rd, ... attempt; the last value repeats past the end.
+JUDGE_RETRY_BACKOFF_SECONDS: tuple[float, ...] = (5.0, 30.0)
+# Set while a retry_judge_in_place loop runs, so a nested one makes a single attempt and the cap stays exact.
+_IN_JUDGE_RETRY: contextvars.ContextVar[bool] = contextvars.ContextVar("nemo_gym_in_judge_retry", default=False)
 
 
 def normalize_math_judge_verdict(text: str) -> str:
@@ -66,7 +89,12 @@ def normalize_math_judge_verdict(text: str) -> str:
 
 
 class JudgeError(Exception):
-    """A judge call failed; judge_failsafe routes the row to the failures sidecar."""
+    """A judge call failed; judge_failsafe routes the row to the failures sidecar.
+
+    ``attempts`` is how many times the judge was tried on the same answer before this error, once known.
+    """
+
+    attempts: int | None = None
 
 
 class JudgeInputTooLongError(JudgeError):
@@ -106,10 +134,19 @@ def _is_context_overflow(error: BaseException) -> bool:
     return bool(_CONTEXT_OVERFLOW_PATTERN.search(f"{getattr(error, 'message', '')} {body}"))
 
 
+def _judge_failure_cause(error: JudgeError) -> FailureCause:
+    """What a judge failure's last error looked like. A call error reads its chain; a reply with no verdict (no
+    chain) was the judge's own output, so it is infra. Recorded on the row, never used to re-run the rollout."""
+    if error.__cause__ is None:
+        return INFRA
+    return failure_cause_of(error)
+
+
 def raise_unparseable_verdict(server: str, judge_output: str) -> None:
     """Raise the JudgeError for a judge reply that carries no verdict the server can read.
 
-    ``judge_failsafe`` turns it into a ``judge_failed`` row: retried on resume, outside the score.
+    In evaluation ``retry_judge_in_place`` asks the judge again on the same answer; ``judge_failsafe`` then records
+    a ``judge_failed`` row by ``judge_failure_after_retries``.
     """
     raise JudgeError(f"{server}: judge verdict is unparseable: {judge_output[:500]!r}")
 
@@ -127,6 +164,57 @@ async def reraise_judge_errors(coro: Awaitable[Any]) -> Any:
         body = _error_body(e) if is_eval_mode() else ""
         reply = f" | judge reply: {body[:1000]}" if body else ""
         raise JudgeError(f"{type(e).__name__}: {e}{reply}") from e
+
+
+def judge_max_attempts() -> int:
+    """How many in-place attempts a judge call gets in evaluation (``NEMO_GYM_JUDGE_MAX_ATTEMPTS``, default 3)."""
+    try:
+        return max(1, int(os.environ.get(JUDGE_MAX_ATTEMPTS_ENV, DEFAULT_JUDGE_MAX_ATTEMPTS)))
+    except ValueError:
+        return DEFAULT_JUDGE_MAX_ATTEMPTS
+
+
+async def retry_judge_in_place(attempt: Callable[[], Awaitable[T]]) -> T:
+    """Run one judge call, with its verdict parse, and in evaluation retry it in place on a JudgeError.
+
+    ``attempt`` must send the same stored answer every time, so a retry asks the judge again about the answer the
+    model already gave and never gives the model another try. An HTTP error, a timeout, an empty reply and an
+    unparseable verdict all surface as JudgeError and are retried, up to ``judge_max_attempts()`` with backoff. A
+    ``JudgeInputTooLongError`` is the model's own answer and is not retried. The error that ends the loop carries
+    the number of attempts made. Training makes a single attempt, as before.
+    """
+    if _IN_JUDGE_RETRY.get():
+        # Nested inside a caller's loop (call_judge inside a call-and-parse attempt): the outer loop retries.
+        return await attempt()
+    max_attempts = judge_max_attempts() if is_eval_mode() else 1
+    token = _IN_JUDGE_RETRY.set(True)
+    try:
+        return await _retry_loop(attempt, max_attempts)
+    finally:
+        _IN_JUDGE_RETRY.reset(token)
+
+
+async def _retry_loop(attempt: Callable[[], Awaitable[T]], max_attempts: int) -> T:
+    for attempt_number in range(1, max_attempts + 1):
+        try:
+            return await attempt()
+        except JudgeInputTooLongError as e:
+            e.attempts = attempt_number
+            raise
+        except JudgeError as e:
+            if attempt_number == max_attempts:
+                e.attempts = attempt_number
+                raise
+            delay = JUDGE_RETRY_BACKOFF_SECONDS[min(attempt_number - 1, len(JUDGE_RETRY_BACKOFF_SECONDS) - 1)]
+            logger.warning(
+                "Judge attempt %d of %d failed, retrying on the same answer in %gs: %s",
+                attempt_number,
+                max_attempts,
+                delay,
+                str(e)[:300],
+            )
+            await asyncio.sleep(delay)
+    raise AssertionError("unreachable")  # pragma: no cover
 
 
 async def call_judge(
@@ -159,7 +247,8 @@ async def call_judge(
             raise
         return response_model.model_validate(await get_response_json(http_response))
 
-    return await reraise_judge_errors(_call())
+    # A retry posts the same ``json`` object: the same answer, byte for byte.
+    return await retry_judge_in_place(lambda: reraise_judge_errors(_call()))
 
 
 def judge_failsafe(verify_fn: Callable) -> Callable:
@@ -191,7 +280,14 @@ def judge_failsafe(verify_fn: Callable) -> Callable:
                     "failure_reason": error,
                     "_ng_failure_class": "judge_input_too_long",
                     "_ng_failure_judge_error": error,
+                    "_ng_failure_judge_attempts": e.attempts or 1,
                 }
+                return JSONResponse(content=jsonable_encoder(data))
+            if is_eval_mode():
+                # The judge already had its in-place attempts on this answer; the rollout is never re-run for it.
+                data |= {"failure_kind": "judge_failed", "failure_reason": error} | judge_failure_after_retries(
+                    judge_error=error, cause=_judge_failure_cause(e), attempts=e.attempts or 1
+                )
                 return JSONResponse(content=jsonable_encoder(data))
             instance_config = data.get("instance_config")
             data |= {

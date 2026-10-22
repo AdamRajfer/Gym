@@ -73,7 +73,7 @@ from nemo_gym.config_types import (
     BaseServerConfig,
     HeadServerUnreachableError,
 )
-from nemo_gym.failure_kinds import FAILURE_CAUSE_HEADER, INFRA, failure_cause_of
+from nemo_gym.failure_kinds import FAILURE_CAUSE_HEADER, FAILURE_STAGE_HEADER, INFRA, failure_cause_of
 from nemo_gym.global_config import (
     DRY_RUN_KEY_NAME,
     HEAD_SERVER_KEY_NAME,
@@ -667,6 +667,12 @@ async def _traced_request(
         if span is not None:
             safe_set_span_attributes(span, {"http.response.status_code": response.status})
         return response
+
+
+def _failed_call_was_verify(error: ClientResponseError) -> bool:
+    """Whether the inner call that failed was a ``/verify``: the rollout had already produced its answer."""
+    url = getattr(getattr(error, "request_info", None), "real_url", None)
+    return str(url).split("?", 1)[0].rstrip("/").endswith("/verify") if url is not None else False
 
 
 def _redacted_url(url: str) -> str:
@@ -1637,11 +1643,10 @@ class SimpleServer(BaseServer):
                 response_content = f"Hit an exception in {self.get_session_middleware_key()} calling an inner server: {e.response_content}"
                 print(_format_upstream_error_log(self.get_session_middleware_key(), e), flush=True)
 
-                return JSONResponse(
-                    content=response_content,
-                    status_code=500,
-                    headers={FAILURE_CAUSE_HEADER: failure_cause_of(e)},
-                )
+                headers = {FAILURE_CAUSE_HEADER: failure_cause_of(e)}
+                if _failed_call_was_verify(e):
+                    headers[FAILURE_STAGE_HEADER] = "verification"
+                return JSONResponse(content=response_content, status_code=500, headers=headers)
             except CancelledError:
                 return JSONResponse(
                     content="Request was cancelled", status_code=500, headers={FAILURE_CAUSE_HEADER: INFRA}

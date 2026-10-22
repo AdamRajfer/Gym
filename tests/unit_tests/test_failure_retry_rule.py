@@ -286,6 +286,72 @@ class TestThroughLegacyAgent:
         assert is_terminal_failure(row)
 
 
+def _verify_error(status: int, body: bytes) -> ClientResponseError:
+    """The agent's inner /verify call failed: the rollout had already produced the model's answer."""
+    request_info = SimpleNamespace(method="POST", url="http://resources/verify", real_url="http://resources/verify")
+    error = ClientResponseError(request_info=request_info, history=(), status=status, message="verify failed")
+    error.response_content = body
+    return error
+
+
+class TestAFailureAfterTheAnswerExistsIsNeverReRun:
+    """Evaluation: re-running a rollout whose answer exists would score a different answer."""
+
+    @pytest.mark.parametrize(
+        ("status", "body"),
+        [
+            (500, b"Hit an exception in judge calling an inner server: 422 Budget has been exceeded"),
+            (422, b"Unprocessable Entity"),
+            (500, b"transient: verifier sandbox restarted"),
+        ],
+        ids=["relayed-judge-422", "verify-422", "relayed-5xx"],
+    )
+    def test_a_failed_verify_is_never_re_dispatched_and_stays_out_of_the_score(
+        self, status: int, body: bytes, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from nemo_gym.rollout_collection import is_infra_unresolved, is_never_redispatched
+
+        monkeypatch.setattr("nemo_gym.rollout_collection.is_eval_mode", lambda: True)
+        response = _through_legacy_agent(_verify_error(status, body))
+
+        assert response.headers["X-NeMo-Gym-Failure-Stage"] == "verification"
+        row = _collector_row(response)
+        assert (row["_ng_failure_stage"], row[NG_FAILURE_CAUSE_KEY]) == ("verification", INFRA)
+        assert is_never_redispatched(row)  # Resume leaves it alone.
+        assert not is_terminal_failure(row) and is_infra_unresolved(row)  # Out of the score, counted.
+
+    @pytest.mark.parametrize("kind", ["transient", "judge_failed", "masked_sample", "verifier_error"])
+    def test_an_environment_failure_at_verification_is_never_re_dispatched(
+        self, kind: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from nemo_gym.rollout_collection import is_never_redispatched
+
+        monkeypatch.setattr("nemo_gym.rollout_collection.is_eval_mode", lambda: True)
+        row = {NG_FAILURE_CLASS_KEY: kind, NG_FAILURE_CAUSE_KEY: INFRA, "_ng_failure_stage": "verification"}
+
+        assert is_never_redispatched(row)
+
+    def test_a_failure_before_the_answer_exists_is_still_re_dispatched(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from nemo_gym.rollout_collection import is_never_redispatched
+
+        monkeypatch.setattr("nemo_gym.rollout_collection.is_eval_mode", lambda: True)
+        response = _through_legacy_agent(_refused())  # The policy server died during generation.
+
+        row = _collector_row(response)
+        assert "X-NeMo-Gym-Failure-Stage" not in response.headers and "_ng_failure_stage" not in row
+        assert not is_never_redispatched(row)
+        for stage in ("seed", "agent"):
+            assert not is_never_redispatched({NG_FAILURE_CLASS_KEY: "transient", "_ng_failure_stage": stage})
+
+    def test_training_keeps_re_dispatching_a_failed_verify(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from nemo_gym.rollout_collection import is_never_redispatched
+
+        monkeypatch.setattr("nemo_gym.rollout_collection.is_eval_mode", lambda: False)
+        row = _collector_row(_through_legacy_agent(_verify_error(500, b"Hit an exception: 503 overloaded")))
+
+        assert not is_never_redispatched(row)
+
+
 class TestJudgeFailed:
     @pytest.mark.parametrize(
         "judge_error",

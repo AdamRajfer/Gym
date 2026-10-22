@@ -189,6 +189,8 @@ MODEL: FailureCause = "model"
 # Gym's exception middleware names the cause of every 500 it returns in this header, so a relay such
 # as legacy_agent carries it to rollout collection unchanged.
 FAILURE_CAUSE_HEADER = "X-NeMo-Gym-Failure-Cause"
+# Set beside it when the 500 came from a failed /verify call: the rollout already produced the model's answer.
+FAILURE_STAGE_HEADER = "X-NeMo-Gym-Failure-Stage"
 
 
 FAILURE_RULES: dict[str, FailureRule] = {

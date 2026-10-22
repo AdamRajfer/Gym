@@ -62,6 +62,7 @@ from nemo_gym.failure_kinds import (
     CANCELLED,
     FAILURE_CAUSE_HEADER,
     FAILURE_RULES,
+    FAILURE_STAGE_HEADER,
     FINAL,
     INFRA,
     JUDGE_FAILED,
@@ -239,6 +240,7 @@ NG_TERMINAL_KEY = "_ng_failure_terminal"
 # "infra" or "model": where a failure happened, stamped by the collector on every failures-sidecar row.
 NG_FAILURE_CAUSE_KEY = "_ng_failure_cause"
 NG_FAILURE_JUDGE_ERROR_KEY = "_ng_failure_judge_error"
+NG_FAILURE_STAGE_KEY = "_ng_failure_stage"
 AGENT_REQUEST_FAILED_FAILURE_CLASS = "agent_request_failed"
 AGENT_RUN_ERROR_FAILURE_CLASS = "agent_run_error"
 MASKED_SAMPLE_FAILURE_CLASS = "masked_sample"
@@ -438,7 +440,7 @@ def _episode_record(response: Dict[str, Any]) -> Dict[str, Any]:
         if failure.get("failure_kind") is not None:
             record["failure_kind"] = failure["failure_kind"]
         if failure.get("stage") is not None:
-            record["_ng_failure_stage"] = failure["stage"]
+            record[NG_FAILURE_STAGE_KEY] = failure["stage"]
         if failure.get("partial_response") is not None:
             record["_ng_failure_partial_response"] = failure["partial_response"]
         if failure.get("agent_observations") is not None:
@@ -1763,7 +1765,9 @@ def is_never_redispatched(record: Mapping[str, Any], *, retry_terminal_timeouts:
     """
     if is_terminal_failure(record, retry_terminal_timeouts=retry_terminal_timeouts):
         return True
-    return is_eval_mode() and _is_judge_failure(record)
+    # A failure at verification: the rollout already produced the model's answer, so re-running it would score a
+    # different one. It stays infra-unresolved, out of the score and counted, and gym eval reverify can recover it.
+    return is_eval_mode() and (_is_judge_failure(record) or record.get(NG_FAILURE_STAGE_KEY) == "verification")
 
 
 def is_unscored_failure(record: Mapping[str, Any]) -> bool:
@@ -2133,7 +2137,7 @@ def _agent_request_failure_row(exc: BaseException, status: Optional[int]) -> Dic
     cause = headers.get(FAILURE_CAUSE_HEADER) if hasattr(headers, "get") else None
     if cause not in (INFRA, MODEL):
         cause = failure_cause_of_text(response_body or str(exc)) if rollout_ran else INFRA
-    return {
+    row = {
         NG_FAILURE_CLASS_KEY: (AGENT_RUN_ERROR_FAILURE_CLASS if rollout_ran else AGENT_REQUEST_FAILED_FAILURE_CLASS),
         NG_FAILURE_CAUSE_KEY: cause,
         "_ng_failure_type": type(exc).__name__,
@@ -2141,6 +2145,12 @@ def _agent_request_failure_row(exc: BaseException, status: Optional[int]) -> Dic
         "_ng_failure_http_status": status,
         "_ng_failure_response_body": response_body,
     }
+    if hasattr(headers, "get") and headers.get(FAILURE_STAGE_HEADER) == "verification":
+        row[NG_FAILURE_STAGE_KEY] = "verification"
+        if is_eval_mode():
+            # The answer exists and the verifier did not score it: infra, never the model's 0 and never re-run.
+            row[NG_FAILURE_CAUSE_KEY] = INFRA
+    return row
 
 
 def _truncated_body(body: Optional[bytes]) -> Optional[str]:

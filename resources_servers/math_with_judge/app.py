@@ -37,6 +37,7 @@ from nemo_gym.base_resources_server import (
     SimpleResourcesServer,
 )
 from nemo_gym.config_types import ModelServerRef
+from nemo_gym.global_config import is_eval_mode
 from nemo_gym.judge import call_judge, normalize_math_judge_verdict, raise_unparseable_verdict
 from nemo_gym.openai_utils import (
     NeMoGymEasyInputMessage,
@@ -624,20 +625,25 @@ Example output: "My final verdict is different [[A!=B]]"."""
         )
         judge_evaluation = JudgeEvaluation(responses_create_params=responses_create_params, response=judge_response)
 
-        # A reply that carries no verdict (no message, a refusal, neither label) is the judge's failure, not the
-        # model's: it is retried as judge_failed instead of being scored as unequal.
+        # In evaluation, a reply that carries no verdict (no message, a refusal, neither label) is the judge's
+        # failure, not the model's: it is retried as judge_failed instead of being scored as unequal. Training
+        # treats it as unequal, as before.
         last_output = judge_response.output[-1]
         if last_output.type != "message":
-            raise_unparseable_verdict("math_with_judge", f"judge output item of type {last_output.type!r}")
+            if is_eval_mode():
+                raise_unparseable_verdict("math_with_judge", f"judge output item of type {last_output.type!r}")
+            return False, judge_evaluation
 
         last_content = last_output.content[-1]
         if last_content.type != "output_text":
-            raise_unparseable_verdict("math_with_judge", f"judge content of type {last_content.type!r}")
+            if is_eval_mode():
+                raise_unparseable_verdict("math_with_judge", f"judge content of type {last_content.type!r}")
+            return False, judge_evaluation
 
         output_text = normalize_math_judge_verdict(last_content.text)
         equal_choice_position = output_text.rfind(self.JUDGE_EQUAL_LABEL)
         not_equal_choice_position = output_text.rfind(self.JUDGE_NOT_EQUAL_LABEL)
-        if equal_choice_position < 0 and not_equal_choice_position < 0:
+        if equal_choice_position < 0 and not_equal_choice_position < 0 and is_eval_mode():
             raise_unparseable_verdict("math_with_judge", last_content.text)
         return equal_choice_position > not_equal_choice_position, judge_evaluation
 

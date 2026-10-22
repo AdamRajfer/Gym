@@ -15,6 +15,7 @@
 from unittest.mock import AsyncMock, MagicMock
 
 import orjson
+import pytest
 from pytest import approx, fixture
 
 from nemo_gym.base_resources_server import ReverifyMode
@@ -491,8 +492,12 @@ class TestSimpleQAGetKeyMetrics:
         assert key["mean/output_tokens"] == 200.0
 
 
-async def test_an_answer_too_long_for_the_judge_is_the_models_final_zero() -> None:
+@pytest.mark.parametrize("eval_mode", [True, False], ids=["evaluation", "training"])
+async def test_an_answer_too_long_for_the_judge_is_the_models_final_zero(
+    monkeypatch: pytest.MonkeyPatch, eval_mode: bool
+) -> None:
     """The judge input carries no documents, so a judge context overflow comes from the model's answer."""
+    monkeypatch.setattr("nemo_gym.judge.is_eval_mode", lambda: eval_mode)
     from types import SimpleNamespace
 
     from aiohttp import ClientResponseError
@@ -528,4 +533,5 @@ async def test_an_answer_too_long_for_the_judge_is_the_models_final_zero() -> No
 
     row = orjson.loads((await judge_failsafe(server.verify)(request)).body)
 
-    assert (row["_ng_failure_class"], row["reward"], row["mask_sample"]) == ("judge_input_too_long", 0.0, False)
+    expected = ("judge_input_too_long", 0.0, False) if eval_mode else ("judge_failed", 0.0, True)
+    assert (row["_ng_failure_class"], row["reward"], row["mask_sample"]) == expected

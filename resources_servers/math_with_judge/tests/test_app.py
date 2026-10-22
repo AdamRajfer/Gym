@@ -20,7 +20,7 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from math_verify.errors import TimeoutException
-from pytest import approx, fixture, mark, raises, skip
+from pytest import MonkeyPatch, approx, fixture, mark, raises, skip
 from sympy import sympify
 
 from nemo_gym.base_resources_server import ReverifyMode
@@ -937,7 +937,11 @@ class TestApp:
             expected_output_item,
         )
 
-    async def test_generate_judge_evaluation(self, config: LibraryJudgeMathResourcesServerConfig) -> None:
+    async def test_generate_judge_evaluation(
+        self, config: LibraryJudgeMathResourcesServerConfig, monkeypatch: MonkeyPatch
+    ) -> None:
+        # An unparseable verdict is a retried judge_failed in evaluation only.
+        monkeypatch.setattr("resources_servers.math_with_judge.app.is_eval_mode", lambda: True)
         judge_config = config.model_copy(deep=True)
         judge_config.judge_responses_create_params.max_output_tokens = 1024
         server_mock = MagicMock(spec=ServerClient)
@@ -1089,10 +1093,12 @@ class TestApp:
 
     @mark.parametrize("judge_text", ["no verdict at all", "I cannot decide."], ids=["no-marker", "prose"])
     async def test_an_unparseable_judge_verdict_is_judge_failed_not_a_zero(
-        self, config: LibraryJudgeMathResourcesServerConfig, judge_text: str
+        self, config: LibraryJudgeMathResourcesServerConfig, judge_text: str, monkeypatch: MonkeyPatch
     ) -> None:
         """The judge, not the model, failed: the row is retried as judge_failed and stays out of the score."""
         from nemo_gym.judge import judge_failsafe
+
+        monkeypatch.setattr("resources_servers.math_with_judge.app.is_eval_mode", lambda: True)
 
         server_mock = MagicMock(spec=ServerClient)
         judge_reply = self._create_response("judge", self._create_response_output_message(judge_text))
@@ -1117,6 +1123,22 @@ class TestApp:
         assert row["failure_kind"] == "judge_failed"
         assert row["mask_sample"] is True
         assert "unparseable" in row["_ng_failure_judge_error"]
+
+    @mark.parametrize("judge_text", ["no verdict at all", "I cannot decide."], ids=["no-marker", "prose"])
+    async def test_training_scores_an_unparseable_judge_verdict_as_before(
+        self, config: LibraryJudgeMathResourcesServerConfig, judge_text: str, monkeypatch: MonkeyPatch
+    ) -> None:
+        """Training is unchanged: a reply without a verdict still scores the answers as unequal."""
+        monkeypatch.setattr("resources_servers.math_with_judge.app.is_eval_mode", lambda: False)
+        server_mock = MagicMock(spec=ServerClient)
+        judge_reply = self._create_response("judge", self._create_response_output_message(judge_text))
+        server_mock.post = AsyncMock(return_value=MagicMock(read=AsyncMock(return_value=json.dumps(judge_reply))))
+        resources_server = LibraryJudgeMathResourcesServer(config=config, server_client=server_mock)
+
+        equal, evaluation = await resources_server._generate_judge_evaluation("question", "first", "second")
+
+        assert equal is False
+        assert evaluation.response.output[-1].content[-1].text == judge_text
 
 
 # ──────────────────────────────────────────────────────────

@@ -294,13 +294,17 @@ Reply as JSON, with a verdict of CORRECT or INCORRECT."""
         judge.assert_not_awaited()
 
 
+@pytest.mark.parametrize("eval_mode", [True, False], ids=["evaluation", "training"])
 @pytest.mark.parametrize("judge_protocol", [LEGACY_JUDGE_PROTOCOL, V1_1_JUDGE_PROTOCOL])
-def test_an_answer_too_long_for_the_judge_is_the_models_final_zero(judge_protocol: str) -> None:
+def test_an_answer_too_long_for_the_judge_is_the_models_final_zero(
+    judge_protocol: str, monkeypatch: pytest.MonkeyPatch, eval_mode: bool
+) -> None:
     """The judge sees no documents, so a judge context overflow comes from the model's answer: a final 0.
 
     The judge's engine rejects the input with a 400, and Gym's judge model server relays it as a 500,
     as on a real run; the row is read from AA-LCR's own /verify over HTTP.
     """
+    monkeypatch.setattr("nemo_gym.judge.is_eval_mode", lambda: eval_mode)
     from fastapi.testclient import TestClient
 
     from tests.unit_tests.test_judge import (
@@ -318,5 +322,6 @@ def test_an_answer_too_long_for_the_judge_is_the_models_final_zero(judge_protoco
     with TestClient(server.setup_webserver()) as http:
         row = http.post("/verify", json=json.loads(_request(judge_protocol).model_dump_json())).json()
 
-    assert (row["_ng_failure_class"], row["reward"], row["mask_sample"]) == ("judge_input_too_long", 0.0, False)
-    assert "context_length_exceeded" in row["_ng_failure_judge_error"]
+    expected = ("judge_input_too_long", 0.0, False) if eval_mode else ("judge_failed", 0.0, True)
+    assert (row["_ng_failure_class"], row["reward"], row["mask_sample"]) == expected
+    assert ("context_length_exceeded" in row["_ng_failure_judge_error"]) is eval_mode

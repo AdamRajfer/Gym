@@ -22,17 +22,19 @@ rollout_collection routes to ``<output>_failures.jsonl`` — excluded from the
 aggregate metrics and from the file-based re-aggregation (``gym eval
 aggregate``), and retryable on resume.
 
-Boundary: a failed *call* (transport/timeout/auth/HTTP) → JudgeError → sidecar, and
-so is a *received-but-unparseable* verdict: the judge, not the model, failed to
-produce a usable answer, so the row is retried as ``judge_failed`` and never scored
-0 for the model. A server raises it with ``raise_unparseable_verdict`` from the
-branch that finds no verdict. Empty output is a per-benchmark call, so servers differ.
+Boundary: a failed *call* (transport/timeout/auth/HTTP) → JudgeError → sidecar. In
+evaluation, so is a *received-but-unparseable* verdict: the judge, not the model,
+failed to produce a usable answer, so the row is retried as ``judge_failed`` and
+never scored 0 for the model. A server raises it with ``raise_unparseable_verdict``
+from the branch that finds no verdict, only when ``is_eval_mode()``; in training a
+received-but-unparseable reply stays the wrong answer it always was. Empty output is
+a per-benchmark call, so servers differ.
 
-One judge error is the model's: a judge that rejects its input as too long when the
-model's own answer made it so. A server that knows this (its judge input carries no
-documents, or the input without the answer fits) passes ``overflow_is_the_models=True``
-to ``call_judge``; the row is then ``judge_input_too_long``, a final 0. A server that
-cannot tell keeps the default, so the overflow stays a retried ``judge_failed``.
+One judge error is the model's, in evaluation: a judge that rejects its input as too
+long when the model's own answer made it so. A server that knows this (its judge input
+carries no documents) passes ``overflow_is_the_models=True`` to ``call_judge``; in
+evaluation the row is then ``judge_input_too_long``, a final 0. A server that cannot
+tell keeps the default, and training is unchanged: the overflow stays ``judge_failed``.
 
 Wrap the call, not the scoring around it: ``reraise_judge_errors`` relabels every
 exception it sees, so covering a whole ``verify()`` would misfile ordinary bugs
@@ -47,6 +49,7 @@ from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
+from nemo_gym.global_config import is_eval_mode
 from nemo_gym.server_utils import ServerClient, get_response_json, raise_for_status
 
 
@@ -118,9 +121,10 @@ async def reraise_judge_errors(coro: Awaitable[Any]) -> Any:
     except JudgeError:
         raise
     except Exception as e:
-        # The judge's own reply (an engine's 400 body, relayed through a model server's 500) says why it failed;
-        # it goes on the row, so a context overflow and an unparseable verdict do not look alike.
-        body = _error_body(e)
+        # In evaluation, the judge's own reply (an engine's 400 body, relayed through a model server's 500) says
+        # why it failed; it goes on the row, so a context overflow and an unparseable verdict do not look alike.
+        # Training keeps the row exactly as before.
+        body = _error_body(e) if is_eval_mode() else ""
         reply = f" | judge reply: {body[:1000]}" if body else ""
         raise JudgeError(f"{type(e).__name__}: {e}{reply}") from e
 
@@ -149,7 +153,8 @@ async def call_judge(
         try:
             await raise_for_status(http_response)
         except Exception as e:
-            if overflow_is_the_models and _is_context_overflow(e):
+            # Evaluation only: training keeps a judge overflow a masked judge_failed row, as before.
+            if overflow_is_the_models and is_eval_mode() and _is_context_overflow(e):
                 raise JudgeInputTooLongError(f"{type(e).__name__}: {e} | judge reply: {_error_body(e)[:1000]}") from e
             raise
         return response_model.model_validate(await get_response_json(http_response))

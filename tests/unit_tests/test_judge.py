@@ -179,6 +179,30 @@ _OVERFLOW_BODY = (
 class TestJudgeInputTooLong:
     """A judge input the model's own answer made too long is the model's final 0, where the server can tell."""
 
+    @pytest.fixture(autouse=True)
+    def _evaluation(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # The judge-overflow rule and the judge's reply on the row are evaluation-only.
+        monkeypatch.setattr("nemo_gym.judge.is_eval_mode", lambda: True)
+
+    @pytest.mark.asyncio
+    async def test_training_keeps_an_answer_caused_overflow_judge_failed(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr("nemo_gym.judge.is_eval_mode", lambda: False)
+
+        async def verify(body):
+            return await call_judge(
+                _overflow_client(400, _OVERFLOW_BODY),
+                server_name="judge",
+                url_path="/v1/responses",
+                json={},
+                response_model=_Verdict,
+                overflow_is_the_models=True,
+            )
+
+        data = orjson.loads((await judge_failsafe(verify)(_Req())).body)
+        assert (data["_ng_failure_class"], data["reward"], data["mask_sample"]) == ("judge_failed", 0.0, True)
+
     @pytest.mark.asyncio
     async def test_an_answer_caused_overflow_is_the_models_final_zero(self) -> None:
         from nemo_gym.judge import JudgeInputTooLongError
@@ -295,6 +319,23 @@ def _judge_model_server(upstream_error: BaseException):
 
 class TestJudgeReasonThroughTheModelServer:
     """The judge's own reason survives Gym's judge model server, which answers 500 for an upstream 4xx it keeps."""
+
+    @pytest.fixture(autouse=True)
+    def _evaluation(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # The judge-overflow rule and the judge's reply on the row are evaluation-only.
+        monkeypatch.setattr("nemo_gym.judge.is_eval_mode", lambda: True)
+
+    @pytest.mark.asyncio
+    async def test_training_keeps_the_row_as_before(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr("nemo_gym.judge.is_eval_mode", lambda: False)
+
+        row = await self._row(self._upstream(400, _OVERFLOW_BODY), overflow_is_the_models=True)
+
+        assert (row["_ng_failure_class"], row["reward"], row["mask_sample"]) == ("judge_failed", 0.0, True)
+        assert (
+            row["_ng_failure_judge_error"]
+            == "ClientResponseError: 500, message='Error', url='http://judge/v1/responses'"
+        )
 
     @staticmethod
     def _upstream(status: int, body: bytes) -> BaseException:

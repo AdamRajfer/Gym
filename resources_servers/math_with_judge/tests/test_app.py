@@ -1100,7 +1100,7 @@ class TestApp:
         [("no verdict at all", "model"), ("I cannot decide.", "model"), ("", "infra")],
         ids=["no-marker", "prose", "empty"],
     )
-    async def test_an_unparseable_judge_verdict_is_judge_failed_not_a_zero(
+    async def test_an_unparseable_judge_verdict_is_retried_in_place_then_split_by_cause(
         self,
         config: LibraryJudgeMathResourcesServerConfig,
         judge_text: str,

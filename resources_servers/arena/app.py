@@ -29,7 +29,7 @@ from nemo_gym.base_resources_server import (
 )
 from nemo_gym.config_types import Domain, ModelServerRef
 from nemo_gym.global_config import is_eval_mode
-from nemo_gym.judge import JudgeError, raise_unparseable_verdict, retry_judge_in_place
+from nemo_gym.judge import JudgeError, JudgeNoVerdictError, raise_unparseable_verdict, retry_judge_in_place
 from nemo_gym.openai_utils import (
     NeMoGymEasyInputMessage,
     NeMoGymResponse,
@@ -361,10 +361,23 @@ class ArenaResourcesServer(SimpleResourcesServer):
                         raise JudgeError(f"{type(exc).__name__}: {exc}") from exc
                     verdict = _verdict_of(judge_response)
                     if verdict is None:
-                        raise_unparseable_verdict("arena", _last_output_text(judge_response))
+                        try:
+                            raise_unparseable_verdict("arena", _last_output_text(judge_response))
+                        except JudgeNoVerdictError as e:
+                            e.judge_response = judge_response
+                            raise
                     return judge_response, verdict
 
-                judge_response, verdict = await retry_judge_in_place(_judge_once)
+                try:
+                    judge_response, verdict = await retry_judge_in_place(_judge_once)
+                except JudgeNoVerdictError as e:
+                    # Text with no verdict on every try: Arena-Hard-Auto drops a null judgment, so the game keeps no
+                    # verdict. The metric leaves it out of the win rate and counts it against the failed-rollout gate.
+                    if self.config.judge_no_verdict_outcome != "drop" or any(c != "model" for c in e.attempt_causes):
+                        raise
+                    return ArenaGame(
+                        responses_create_params=responses_create_params, response=e.judge_response, verdict=None
+                    )
                 return ArenaGame(
                     responses_create_params=responses_create_params, response=judge_response, verdict=verdict
                 )

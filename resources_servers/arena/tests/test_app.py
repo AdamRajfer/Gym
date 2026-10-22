@@ -839,20 +839,24 @@ class TestArenaResourcesServer:
         assert [game.verdict for game in result.games] == ["[[A>B]]", "[[B>A]]"]
         assert result.reward == approx(1.0)
 
-    async def test_a_judge_failure_at_the_cap_is_the_models_final_zero(
+    async def test_a_null_judgment_at_the_cap_is_dropped_as_arena_hard_auto_does(
         self, server: ArenaResourcesServer, judged_in_evaluation: None
     ):
+        """Text with no verdict on every try: the game keeps no verdict, never a lost game for the model."""
         game1, _ = self._recording_judge(server, ["no verdict"] * 3, ["Final: [[B>A]]"])
 
-        row = json.loads((await judge_failsafe(server.verify)(body=self._make_verify_request("Answer."))).body)
+        result = await server.verify(self._make_verify_request("Answer."))
 
         assert len(game1) == 3 and len(set(game1)) == 1
-        assert row["_ng_failure_class"] == "judge_failed"
-        assert (row["reward"], row["mask_sample"], row["_ng_failure_terminal"]) == (0.0, False, True)
-        assert row["_ng_failure_judge_attempts"] == 3
-        assert "unparseable" in row["_ng_failure_judge_error"]
-        assert is_terminal_failure(row)  # Resume never re-dispatches the rollout for it.
-        assert row["_ng_failure_cause"] == "model"  # The judge answered three times without a verdict.
+        assert [game.verdict for game in result.games] == [None, "[[B>A]]"]
+        # A result, not a failure row: nothing is re-dispatched, and the game's text is kept.
+        assert "_ng_failure_class" not in result.model_dump()
+        assert "no verdict" in result.games[0].response.output[-1].content[-1].text
+
+        # The metric leaves the rollout out of the win rate and counts it against the failed-rollout gate.
+        rollout = json.loads(result.model_dump_json()) | {"category": "lmarena_v2"}
+        metrics = server.compute_metrics([[rollout]])
+        assert metrics["rollout_failure_rate"] == 1.0
 
     async def test_a_judge_outage_at_the_cap_is_unresolved_infra_not_a_lost_game(
         self, server: ArenaResourcesServer, judged_in_evaluation: None
@@ -873,9 +877,8 @@ class TestArenaResourcesServer:
             (["", "", ""], "infra"),
             (["", "no verdict", "no verdict"], "infra"),
             ([429, 429, 429], "infra"),
-            (["no verdict"] * 3, "model"),
         ],
-        ids=["empty-x3", "empty-then-no-verdict", "429-x3", "no-verdict-x3"],
+        ids=["empty-x3", "empty-then-no-verdict", "429-x3"],
     )
     async def test_a_reply_with_no_verdict_is_the_models_0_unless_a_try_was_empty_or_limited(
         self, server: ArenaResourcesServer, judged_in_evaluation: None, replies: list, cause: str

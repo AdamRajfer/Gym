@@ -290,6 +290,61 @@ as a number of calls.
 
 `expected`, `missing` and `healthy` are null without an inventory. The summary is also written when collection fails or Slurm stops the job with SIGTERM.
 
+### Timeouts
+
+`run.stats.timeouts` counts the rollouts that ran out of time. It reads each rollout's final record: its row in the
+rollout file, or the last failure row of a rollout that never landed. `gym eval health-check` recomputes it from the
+same files. It is a diagnostic only and changes no score, verdict or row.
+
+One function decides whether a rollout ran out of time, which limit it hit, and on what evidence, in this order:
+
+1. `typed`: a timeout record on the row or on an operation record it carries (`ng_trajectory` invocations and tool
+   calls, captured model calls), in a `timeouts` list. Each record has `event_id`, `limit`, `enforcer`, `evidence`
+   (`internal` or `external`), `configured_s`, `elapsed_s` and `fired_at`. A record copied onto several operations
+   counts once by its `event_id`. An entry that is not a valid record is not evidence and is counted in
+   `invalid_events`.
+2. `legacy`: a signal rows already carry, named in `by_limit` by where it was found: a `timeout_exceeded`,
+   `agent_timeout` or `transport_timeout` failure class or `failure_kind`, an agent timeout flag (`timed_out`,
+   `agent_timed_out`, `eval_timed_out` and similar), a `timeout` termination reason, the `Episode timed out`
+   failure of an environment server's episode deadline, or a failed rollout with a captured model call whose
+   `error_category` is `timeout`. Nothing ties these names to the components that set them.
+3. `unclassified`: a failed rollout with no signal, where a record shows a measured `elapsed_s` at or past its
+   `configured_s`. Timing alone never confirms that a limit fired, so these are counted apart.
+
+A failed rollout that none of these matches is counted in `failed_without_signal`: it is not known to be a timeout, and
+not known not to be.
+
+```json
+"timeouts": {
+  "rollouts": 200,
+  "timed_out": 12,
+  "by_evidence": {"typed": 8, "legacy": 4, "unclassified": 0},
+  "by_limit": {"default_episode_timeout_seconds": 8, "_ng_failure_class=timeout_exceeded": 4},
+  "by_enforcer": {"gym.environment_server": 8},
+  "events": 8,
+  "invalid_events": 0,
+  "failed_without_signal": 3,
+  "elapsed_s": {"p50": 1790.2, "p95": 1801.4},
+  "time_split": {
+    "rollouts_with_captures": 11,
+    "share": {"policy_model": 0.62, "other_model": 0.04, "tool": 0.21, "unrecorded": 0.08, "untracked": 0.05},
+    "policy_output_tokens_per_s": {"p50": 41.3, "p5": 12.9},
+    "policy_calls_per_rollout": {"p50": 37.0, "p95": 64.0}
+  }
+}
+```
+
+`elapsed_s` is the `/run` wall clock that `gym eval run` stamps on each row as `_ng_elapsed_s`. `time_split` shows
+where the time of the timed-out rollouts went. Each share divides by the summed elapsed time of the timed-out rollouts
+that have both that stamp and model-call captures: time in policy-model calls, in other models' calls (a judge or a
+user simulator), in tool calls, after the agent's last recorded call (`unrecorded`, typically a call cancelled at the
+deadline), and the rest (`untracked`, such as setup and verification). Overlapping calls count once. A share is null
+when one of those rollouts does not measure that kind of time. `policy_output_tokens_per_s` is end to end, so it
+includes queue and prefill time.
+
+When an exporter is configured, `gym eval run` and `gym eval aggregate` also send this section's numbers as flat keys,
+such as `health/timeouts/timed_out` and `health/timeouts/by_evidence/typed`. A null value is not sent.
+
 A run stopped by SIGTERM gets a provisional summary: the run accounting in `run.artifacts`, with `partial: true`, and no `run.verdicts` or `rollout_verdicts.jsonl`. It evaluates only `run_excessive_failures`, which needs no rollouts, and lists every other check in `run.artifacts.not_evaluated`. Its `healthy` is false when the accounting already has a reason and null otherwise. Run `gym eval health-check` on the run directory for the full summary; it judges the run by the limits the provisional summary recorded. A stopped run exits with status 143, or with status 1 (`EVAL FAILED`) when `require_complete` is on, which is the default under `gym eval submit`.
 
 ### `rollout_verdicts.jsonl`

@@ -66,6 +66,7 @@ from nemo_gym.failure_kinds import (
     INFRA,
     JUDGE_FAILED,
     JUDGE_FAILURE_KINDS,
+    JUDGE_SETTLED_KEY,
     MODEL,
     RETRY,
     RETRY_THEN_UNSCORED,
@@ -452,9 +453,15 @@ def _episode_record(response: Dict[str, Any]) -> Dict[str, Any]:
             NG_FAILURE_CLASS_KEY: JUDGE_FAILED,
             NG_FAILURE_JUDGE_ERROR_KEY: result.get(NG_FAILURE_JUDGE_ERROR_KEY),
         }
-        # In evaluation judge_failure_after_retries decided the row (final, never re-dispatched) and recorded the
-        # judge's attempts and cause; keep those as written.
-        for key in (NG_TERMINAL_KEY, NG_FAILURE_CAUSE_KEY, "_ng_failure_judge_cause", "_ng_failure_judge_attempts"):
+        # In evaluation judge_failure_after_retries decided the row (the model's final 0, or a settled infra row) and
+        # recorded the judge's attempts and cause; keep those as written.
+        for key in (
+            NG_TERMINAL_KEY,
+            NG_FAILURE_CAUSE_KEY,
+            JUDGE_SETTLED_KEY,
+            "_ng_failure_judge_cause",
+            "_ng_failure_judge_attempts",
+        ):
             if key in result:
                 judge_failure[key] = result[key]
         # drop the judge failure keys from the result so it doesn't raise in _is_collector_key
@@ -1737,13 +1744,24 @@ def is_terminal_failure(record: Mapping[str, Any], *, retry_terminal_timeouts: b
         return False
     if record.get(NG_TERMINAL_KEY):
         return True
-    # Evaluation: a judge failure is never re-dispatched, so the model never gets another answer scored
-    # (judge_failure_after_retries). Training keeps the table's retry.
-    if is_eval_mode() and (
-        record.get(NG_FAILURE_CLASS_KEY) in JUDGE_FAILURE_KINDS or record.get("failure_kind") in JUDGE_FAILURE_KINDS
-    ):
-        return True
     return not is_retryable(_rule_kind(record), cause=failure_cause_of_row(record))
+
+
+def _is_judge_failure(record: Mapping[str, Any]) -> bool:
+    return record.get(NG_FAILURE_CLASS_KEY) in JUDGE_FAILURE_KINDS or record.get("failure_kind") in JUDGE_FAILURE_KINDS
+
+
+def is_never_redispatched(record: Mapping[str, Any], *, retry_terminal_timeouts: bool = False) -> bool:
+    """Whether resume leaves a persisted failure alone: a final failure, or, in evaluation, any judge failure.
+
+    Re-running a rollout because its judge failed would give the model another answer and score a different one,
+    so in evaluation every judge failure is settled by ``judge_failure_after_retries``: the model's final 0 when
+    the model's answer caused it (``is_terminal_failure``), otherwise an unresolved infra row that stays out of the
+    score (``is_infra_unresolved``). That holds for a row written before the rule, too. Training keeps the retry.
+    """
+    if is_terminal_failure(record, retry_terminal_timeouts=retry_terminal_timeouts):
+        return True
+    return is_eval_mode() and _is_judge_failure(record)
 
 
 def is_unscored_failure(record: Mapping[str, Any]) -> bool:
@@ -2407,7 +2425,7 @@ def _counted_classes(selected: Optional[List[str]]) -> str:
 
 
 def _settled_failure_keys(failures_fpath: Path, *, retry_terminal_timeouts: bool = False) -> set:
-    """Rollouts that resume will not dispatch again: a final failure, or one at the attempt cap."""
+    """Rollouts that resume will not dispatch again: a final failure, a settled judge failure, or one at the cap."""
     if not failures_fpath.exists():
         return set()
     attempts: Counter = Counter()
@@ -2422,7 +2440,7 @@ def _settled_failure_keys(failures_fpath: Path, *, retry_terminal_timeouts: bool
                 continue
             key = (row[TASK_INDEX_KEY_NAME], row[ROLLOUT_INDEX_KEY_NAME])
             attempts[key] += 1
-            if is_terminal_failure(row, retry_terminal_timeouts=retry_terminal_timeouts):
+            if is_never_redispatched(row, retry_terminal_timeouts=retry_terminal_timeouts):
                 settled.add(key)
     max_attempts = _get_max_rollout_attempts()
     return settled | {key for key, count in attempts.items() if count >= max_attempts}
@@ -3300,7 +3318,7 @@ class RolloutCollectionHelper(BaseModel):
                         continue
                     k = (fr[TASK_INDEX_KEY_NAME], fr[ROLLOUT_INDEX_KEY_NAME])
                     attempts_by_key[k] += 1
-                    if is_terminal_failure(fr, retry_terminal_timeouts=config.retry_terminal_timeouts):
+                    if is_never_redispatched(fr, retry_terminal_timeouts=config.retry_terminal_timeouts):
                         terminal_keys.add(k)
                     # A failed attempt still tells us how long this task runs -
                     # the only duration signal available for a task that has not

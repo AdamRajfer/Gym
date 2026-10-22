@@ -250,8 +250,14 @@ class TestJudgeInputTooLong:
 
         data = orjson.loads((await judge_failsafe(verify)(_Req())).body)
         assert data["_ng_failure_class"] == "judge_failed"
-        # Evaluation: after its in-place retries the judge failure is final and never re-dispatches the rollout.
-        assert (data["_ng_failure_terminal"], data["mask_sample"], data["reward"]) == (True, False, 0.0)
+        assert data["mask_sample"] is False
+        if (overflow_is_the_models, status) == (True, 400):
+            # A 4xx the model's answer shaped: the model's final 0.
+            assert (data["_ng_failure_terminal"], data["reward"], data["_ng_failure_cause"]) == (True, 0.0, "model")
+        else:
+            # A 5xx, or an overflow on a server that cannot tell the answer caused it: settled infra, out of the score.
+            assert (data["_ng_failure_judge_settled"], data["_ng_failure_cause"]) == (True, "infra")
+            assert "_ng_failure_terminal" not in data
 
 
 class _JudgeRelayClient(ServerClient):
@@ -386,11 +392,12 @@ class TestJudgeReasonThroughTheModelServer:
         row = await self._row(self._upstream(503, b'{"error": "overloaded"}'), overflow_is_the_models=True)
 
         assert row["_ng_failure_class"] == "judge_failed"
-        assert (row["_ng_failure_terminal"], row["mask_sample"], row["_ng_failure_judge_cause"]) == (
+        assert (row["_ng_failure_judge_settled"], row["mask_sample"], row["_ng_failure_cause"]) == (
             True,
             False,
             "infra",
         )
+        assert "_ng_failure_terminal" not in row
 
 
 def _recording_judge(*replies: tuple[int, bytes]) -> tuple[MagicMock, list[bytes]]:
@@ -490,7 +497,7 @@ class TestJudgeRetriedInPlaceOnTheSameAnswer:
         assert len(set(sent)) == 1
 
     @pytest.mark.asyncio
-    async def test_the_final_outcome_is_the_models_zero_with_the_judges_last_error(self) -> None:
+    async def test_a_judge_outage_after_the_retries_is_settled_infra_with_its_last_error(self) -> None:
         client, _ = _recording_judge(
             (503, b'{"error": "overloaded"}'), (503, b'{"error": "overloaded"}'), (502, b'{"error": "bad gateway"}')
         )
@@ -498,9 +505,13 @@ class TestJudgeRetriedInPlaceOnTheSameAnswer:
         row = await self._verify(client)
 
         assert row["_ng_failure_class"] == "judge_failed"
-        assert (row["reward"], row["mask_sample"], row["_ng_failure_terminal"]) == (0.0, False, True)
-        assert row["_ng_failure_cause"] == "model"  # Counted as the model's failure, as the rule says.
-        assert row["_ng_failure_judge_cause"] == "infra"  # What the judge's last error looked like.
+        # A gateway outage is infra: settled (never re-dispatched), left out of the score, counted as unresolved.
+        assert (row["_ng_failure_judge_settled"], row["mask_sample"], "_ng_failure_terminal" in row) == (
+            True,
+            False,
+            False,
+        )
+        assert row["_ng_failure_cause"] == row["_ng_failure_judge_cause"] == "infra"
         assert row["_ng_failure_judge_attempts"] == 3
         assert "HTTP 502" in row["_ng_failure_judge_error"]  # The last attempt's error, not the first.
         assert row["response"] == {"final": self.ANSWER}
@@ -525,6 +536,91 @@ class TestJudgeRetriedInPlaceOnTheSameAnswer:
         assert (row["_ng_failure_class"], row["reward"], row["mask_sample"]) == ("judge_input_too_long", 0.0, False)
         assert row["_ng_failure_judge_attempts"] == 1
         assert "context_length_exceeded" in row["_ng_failure_judge_error"]
+
+    # The cases the real-run audit saw. Each one fails all three attempts, then judge_failure_after_retries
+    # decides the row by its cause.
+    _INFRA_CASES = [
+        (429, b'{"error": "rate limited"}'),
+        (401, b'{"error": "Incorrect API key provided"}'),
+        (408, b'{"error": "request timeout"}'),
+        (502, b'{"error": "bad gateway"}'),
+        (503, b'{"error": "overloaded"}'),
+    ]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(("status", "body"), _INFRA_CASES, ids=["429", "401", "408", "502", "503"])
+    async def test_rule_branch_infra_is_an_unresolved_row_never_re_dispatched(self, status: int, body: bytes) -> None:
+        client, sent = _recording_judge(*[(status, body)] * 3)
+
+        row = await self._verify(client)
+
+        assert len(sent) == 3 and len(set(sent)) == 1
+        assert row["_ng_failure_cause"] == row["_ng_failure_judge_cause"] == "infra"
+        assert row["_ng_failure_judge_settled"] is True  # Resume never re-dispatches it.
+        assert "_ng_failure_terminal" not in row  # Not the model's 0: it stays out of the score.
+        assert row["mask_sample"] is False
+        assert row["_ng_failure_judge_attempts"] == 3
+
+    @pytest.mark.asyncio
+    async def test_rule_branch_model_an_unparseable_verdict_is_the_models_final_zero(self) -> None:
+        client, sent = _recording_judge(*[(200, b'{"no_verdict": "I cannot grade this."}')] * 3)
+
+        row = await self._verify(client)
+
+        assert len(sent) == 3 and len(set(sent)) == 1
+        assert row["_ng_failure_cause"] == row["_ng_failure_judge_cause"] == "model"
+        assert (row["_ng_failure_terminal"], row["reward"], row["mask_sample"]) == (True, 0.0, False)
+        assert "_ng_failure_judge_settled" not in row
+
+    @pytest.mark.asyncio
+    async def test_rule_branch_model_an_answer_caused_overflow_is_the_models_final_zero(self) -> None:
+        judge = _overflow_client(400, _OVERFLOW_BODY)
+
+        async def verify(body):
+            return await call_judge(
+                judge,
+                server_name="judge",
+                url_path="/v1/responses",
+                json={"input": "grade this"},
+                response_model=_Verdict,
+                overflow_is_the_models=True,
+            )
+
+        row = orjson.loads((await judge_failsafe(verify)(_Req(response={"final": "x" * 50}))).body)
+
+        assert (row["_ng_failure_class"], row["reward"], row["mask_sample"]) == ("judge_input_too_long", 0.0, False)
+        from nemo_gym.failure_kinds import FAILURE_RULES, FINAL
+
+        assert FAILURE_RULES[row["_ng_failure_class"]] == FINAL
+
+    @pytest.mark.asyncio
+    async def test_an_overflow_a_server_cannot_place_stays_out_of_the_score(self) -> None:
+        """Documents in the judge input may have overflowed it: never the model's 0, kept visible as infra."""
+        judge = _overflow_client(400, _OVERFLOW_BODY)
+
+        async def verify(body):
+            return await call_judge(
+                judge, server_name="judge", url_path="/v1/responses", json={"input": "x"}, response_model=_Verdict
+            )
+
+        row = orjson.loads((await judge_failsafe(verify)(_Req(response={"final": "short"}))).body)
+
+        assert (row["_ng_failure_cause"], row["_ng_failure_judge_settled"]) == ("infra", True)
+        assert "_ng_failure_terminal" not in row
+
+    @pytest.mark.parametrize(
+        ("cause", "terminal", "settled"), [("model", True, False), ("infra", False, True)], ids=["model", "infra"]
+    )
+    def test_the_rule_function_splits_by_cause(self, cause: str, terminal: bool, settled: bool) -> None:
+        from nemo_gym.failure_kinds import judge_failure_after_retries
+
+        row = judge_failure_after_retries(judge_error="last error", cause=cause, attempts=3)
+
+        assert row["_ng_failure_cause"] == row["_ng_failure_judge_cause"] == cause
+        assert bool(row.get("_ng_failure_terminal")) is terminal
+        assert bool(row.get("_ng_failure_judge_settled")) is settled
+        assert (row["_ng_failure_judge_error"], row["_ng_failure_judge_attempts"]) == ("last error", 3)
+        assert ("reward" in row) is terminal
 
     @pytest.mark.asyncio
     async def test_a_nested_judge_call_does_not_multiply_the_cap(self) -> None:

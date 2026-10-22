@@ -95,13 +95,18 @@ from nemo_gym.rollout_collection import (
     _failure_rows_counted_as_zero,
     _failures_path_for,
     _get_max_rollout_attempts,
+    _infra_unresolved_counts,
+    _infra_unresolved_metrics,
     _masking_step_metrics,
     _missing_rollout_rows_counted_as_zero,
     _rollout_for_export,
     _rollout_order_key,
     _rollout_request_debug_summary,
     _round_robin_by_agent,
+    _settled_failure_keys,
     get_max_rollout_attempts,
+    is_infra_unresolved,
+    is_never_redispatched,
     is_terminal_failure,
     loads_jsonl_line,
 )
@@ -7684,17 +7689,52 @@ class TestAJudgeFailureNeverReRunsTheRollout:
 
         assert [r[TASK_INDEX_KEY_NAME] for r in input_rows] == [0, 3]
 
-    def test_the_rules_row_is_final_and_counts_as_zero(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    @staticmethod
+    def _rule_row(task: int, cause: str) -> dict:
         from nemo_gym.failure_kinds import judge_failure_after_retries
 
-        monkeypatch.setattr("nemo_gym.rollout_collection.is_eval_mode", lambda: False)  # The stamp alone decides.
-        row = {TASK_INDEX_KEY_NAME: 0, ROLLOUT_INDEX_KEY_NAME: 0} | judge_failure_after_retries(
-            judge_error="HTTP 503", cause=INFRA, attempts=3
+        return {TASK_INDEX_KEY_NAME: task, ROLLOUT_INDEX_KEY_NAME: 0} | judge_failure_after_retries(
+            judge_error="last judge error", cause=cause, attempts=3
         )
 
-        assert is_terminal_failure(row)
-        assert (row["reward"], row["mask_sample"], row[NG_FAILURE_CAUSE_KEY]) == (0.0, False, MODEL)
-        assert (row["_ng_failure_judge_cause"], row["_ng_failure_judge_attempts"]) == (INFRA, 3)
+    def test_rule_branch_model_is_the_models_final_zero(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr("nemo_gym.rollout_collection.is_eval_mode", lambda: True)
+        row = self._rule_row(1, MODEL)
+        failures = _failures_path_for(tmp_path / "output.jsonl")
+        failures.write_bytes(orjson.dumps(row) + b"\n")
+
+        assert is_terminal_failure(row) and not is_infra_unresolved(row)
+        [counted] = _failure_rows_counted_as_zero([failures], None, set())
+        assert counted["reward"] == 0.0
+        assert (row[NG_FAILURE_CAUSE_KEY], row["_ng_failure_judge_attempts"]) == (MODEL, 3)
+        assert _settled_failure_keys(failures) == {(1, 0)}
+
+    def test_rule_branch_infra_is_unresolved_left_out_and_never_re_dispatched(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr("nemo_gym.rollout_collection.is_eval_mode", lambda: True)
+        row = self._rule_row(1, INFRA)
+        config = TestLongestFirstDispatch._write_resume_state(tmp_path, [row])
+        failures = _failures_path_for(Path(config.output_jsonl_fpath))
+
+        input_rows, *_ = RolloutCollectionHelper()._load_from_cache(config)
+
+        assert 1 not in [r[TASK_INDEX_KEY_NAME] for r in input_rows]  # Never re-dispatched.
+        assert not is_terminal_failure(row) and is_infra_unresolved(row)
+        assert _failure_rows_counted_as_zero([failures], None, set()) == []  # Left out of the score.
+        assert _settled_failure_keys(failures) == {(1, 0)}  # The run can finish.
+        unresolved, owed = _infra_unresolved_counts({(1, 0): row}, {(1, 0): 1}, set(), expected=4, missing=0)
+        assert (unresolved, owed) == (1, 4)
+        # One of four owed rollouts is 25%, past the 2% cap: the run is not publishable.
+        assert _infra_unresolved_metrics(unresolved, owed)["publishable"] is False
+
+    def test_a_judge_failure_written_before_the_rule_is_settled_infra(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """An old masked judge_failed row names no cause; its kind's rule says infra, so it is never a model 0."""
+        monkeypatch.setattr("nemo_gym.rollout_collection.is_eval_mode", lambda: True)
+        [legacy, _] = self._judge_rows()
+
+        assert is_never_redispatched(legacy)
+        assert not is_terminal_failure(legacy) and is_infra_unresolved(legacy)
 
     def test_training_keeps_retrying_a_judge_failure(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr("nemo_gym.rollout_collection.is_eval_mode", lambda: False)
@@ -7713,7 +7753,8 @@ class TestAJudgeFailureNeverReRunsTheRollout:
 
         record = _episode_record({"task_id": "t", "result": result})
 
-        assert (record[NG_TERMINAL_KEY], record[NG_FAILURE_CAUSE_KEY]) == (True, MODEL)
+        assert (record["_ng_failure_judge_settled"], record[NG_FAILURE_CAUSE_KEY]) == (True, INFRA)
+        assert NG_TERMINAL_KEY not in record
         assert (record["_ng_failure_judge_cause"], record["_ng_failure_judge_attempts"]) == (INFRA, 3)
 
 

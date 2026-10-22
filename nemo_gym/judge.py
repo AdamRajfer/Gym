@@ -25,8 +25,10 @@ In evaluation the rollout is never re-run for a judge failure: that would give t
 model another answer and score a different one. ``retry_judge_in_place`` asks the
 judge again about the same stored answer (``NEMO_GYM_JUDGE_MAX_ATTEMPTS``, default
 3, with backoff), and when every attempt fails
-``failure_kinds.judge_failure_after_retries`` decides the row: today a final 0 for
-the model, with the judge's last error, its cause and the attempt count recorded.
+``failure_kinds.judge_failure_after_retries`` decides the row by its cause: the
+model's final 0 when the model's answer caused it, and an unresolved infra row (left
+out of the score, counted, never re-dispatched) when a service did. The judge's last
+error, the cause and the attempt count are recorded either way.
 
 Boundary: a failed *call* (transport/timeout/auth/HTTP) → JudgeError → sidecar. In
 evaluation, so is a *received-but-unparseable* verdict: the judge, not the model,
@@ -59,7 +61,7 @@ from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
-from nemo_gym.failure_kinds import INFRA, FailureCause, failure_cause_of, judge_failure_after_retries
+from nemo_gym.failure_kinds import INFRA, MODEL, FailureCause, failure_cause_of, judge_failure_after_retries
 from nemo_gym.global_config import is_eval_mode
 from nemo_gym.server_utils import ServerClient, get_response_json, raise_for_status
 
@@ -135,9 +137,17 @@ def _is_context_overflow(error: BaseException) -> bool:
 
 
 def _judge_failure_cause(error: JudgeError) -> FailureCause:
-    """What a judge failure's last error looked like. A call error reads its chain; a reply with no verdict (no
-    chain) was the judge's own output, so it is infra. Recorded on the row, never used to re-run the rollout."""
+    """What caused a judge failure, from its last error; ``judge_failure_after_retries`` decides the row by it.
+
+    A failed call reads its error chain: a spent budget, a rate limit, a gateway status, a timeout or a bad key is
+    infra. A judge that answered without a verdict (no error chain) did so on every attempt with the same answer,
+    so the answer is the cause, and so is any other 4xx the judge gave the request the answer shaped. A context
+    overflow reaches here only from a server that cannot tell the answer caused it (``overflow_is_the_models`` is
+    off: the judge input carries documents too), so it is not the model's and stays out of the score as infra.
+    """
     if error.__cause__ is None:
+        return MODEL
+    if _is_context_overflow(error.__cause__):
         return INFRA
     return failure_cause_of(error)
 

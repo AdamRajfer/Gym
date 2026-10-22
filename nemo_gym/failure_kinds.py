@@ -417,26 +417,38 @@ def is_retryable(kind: str | None, *, cause: FailureCause | None) -> bool:
 JUDGE_FAILURE_KINDS: frozenset[str] = frozenset({JUDGE_FAILED, JUDGE_UNPARSEABLE})
 
 
+# A judge-infra row the rule settled: never re-dispatched, but not final either, so it stays out of the score.
+JUDGE_SETTLED_KEY = "_ng_failure_judge_settled"
+
+
 def judge_failure_after_retries(*, judge_error: str, cause: FailureCause, attempts: int) -> dict[str, object]:
     """The evaluation rule for a judge failure that its in-place retries on the same answer did not fix.
 
-    The rollout is never re-dispatched: that would give the model another answer and score a different one.
-    The judge already had every attempt on the stored answer, so the row is the model's final failure and counts
-    as 0. ``cause`` is what the last error looked like (infra or model); it stays on the row so a judge outage stays
-    visible in the counts, and so this one rule can change once real runs show how often outages reach it.
-    Returns the fields of the failures-sidecar row. Resume reads the same rule for every row of a
-    ``JUDGE_FAILURE_KINDS`` kind, also one written before this rule existed (``is_terminal_failure``).
+    The rollout is never re-dispatched, whatever the cause: that would give the model another answer and score a
+    different one. What the row becomes depends on what the judge's last error says caused it:
+
+    - ``model``: the model's answer did it (an answer that overflows the judge's context, a verdict the answer
+      made unparseable). The row is the model's final failure and counts as 0.
+    - ``infra``: a service the model does not control (a spent budget, a rate limit, a gateway or a bad key).
+      The row is an unresolved infra row: left out of the score, counted in ``rollouts_infra_unresolved``, and
+      the run is not publishable above ``MAX_INFRA_UNRESOLVED_RATE``. In-place retries fix transient outages; a
+      bad key never recovers, and scoring it as the model's 0 would publish a score near 0.
+
+    The judge's last error, the cause and the attempt count stay on the row either way. Returns the fields of the
+    failures-sidecar row. Resume reads the same rule for every ``JUDGE_FAILURE_KINDS`` row, also one written
+    before this rule existed.
     """
-    return {
+    row: dict[str, object] = {
         "_ng_failure_class": JUDGE_FAILED,
-        "_ng_failure_terminal": True,
-        "_ng_failure_cause": MODEL,
+        "_ng_failure_cause": cause,
         "_ng_failure_judge_error": judge_error,
         "_ng_failure_judge_cause": cause,
         "_ng_failure_judge_attempts": attempts,
-        "reward": 0.0,
         "mask_sample": False,
     }
+    if cause == MODEL:
+        return row | {"_ng_failure_terminal": True, "reward": 0.0}
+    return row | {JUDGE_SETTLED_KEY: True}
 
 
 def is_unscored(kind: str | None) -> bool:

@@ -41,7 +41,7 @@ import aiohttp
 import orjson
 from aiohttp import ClientError
 from omegaconf import DictConfig, OmegaConf
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, Field, PrivateAttr, field_validator, model_validator
 from tqdm.asyncio import tqdm
 
 from nemo_gym import _resolve_under_cwd_or_install
@@ -82,6 +82,7 @@ from nemo_gym.global_config import (
     pairing_override_enabled,
     resolve_dataset_agent,
 )
+from nemo_gym.health.types import RunHealthConfig
 from nemo_gym.observability.model_calls import (
     await_model_call_capture_quiescence,
     clear_model_call_captures_for_rollouts,
@@ -1071,7 +1072,9 @@ def _normalize_health_check_ignored_checks(value) -> List[str]:
     return list(normalize_ignored_checks(value))
 
 
-class SharedRolloutCollectionConfig(RemovedRolloutOptionsMixin, UploadRolloutsConfigMixin, BaseNeMoGymCLIConfig):
+class SharedRolloutCollectionConfig(
+    RemovedRolloutOptionsMixin, UploadRolloutsConfigMixin, RunHealthConfig, BaseNeMoGymCLIConfig
+):
     output_jsonl_fpath: str = Field(description="The output data jsonl file path.")
     batch_manifest_fpath: Optional[str] = Field(
         default=None,
@@ -2709,6 +2712,10 @@ class _BoundedCompletionIterator:
 
 
 class RolloutCollectionHelper(BaseModel):
+    # (task index, rollout index) of every record persisted to the rollouts jsonl, kept current as rows land,
+    # so a run stopped by SIGTERM can be accounted for without re-reading that file.
+    _landed_keys: set = PrivateAttr(default_factory=set)
+
     def _preprocess_rows_from_config(self, config: RolloutCollectionConfig) -> List[Dict]:
         range_iterator = repeat(0)
         if config.limit:
@@ -3176,7 +3183,8 @@ class RolloutCollectionHelper(BaseModel):
         # outside a git clone.
         output_fpath.parent.mkdir(parents=True, exist_ok=True)
 
-        persisted_success_keys: set = set()
+        persisted_success_keys = self._landed_keys
+        persisted_success_keys.clear()
         if config.resume_from_cache and config.materialized_jsonl_fpath.exists() and output_fpath.exists():
             should_clear_outputs = False
             _drop_truncated_tail(output_fpath)
@@ -3897,6 +3905,7 @@ Aggregate metrics: {aggregate_metrics_fpath}{coverage}""")
                     output_fpath,
                     workers=config.health_check_workers,
                     ignored_checks=config.health_check_ignored_checks,
+                    limits=config.run_health_limits,
                 )
             except Exception:
                 logger.exception(
@@ -4589,7 +4598,7 @@ Aggregate metrics: {aggregate_metrics_fpath}{coverage}""")
         return setup_server_client_utils(head_server_config)
 
 
-class RolloutAggregationConfig(BaseNeMoGymCLIConfig):
+class RolloutAggregationConfig(RunHealthConfig, BaseNeMoGymCLIConfig):
     """
     Aggregate metrics across rollout shards produced by `gym eval run --no-serve +disable_aggregation=true`.
 
@@ -4881,10 +4890,12 @@ Aggregate metrics: {aggregate_metrics_fpath}{coverage}""")
             try:
                 health_result = await asyncio.to_thread(
                     run_health_checks,
-                    output_fpath if config.merge_shards else [Path(path) for path in input_paths],
+                    # The shards, not the merged file: their sidecars and inventories sit next to them.
+                    [Path(path) for path in input_paths],
                     output_dir=output_fpath.parent,
                     workers=config.health_check_workers,
                     ignored_checks=config.health_check_ignored_checks,
+                    limits=config.run_health_limits,
                 )
             except Exception:
                 logger.exception(

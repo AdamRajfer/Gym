@@ -19,6 +19,7 @@ import pytest
 from pydantic import BaseModel, ConfigDict
 
 from nemo_gym.judge import JudgeError, call_judge, judge_failsafe, normalize_math_judge_verdict, reraise_judge_errors
+from nemo_gym.server_utils import ServerClient
 
 
 @pytest.mark.parametrize(
@@ -227,13 +228,10 @@ class TestJudgeInputTooLong:
         assert data["mask_sample"] is True
 
 
-class _JudgeRelay:
+class _JudgeRelayClient(ServerClient):
     """A ServerClient whose post() reaches a real Gym judge model server over its HTTP app, as the real hop does."""
 
-    def __init__(self, judge_app) -> None:
-        from fastapi.testclient import TestClient
-
-        self._judge = TestClient(judge_app, raise_server_exceptions=False)
+    judge: object
 
     async def post(self, server_name: str, url_path: str, json=None, **kwargs):
         from types import SimpleNamespace
@@ -241,7 +239,7 @@ class _JudgeRelay:
         from aiohttp import ClientResponseError
 
         payload = json.model_dump(mode="json", exclude_unset=True) if hasattr(json, "model_dump") else json
-        reply = self._judge.post(url_path, json=payload)
+        reply = self.judge.post(url_path, json=payload)
 
         def reject() -> None:
             url = f"http://judge{url_path}"
@@ -253,6 +251,19 @@ class _JudgeRelay:
         relayed.content.read = AsyncMock(return_value=reply.content)
         relayed.raise_for_status = MagicMock(side_effect=None if reply.is_success else reject)
         return relayed
+
+
+def _JudgeRelay(judge_app) -> "_JudgeRelayClient":
+    from fastapi.testclient import TestClient
+    from omegaconf import OmegaConf
+
+    from nemo_gym.server_utils import BaseServerConfig
+
+    return _JudgeRelayClient.model_construct(
+        head_server_config=BaseServerConfig(host="head", port=1),
+        global_config_dict=OmegaConf.create({}),
+        judge=TestClient(judge_app, raise_server_exceptions=False),
+    )
 
 
 def _judge_model_server(upstream_error: BaseException):

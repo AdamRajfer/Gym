@@ -26,7 +26,7 @@ import pytest
 import yaml
 from pytest import MonkeyPatch
 
-from nemo_gym.orchestration.api import SubmitConfig
+from nemo_gym.orchestration.api import SAVED_CONFIG, SubmitConfig
 from nemo_gym.orchestration.executors.base import BaseExecutor
 from nemo_gym.orchestration.jobs import (
     RESOLVED_CONFIG_NAME,
@@ -237,6 +237,76 @@ def test_persist_writes_the_resolved_config_next_to_the_manifest(tmp_path, monke
 
     resolved = yaml.safe_load(written[run_dir / RESOLVED_CONFIG_NAME])
     assert resolved["job"]["output_path"] == str(tmp_path / "jobs")
+
+
+_ENV = {"API_KEY": "host:GYM_TEST_SECRET", "HF_HOME": "lit:/cache/huggingface", "LATE": "runtime:LATE"}
+
+
+def _config_with_env(tmp_path, env: dict[str, str]) -> dict:
+    return {
+        "services": {"svc": {"container": "gym:latest", "type": "vllm", "model": "org/model", "env": env}},
+        "compute": {"hsg": {"type": "slurm", "account": "my-account", "hostname": None}},
+        "driver": {"container": "gym:latest", "benchmarks": {"gsm8k": {}}, "env": env},
+        "job": {"output_path": str(tmp_path / "jobs")},
+    }
+
+
+def _persisted(tmp_path, config: SubmitConfig) -> str:
+    """The resolved config text that the real `persist()` writes for `config`."""
+
+    class _Executor(BaseExecutor):
+        def run(self, config, *, dry_run: bool = False):  # pragma: no cover - unused
+            raise NotImplementedError
+
+    run_dir = tmp_path / "run"
+    run_dir.mkdir(exist_ok=True)
+    written: dict[Path, str] = {}
+    _Executor().persist(_record(run_dir=str(run_dir)), config, lambda path, text, **_: written.__setitem__(path, text))
+    return written[run_dir / RESOLVED_CONFIG_NAME]
+
+
+def test_persisted_env_keeps_every_prefix_and_validates_again(tmp_path, monkeypatch: MonkeyPatch):
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    monkeypatch.setenv("GYM_TEST_SECRET", "s3cr3t-value")
+    config = SubmitConfig.model_validate(_config_with_env(tmp_path, _ENV))
+
+    text = _persisted(tmp_path, config)
+    saved = yaml.safe_load(text)
+
+    assert "s3cr3t-value" not in text
+    assert saved["driver"]["env"] == _ENV
+    assert saved["services"]["svc"]["env"] == _ENV
+    # Validated with the same rules as a submit, so a resubmit gets the same config.
+    reloaded = SubmitConfig.model_validate(saved)
+    assert reloaded.driver.env == config.driver.env
+    assert reloaded.services["svc"].env == config.services["svc"].env
+
+
+def test_persisting_a_reloaded_config_writes_the_same_record(tmp_path, monkeypatch: MonkeyPatch):
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    monkeypatch.setenv("GYM_TEST_SECRET", "s3cr3t-value")
+    first = _persisted(tmp_path, SubmitConfig.model_validate(_config_with_env(tmp_path, _ENV)))
+
+    second = _persisted(tmp_path, SubmitConfig.model_validate(yaml.safe_load(first)))
+
+    assert second == first
+
+
+def test_a_record_saved_with_bare_literals_still_loads_as_a_saved_config(tmp_path, monkeypatch: MonkeyPatch):
+    """Records written before the dump kept `lit:` hold `HF_HOME: /cache/huggingface`."""
+    monkeypatch.setenv("GYM_TEST_SECRET", "s3cr3t-value")
+    old_env = {"API_KEY": "host:GYM_TEST_SECRET", "HF_HOME": "/cache/huggingface", "LATE": "runtime:LATE"}
+
+    config = SubmitConfig.model_validate(_config_with_env(tmp_path, old_env), context={SAVED_CONFIG: True})
+
+    expected = {"API_KEY": "s3cr3t-value", "HF_HOME": "/cache/huggingface", "LATE": "runtime:LATE"}
+    assert config.driver.env == expected
+    assert config.services["svc"].env == expected
+
+
+def test_a_bare_env_value_is_still_refused_outside_a_saved_config(tmp_path):
+    with pytest.raises(ValueError, match="must start with one of the prefixes"):
+        SubmitConfig.model_validate(_config_with_env(tmp_path, {"HF_HOME": "/cache/huggingface"}))
 
 
 def test_jobs_module_is_executor_agnostic():

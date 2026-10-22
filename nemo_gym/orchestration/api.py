@@ -26,6 +26,7 @@ from pydantic import (
     PrivateAttr,
     SerializationInfo,
     Tag,
+    ValidationInfo,
     field_serializer,
     field_validator,
     model_validator,
@@ -47,6 +48,9 @@ RUNTIME_ENV_PREFIX = "runtime:"
 # `model_dump` context flag: write each `host:` env value as its `host:VAR` reference, so a
 # record meant for other readers never holds the submitter's resolved secrets.
 HOST_ENV_REFS = "host_env_refs"
+# `model_validate` context flag for reading a config that `persist()` saved. Records written before
+# `lit:` was kept on the dump hold literals without a prefix; this reads such a value as `lit:`.
+SAVED_CONFIG = "saved_config"
 
 
 class _HostEnvRefs(BaseModel):
@@ -66,13 +70,19 @@ class _HostEnvRefs(BaseModel):
     @field_serializer("env", check_fields=False)
     def _serialize_env(self, env: dict[str, str], info: SerializationInfo) -> dict[str, str]:
         if info.context and info.context.get(HOST_ENV_REFS):
-            return {k: self._host_env_refs.get(k, v) for k, v in env.items()}
+            # Every value keeps a prefix so the record validates again. A resolved `runtime:` value already
+            # carries its own; anything else that did not come from `host:` is a literal.
+            return {
+                k: self._host_env_refs.get(k) or (v if v.startswith(RUNTIME_ENV_PREFIX) else f"lit:{v}")
+                for k, v in env.items()
+            }
         return env
 
 
-def resolve_env_dict(env: dict[str, str]) -> dict[str, str]:
+def resolve_env_dict(env: dict[str, str], *, saved_config: bool = False) -> dict[str, str]:
     """Resolve `lit:`/`host:`/`runtime:` prefixes on `env` values. Every value must use one
     of these prefixes; a missing or misspelled prefix raises rather than being guessed at.
+    `saved_config` reads a value without a prefix as `lit:` (see SAVED_CONFIG).
 
     - `lit:VALUE` -> literal VALUE.
     - `host:VAR` -> read from os.environ[VAR] on the machine running `gym eval submit`;
@@ -99,6 +109,8 @@ def resolve_env_dict(env: dict[str, str]) -> dict[str, str]:
             if not _ENV_VAR_NAME_RE.match(var):
                 raise ValueError(f"env[{key!r}]: {var!r} is not a valid environment variable name for runtime:{var}")
             resolved[key] = f"{RUNTIME_ENV_PREFIX}{var}"
+        elif saved_config:
+            resolved[key] = raw
         else:
             raise ValueError(
                 f"env[{key!r}]: {raw!r} must start with one of the prefixes 'lit:', 'host:', or 'runtime:'"
@@ -142,8 +154,8 @@ class BaseServiceConfig(_HostEnvRefs, _StrictModel):
 
     @field_validator("env")
     @classmethod
-    def _resolve_env_prefixes(cls, v: dict[str, str]) -> dict[str, str]:
-        return resolve_env_dict(v)
+    def _resolve_env_prefixes(cls, v: dict[str, str], info: ValidationInfo) -> dict[str, str]:
+        return resolve_env_dict(v, saved_config=bool(info.context and info.context.get(SAVED_CONFIG)))
 
 
 class BaseModelServiceConfig(BaseServiceConfig):
@@ -480,8 +492,8 @@ class DriverConfig(_HostEnvRefs, _StrictModel):
 
     @field_validator("env")
     @classmethod
-    def _resolve_env_prefixes(cls, v: dict[str, str]) -> dict[str, str]:
-        return resolve_env_dict(v)
+    def _resolve_env_prefixes(cls, v: dict[str, str], info: ValidationInfo) -> dict[str, str]:
+        return resolve_env_dict(v, saved_config=bool(info.context and info.context.get(SAVED_CONFIG)))
 
 
 class JobConfig(_StrictModel):

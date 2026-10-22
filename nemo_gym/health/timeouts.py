@@ -20,7 +20,7 @@ The section is a report. It changes no row, reward, score or health verdict, and
 A rollout counts as timed out on one of two kinds of evidence:
 
 - ``typed``: a :class:`TimeoutEvent` that the component enforcing a limit attached to the operation it
-  bounds, as proposed in the "Recording Timeouts in NeMo Gym Rollouts" RFC.
+  bounds.
 - ``legacy``: a field that a Gym component writes today when its own deadline fires. Each one is listed in
   :data:`LEGACY_TIMEOUT_SIGNALS` together with the component that writes it.
 

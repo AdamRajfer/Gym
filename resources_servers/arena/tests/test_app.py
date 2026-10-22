@@ -770,7 +770,7 @@ class TestArenaResourcesServer:
         assert result.reward == approx(0.5)
 
     @mark.parametrize("status", [401, 429, 500])
-    async def test_a_failed_judge_call_is_a_retryable_judge_failure_not_a_lost_game(
+    async def test_a_failed_judge_call_is_a_judge_failure_not_a_lost_game(
         self, server: ArenaResourcesServer, status: int, eval_mode: None
     ):
         """A judge 401, 429 or 500 used to score the game as a policy loss; now it reaches judge_failsafe."""
@@ -787,9 +787,71 @@ class TestArenaResourcesServer:
         wrapped = await judge_failsafe(server.verify)(body=self._make_verify_request("Answer."))
         row = json.loads(wrapped.body)
         assert row["_ng_failure_class"] == "judge_failed"
-        assert not is_terminal_failure(row)
-        # The plain judge_failed kind: at the cap the row reaches arena's metric and counts against the gate.
+        # The plain judge_failed kind reaches arena's metric and counts against the gate.
         assert row["failure_kind"] == "judge_failed"
+
+    @fixture
+    def judged_in_evaluation(self, monkeypatch, eval_mode: None) -> None:
+        """Evaluation on the shared judge path too, with no backoff wait."""
+        monkeypatch.setattr("nemo_gym.judge.is_eval_mode", lambda: True)
+        monkeypatch.setattr("nemo_gym.judge.JUDGE_RETRY_BACKOFF_SECONDS", (0.0,))
+        monkeypatch.delenv("NEMO_GYM_JUDGE_MAX_ATTEMPTS", raising=False)
+
+    @staticmethod
+    def _recording_judge(server: ArenaResourcesServer, game1: list, game2: list) -> tuple[list[str], list[str]]:
+        """Answer each game's judge posts with its next reply and record the exact prompt each attempt sent.
+
+        Game 1 puts the policy's answer first (``A: <policy answer>``); the games run concurrently.
+        """
+        sent: tuple[list[str], list[str]] = ([], [])
+        replies = (list(game1), list(game2))
+
+        async def post(**kwargs):
+            prompt = kwargs["json"].model_dump_json()
+            game = 0 if "A: Paris." not in prompt else 1  # The baseline answer is "Paris."
+            sent[game].append(prompt)
+            reply = replies[game].pop(0)
+            if isinstance(reply, int):
+                failed = MagicMock(ok=False, status=reply)
+                failed.raise_for_status.side_effect = ClientResponseError(
+                    request_info=MagicMock(), history=(), status=reply, message="judge unavailable"
+                )
+                failed.content.read = AsyncMock(return_value=b'{"error": "overloaded"}')
+                return failed
+            return _make_post_mock(json.dumps(_make_response("j", _make_output_message(reply))))
+
+        server.server_client.post = AsyncMock(side_effect=post)
+        return sent
+
+    async def test_a_judge_failure_is_retried_in_place_on_the_same_answer(
+        self, server: ArenaResourcesServer, judged_in_evaluation: None
+    ):
+        # Game 1: a 503, then an unparseable reply, then a verdict. Game 2 answers at once.
+        game1, game2 = self._recording_judge(
+            server, [503, "I cannot decide.", "Final verdict: [[A>B]]"], ["Final: [[B>A]]"]
+        )
+
+        result = await server.verify(self._make_verify_request("Answer é."))
+
+        assert len(game1) == 3 and len(game2) == 1
+        assert game1[0] == game1[1] == game1[2]  # Every attempt sent the stored answer, byte for byte.
+        assert "Answer \\u00e9." in game1[0] or "Answer é." in game1[0]
+        assert [game.verdict for game in result.games] == ["[[A>B]]", "[[B>A]]"]
+        assert result.reward == approx(1.0)
+
+    async def test_a_judge_failure_at_the_cap_is_the_models_final_zero(
+        self, server: ArenaResourcesServer, judged_in_evaluation: None
+    ):
+        game1, _ = self._recording_judge(server, ["no verdict"] * 3, ["Final: [[B>A]]"])
+
+        row = json.loads((await judge_failsafe(server.verify)(body=self._make_verify_request("Answer."))).body)
+
+        assert len(game1) == 3 and len(set(game1)) == 1
+        assert row["_ng_failure_class"] == "judge_failed"
+        assert (row["reward"], row["mask_sample"], row["_ng_failure_terminal"]) == (0.0, False, True)
+        assert row["_ng_failure_judge_attempts"] == 3
+        assert "unparseable" in row["_ng_failure_judge_error"]
+        assert is_terminal_failure(row)  # Resume never re-dispatches the rollout for it.
 
     @mark.parametrize("status", [401, 429, 500])
     async def test_training_keeps_a_failed_judge_call_as_a_skipped_game(

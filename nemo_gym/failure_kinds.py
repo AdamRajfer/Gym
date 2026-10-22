@@ -80,6 +80,8 @@ AGENT_COMMAND_NOT_ALLOWED = "agent_command_not_allowed"
 # ``judge_failed`` is produced today by judge_failsafe and by reverification.
 JUDGE_FAILED = "judge_failed"
 JUDGE_UNPARSEABLE = "judge_unparseable"
+# The judge rejected its input as too long, and the server knows the model's own answer made it so.
+JUDGE_INPUT_TOO_LONG = "judge_input_too_long"
 VERIFIER_ERROR = "verifier_error"
 
 # --- provider: sandboxes, browsers, containers ----------------------------------------- #
@@ -116,6 +118,7 @@ FAILURE_KINDS: frozenset[str] = frozenset(
         AGENT_COMMAND_NOT_ALLOWED,
         JUDGE_FAILED,
         JUDGE_UNPARSEABLE,
+        JUDGE_INPUT_TOO_LONG,
         VERIFIER_ERROR,
         PROVIDER_UNAVAILABLE,
         PROVIDER_QUOTA_EXHAUSTED,
@@ -200,6 +203,8 @@ FAILURE_RULES: dict[str, FailureRule] = {
     JUDGE_FAILED: RETRY,
     # The judge, a service the model does not control, produced the verdict it could not parse.
     JUDGE_UNPARSEABLE: RETRY,
+    # The model's answer did not fit the judge's context window: the model's 0, as an answer too long to grade.
+    JUDGE_INPUT_TOO_LONG: FINAL,
     VERIFIER_ERROR: EVIDENCE,
     PROVIDER_UNAVAILABLE: RETRY,
     PROVIDER_QUOTA_EXHAUSTED: RETRY,

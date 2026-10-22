@@ -150,3 +150,78 @@ class TestJudgeFailsafe:
         assert len(data["failure_reason"]) == 2000
         assert data["_ng_failure_judge_error"] == data["failure_reason"]
         assert request.model_dump() == original
+
+
+def _overflow_client(status: int, body: bytes) -> MagicMock:
+    """A judge whose model server rejects the request the way nemo_gym.server_utils.raise_for_status raises it."""
+    from types import SimpleNamespace
+
+    from aiohttp import ClientResponseError
+
+    def reject() -> None:
+        request_info = SimpleNamespace(method="POST", url="http://judge/v1", real_url="http://judge/v1", headers={})
+        raise ClientResponseError(request_info=request_info, history=(), status=status, message="Bad Request")
+
+    resp = MagicMock(ok=False, status=status)
+    resp.read = AsyncMock(return_value=body)
+    resp.content.read = AsyncMock(return_value=body)
+    resp.raise_for_status = MagicMock(side_effect=reject)
+    return MagicMock(post=AsyncMock(return_value=resp))
+
+
+_OVERFLOW_BODY = (
+    b'{"error": {"message": "This model\'s maximum context length is 32768 tokens. However, you requested 40000 '
+    b'tokens.", "code": "context_length_exceeded"}}'
+)
+
+
+class TestJudgeInputTooLong:
+    """A judge input the model's own answer made too long is the model's final 0, where the server can tell."""
+
+    @pytest.mark.asyncio
+    async def test_an_answer_caused_overflow_is_the_models_final_zero(self) -> None:
+        from nemo_gym.judge import JudgeInputTooLongError
+
+        async def verify(body):
+            return await call_judge(
+                _overflow_client(400, _OVERFLOW_BODY),
+                server_name="judge",
+                url_path="/v1/responses",
+                json={},
+                response_model=_Verdict,
+                overflow_is_the_models=True,
+            )
+
+        with pytest.raises(JudgeInputTooLongError):
+            await verify(None)
+        data = orjson.loads((await judge_failsafe(verify)(_Req(response={"final": "a" * 10}))).body)
+        assert data["_ng_failure_class"] == "judge_input_too_long"
+        assert data["failure_kind"] == "judge_input_too_long"
+        assert data["reward"] == 0.0
+        assert data["mask_sample"] is False
+        from nemo_gym.failure_kinds import FAILURE_RULES, FINAL
+
+        assert FAILURE_RULES["judge_input_too_long"] == FINAL
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("overflow_is_the_models", "status", "body"),
+        [(False, 400, _OVERFLOW_BODY), (True, 400, b'{"error": "invalid request"}'), (True, 503, _OVERFLOW_BODY)],
+        ids=["server-cannot-tell", "other-4xx", "5xx"],
+    )
+    async def test_other_judge_errors_stay_judge_failed(
+        self, overflow_is_the_models: bool, status: int, body: bytes
+    ) -> None:
+        async def verify(body_):
+            return await call_judge(
+                _overflow_client(status, body),
+                server_name="judge",
+                url_path="/v1/responses",
+                json={},
+                response_model=_Verdict,
+                overflow_is_the_models=overflow_is_the_models,
+            )
+
+        data = orjson.loads((await judge_failsafe(verify)(_Req())).body)
+        assert data["_ng_failure_class"] == "judge_failed"
+        assert data["mask_sample"] is True

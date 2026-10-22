@@ -28,6 +28,12 @@ produce a usable answer, so the row is retried as ``judge_failed`` and never sco
 0 for the model. A server raises it with ``raise_unparseable_verdict`` from the
 branch that finds no verdict. Empty output is a per-benchmark call, so servers differ.
 
+One judge error is the model's: a judge that rejects its input as too long when the
+model's own answer made it so. A server that knows this (its judge input carries no
+documents, or the input without the answer fits) passes ``overflow_is_the_models=True``
+to ``call_judge``; the row is then ``judge_input_too_long``, a final 0. A server that
+cannot tell keeps the default, so the overflow stays a retried ``judge_failed``.
+
 Wrap the call, not the scoring around it: ``reraise_judge_errors`` relabels every
 exception it sees, so covering a whole ``verify()`` would misfile ordinary bugs
 (a KeyError in prompt assembly, say) as judge failures.
@@ -60,6 +66,29 @@ class JudgeError(Exception):
     """A judge call failed; judge_failsafe routes the row to the failures sidecar."""
 
 
+class JudgeInputTooLongError(JudgeError):
+    """The judge rejected an input the model's own answer made too long: the model's final 0."""
+
+
+# How an OpenAI-compatible engine (vLLM, SGLang, the OpenAI API) words a request that exceeds its context window.
+_CONTEXT_OVERFLOW_PATTERN = re.compile(
+    r"context_length_exceeded|maximum context length|context window|prompt is too long|input length"
+    r"|too many (?:input )?tokens",
+    re.IGNORECASE,
+)
+
+
+def _is_context_overflow(error: BaseException) -> bool:
+    """Whether a judge call failed with a 4xx that says the request exceeds the judge's context window."""
+    status = getattr(error, "status", None)
+    if not isinstance(status, int) or not 400 <= status < 500:
+        return False
+    body = getattr(error, "response_content", None)
+    if isinstance(body, bytes):
+        body = body.decode("utf-8", errors="replace")
+    return bool(_CONTEXT_OVERFLOW_PATTERN.search(f"{getattr(error, 'message', '')} {body or ''}"))
+
+
 def raise_unparseable_verdict(server: str, judge_output: str) -> None:
     """Raise the JudgeError for a judge reply that carries no verdict the server can read.
 
@@ -85,6 +114,7 @@ async def call_judge(
     url_path: str,
     json: Any,
     response_model: Type[ResponseT],
+    overflow_is_the_models: bool = False,
 ) -> ResponseT:
     """POST to a judge model server and parse the reply; raise JudgeError on failure.
 
@@ -92,11 +122,18 @@ async def call_judge(
     ``/v1/chat/completions``), paired with the matching ``response_model``. The
     status check comes before parsing so an auth or server error reports the HTTP
     failure itself, not a validation error against the error body.
+    ``overflow_is_the_models`` says the judge input carries nothing long but the model's answer, so a
+    context-length rejection is the model's final 0 (``JudgeInputTooLongError``), not a retried judge failure.
     """
 
     async def _call() -> ResponseT:
         http_response = await server_client.post(server_name=server_name, url_path=url_path, json=json)
-        await raise_for_status(http_response)
+        try:
+            await raise_for_status(http_response)
+        except Exception as e:
+            if overflow_is_the_models and _is_context_overflow(e):
+                raise JudgeInputTooLongError(f"{type(e).__name__}: {e}") from e
+            raise
         return response_model.model_validate(await get_response_json(http_response))
 
     return await reraise_judge_errors(_call())
@@ -122,6 +159,17 @@ def judge_failsafe(verify_fn: Callable) -> Callable:
                 raise RuntimeError("judge_failsafe: could not locate the verify request body") from e
             error = str(e)[:2000]
             data = body.model_dump()
+            if isinstance(e, JudgeInputTooLongError):
+                # The model's own answer did not fit the judge: a final failure, scored 0, in training too.
+                data |= {
+                    "reward": 0.0,
+                    "mask_sample": False,
+                    "failure_kind": "judge_input_too_long",
+                    "failure_reason": error,
+                    "_ng_failure_class": "judge_input_too_long",
+                    "_ng_failure_judge_error": error,
+                }
+                return JSONResponse(content=jsonable_encoder(data))
             instance_config = data.get("instance_config")
             data |= {
                 "reward": 0.0,

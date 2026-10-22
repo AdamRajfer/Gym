@@ -276,6 +276,21 @@ def test_a_resubmitted_job_resets_its_retry_count_once(tmp_path: Path) -> None:
     assert (tmp_path / RETRY_FILE_NAME).read_text() == "2\n"
 
 
+def test_a_resubmitted_job_starts_a_fresh_walltime_budget(tmp_path: Path) -> None:
+    """A chain stopped at the walltime cap says to resubmit; the resubmitted chain gets the whole budget again."""
+    prologue = render_resume_prologue(ResumeConfig(max_walltime="01:00:00"))
+    walltime = tmp_path / ".gym_accumulated_walltime"
+    walltime.write_text("3700\n")
+
+    _run_prologue(prologue, tmp_path, {"GYM_RESUBMIT": "1"})
+
+    assert not walltime.exists()
+
+    walltime.write_text("1200\n")
+    _run_prologue(prologue, tmp_path, {})
+    assert walltime.read_text() == "1200\n"
+
+
 def _run_args(script: str, job_dir: Path, env: dict[str, str]) -> list[str]:
     """The `gym eval run` arguments job.sh builds, run through bash from its job dir."""
     start = script.index("GYM_CMD=(")

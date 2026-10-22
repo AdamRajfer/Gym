@@ -58,12 +58,13 @@ _gym_stop_incomplete() {{
     exit 1
 }}
 
-# A job queued by `gym eval resubmit` starts a fresh retry count. The variable is read once and unset,
+# A job queued by `gym eval resubmit` starts a fresh retry count and a fresh walltime budget: a chain
+# stopped at the walltime cap says "resubmit to continue". The variable is read once and unset,
 # so the follow-up queued below (which inherits this environment) is an ordinary chain hop.
 _gym_resubmit="${{{resubmit_env}:-}}"
 unset {resubmit_env}
 if [[ "$_gym_resubmit" == 1 ]]; then
-    rm -f "$_retry_file"
+    rm -f "$_retry_file" "$_walltime_file"
 fi
 
 if [[ "$_prev_slurm_job_id" != "" ]]; then

@@ -195,9 +195,8 @@ class _FailingProvider(FakeSandboxProvider):
 
 
 def _sdk_error(message: str, status: int):
-    from opensandbox.exceptions import SandboxApiException
-
-    return SandboxApiException(message, status_code=status)
+    sdk = pytest.importorskip("opensandbox.exceptions", reason="opensandbox SDK is not installed")
+    return sdk.SandboxApiException(message, status_code=status)
 
 
 class TestASandboxThatNeverStartedIsInfra:
@@ -207,14 +206,16 @@ class TestASandboxThatNeverStartedIsInfra:
     @pytest.mark.parametrize(
         "failure",
         [
-            {"create_error": _sdk_error("Sandbox ready timeout after create retries", 504)},
-            {"create_error": SandboxOperationTimeoutError("Timed out during OpenSandbox create after 600s")},
-            {"create_error": RuntimeError("provider control plane refused the request")},
-            {"upload_error": _sdk_error("upload of the task files failed", 500)},
+            {"create_error": lambda: _sdk_error("Sandbox ready timeout after create retries", 504)},
+            {"create_error": lambda: SandboxOperationTimeoutError("Timed out during OpenSandbox create after 600s")},
+            {"create_error": lambda: RuntimeError("provider control plane refused the request")},
+            {"upload_error": lambda: _sdk_error("upload of the task files failed", 500)},
         ],
         ids=["create-504-ready-timeout", "start-timeout", "unexpected-create-error", "start-upload"],
     )
     async def test_a_create_or_start_failure_is_a_retried_create_error(self, failure: dict) -> None:
+        # The SDK error is built in the test, so a missing optional SDK skips only the cases that need it.
+        failure = {key: make() for key, make in failure.items()}
         sandbox = AsyncSandbox(_FailingProvider(**failure), spec=SandboxSpec(image="task", files={"/task.txt": "x"}))
 
         with pytest.raises(SandboxCreateError) as raised:
@@ -234,6 +235,7 @@ class TestASandboxThatNeverStartedIsInfra:
 
     @pytest.mark.asyncio
     async def test_a_provider_create_error_passes_through_unwrapped(self) -> None:
+        pytest.importorskip("opensandbox", reason="opensandbox SDK is not installed")
         from nemo_gym.sandbox.providers.opensandbox import OpenSandboxCreateError
 
         original = OpenSandboxCreateError("pool exhausted")

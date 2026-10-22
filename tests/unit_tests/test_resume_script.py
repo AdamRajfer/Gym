@@ -19,7 +19,11 @@ import subprocess
 import pytest
 
 from nemo_gym.orchestration.api import ResumeConfig
-from nemo_gym.orchestration.executors.resume_script import _walltime_to_seconds, render_resume_prologue
+from nemo_gym.orchestration.executors.resume_script import (
+    INCOMPLETE_MARKER_NAME,
+    _walltime_to_seconds,
+    render_resume_prologue,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -209,3 +213,47 @@ def test_a_requeue_retries_a_follow_up_that_failed_to_submit(tmp_path):
     assert "Failed to submit auto-resume follow-up" in failed.stdout
     assert "Auto-resume follow-up queued: 999" in requeued.stdout
     assert len(_sbatch_calls(tmp_path)) == 2
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="bash not installed")
+def test_a_chain_stopped_at_the_walltime_cap_exits_non_zero_and_marks_the_run_incomplete(tmp_path):
+    (tmp_path / ".gym_accumulated_walltime").write_text("3590")
+
+    result = _run_prologue(tmp_path, ResumeConfig(max_walltime="01:00:00"), "TIMEOUT")
+
+    assert result.returncode == 1, result.stdout
+    assert "REACHED_WORK" not in result.stdout
+    assert "walltime cap with rollouts missing; resubmit to continue" in result.stdout
+    assert "walltime cap" in (tmp_path / INCOMPLETE_MARKER_NAME).read_text()
+    assert not (tmp_path / "sbatch_calls").exists()
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="bash not installed")
+@pytest.mark.parametrize("state", ["CANCELLED", "CANCELLED by 1234"])
+def test_a_chain_stopped_after_a_cancel_exits_non_zero_and_marks_the_run_incomplete(tmp_path, state):
+    result = _run_prologue(tmp_path, ResumeConfig(), state)
+
+    assert result.returncode == 1, result.stdout
+    assert "REACHED_WORK" not in result.stdout
+    assert "was cancelled. Chain stopped with rollouts missing; resubmit to continue." in result.stdout
+    assert (tmp_path / INCOMPLETE_MARKER_NAME).exists()
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="bash not installed")
+def test_a_chain_whose_previous_job_completed_still_exits_zero(tmp_path):
+    result = _run_prologue(tmp_path, ResumeConfig(max_walltime="01:00:00"), "COMPLETED")
+
+    assert result.returncode == 0, result.stdout
+    assert "REACHED_WORK" not in result.stdout
+    assert not (tmp_path / INCOMPLETE_MARKER_NAME).exists()
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="bash not installed")
+def test_a_chain_that_continues_clears_an_earlier_incomplete_marker(tmp_path):
+    (tmp_path / INCOMPLETE_MARKER_NAME).write_text("stopped earlier")
+
+    result = _run_prologue(tmp_path, ResumeConfig(max_walltime="10:00:00"), "TIMEOUT")
+
+    assert result.returncode == 0, result.stdout
+    assert "REACHED_WORK" in result.stdout
+    assert not (tmp_path / INCOMPLETE_MARKER_NAME).exists()

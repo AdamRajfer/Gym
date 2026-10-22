@@ -102,11 +102,20 @@ if [[ "$*" == *ElapsedRaw* ]]; then echo "${FAKE_ELAPSED:-}"; else echo "${FAKE_
 """
 _FAKE_SBATCH = """#!/bin/bash
 echo "$*" >> "$FAKE_LOG_DIR/sbatch_calls"
+if [[ -n "${FAKE_SBATCH_FAILS:-}" ]]; then echo "sbatch: error: Socket timed out"; exit 1; fi
 echo "Submitted batch job 999"
 """
 
 
-def _run_prologue(tmp_path, resume: ResumeConfig, prev_state: str | None) -> subprocess.CompletedProcess:
+def _run_prologue(
+    tmp_path,
+    resume: ResumeConfig,
+    prev_state: str | None,
+    *,
+    job_id: str = "200",
+    prev_job_id: str = "100",
+    sbatch_fails: bool = False,
+) -> subprocess.CompletedProcess:
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir(exist_ok=True)
     for name, body in (("sacct", _FAKE_SACCT), ("sbatch", _FAKE_SBATCH), ("sleep", "#!/bin/bash\n")):
@@ -115,13 +124,14 @@ def _run_prologue(tmp_path, resume: ResumeConfig, prev_state: str | None) -> sub
         tool.chmod(0o755)
     script = tmp_path / "job.sh"
     script.write_text(render_resume_prologue(resume) + "\necho REACHED_WORK\n")
-    args = ["bash", str(script)] + ([] if prev_state is None else ["100"])
+    args = ["bash", str(script)] + ([] if prev_state is None else [prev_job_id])
     env = {
         "PATH": f"{bin_dir}:/usr/bin:/bin",
-        "SLURM_JOB_ID": "200",
+        "SLURM_JOB_ID": job_id,
         "FAKE_LOG_DIR": str(tmp_path),
         "FAKE_STATE": prev_state or "",
         "FAKE_ELAPSED": "60" if prev_state else "",
+        **({"FAKE_SBATCH_FAILS": "1"} if sbatch_fails else {}),
     }
     return subprocess.run(args, cwd=tmp_path, env=env, capture_output=True, text=True)
 
@@ -158,3 +168,44 @@ def test_successor_is_killed_if_its_dependency_can_never_be_met(tmp_path):
     sbatch_args = (tmp_path / "sbatch_calls").read_text()
     assert "--dependency=afternotok:200" in sbatch_args
     assert "--kill-on-invalid-dep=yes" in sbatch_args
+
+
+def _sbatch_calls(tmp_path) -> list[str]:
+    calls = tmp_path / "sbatch_calls"
+    return calls.read_text().splitlines() if calls.exists() else []
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="bash not installed")
+@pytest.mark.parametrize("prev_state", [None, "TIMEOUT"])
+def test_a_requeued_job_does_not_queue_a_second_follow_up(tmp_path, prev_state):
+    """Slurm reruns job.sh under the same job id on a requeue (node failure, preemption with --requeue)."""
+    first = _run_prologue(tmp_path, ResumeConfig(), prev_state)
+    requeued = _run_prologue(tmp_path, ResumeConfig(), prev_state)
+
+    assert "REACHED_WORK" in first.stdout and "REACHED_WORK" in requeued.stdout
+    assert _sbatch_calls(tmp_path) == [_sbatch_calls(tmp_path)[0]]
+    assert "--dependency=afternotok:200" in _sbatch_calls(tmp_path)[0]
+    assert "already queued" in requeued.stdout
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="bash not installed")
+def test_each_resumed_segment_still_queues_its_own_follow_up(tmp_path):
+    _run_prologue(tmp_path, ResumeConfig(), None, job_id="200")
+    _run_prologue(tmp_path, ResumeConfig(), None, job_id="200")  # requeue of the first segment
+    resumed = _run_prologue(tmp_path, ResumeConfig(), "TIMEOUT", job_id="999", prev_job_id="200")
+
+    assert "REACHED_WORK" in resumed.stdout
+    assert [call.split()[0] for call in _sbatch_calls(tmp_path)] == [
+        "--dependency=afternotok:200",
+        "--dependency=afternotok:999",
+    ]
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="bash not installed")
+def test_a_requeue_retries_a_follow_up_that_failed_to_submit(tmp_path):
+    failed = _run_prologue(tmp_path, ResumeConfig(), None, sbatch_fails=True)
+    requeued = _run_prologue(tmp_path, ResumeConfig(), None)
+
+    assert "Failed to submit auto-resume follow-up" in failed.stdout
+    assert "Auto-resume follow-up queued: 999" in requeued.stdout
+    assert len(_sbatch_calls(tmp_path)) == 2

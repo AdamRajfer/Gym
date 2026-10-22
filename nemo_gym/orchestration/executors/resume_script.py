@@ -77,13 +77,22 @@ if [[ "$_prev_slurm_job_id" != "" ]]; then
 fi
 
 echo "$SLURM_JOB_ID" >> "$OUTPUT_DIR/.gym_job_chain"
+# A requeued job keeps its job id and runs this script again. One follow-up per job id, so a requeue
+# does not queue a second one on the same dependency. mkdir is atomic on shared filesystems.
+_guard_marker="$OUTPUT_DIR/.gym_followup_queued.$SLURM_JOB_ID"
+if ! mkdir "$_guard_marker" 2>/dev/null; then
+    echo "Auto-resume follow-up for job $SLURM_JOB_ID is already queued (requeued job). Not queueing another."
 # kill-on-invalid-dep: without it, clusters lacking kill_invalid_depend keep the successor pending forever.
-_next_output=$(sbatch --dependency=afternotok:$SLURM_JOB_ID --kill-on-invalid-dep=yes "$_this_script" $SLURM_JOB_ID 2>&1) && {{
+elif _next_output=$(sbatch --dependency=afternotok:$SLURM_JOB_ID --kill-on-invalid-dep=yes "$_this_script" $SLURM_JOB_ID 2>&1); then
     _next_id=$(echo "$_next_output" | grep -oE '[0-9]+')
     if [[ -n "$_next_id" ]]; then
         echo "Auto-resume follow-up queued: $_next_id (afternotok:$SLURM_JOB_ID)"
     fi
-}} || echo "WARNING: Failed to submit auto-resume follow-up. Chain will NOT continue on failure."
+else
+    # Release the marker so a requeue of this job can try again.
+    rmdir "$_guard_marker" 2>/dev/null
+    echo "WARNING: Failed to submit auto-resume follow-up. Chain will NOT continue on failure."
+fi
 """
 
 _MAX_WALLTIME_CHECK_TEMPLATE = """\

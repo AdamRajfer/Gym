@@ -852,6 +852,20 @@ class TestArenaResourcesServer:
         assert row["_ng_failure_judge_attempts"] == 3
         assert "unparseable" in row["_ng_failure_judge_error"]
         assert is_terminal_failure(row)  # Resume never re-dispatches the rollout for it.
+        assert row["_ng_failure_cause"] == "model"  # The judge answered three times without a verdict.
+
+    async def test_a_judge_outage_at_the_cap_is_unresolved_infra_not_a_lost_game(
+        self, server: ArenaResourcesServer, judged_in_evaluation: None
+    ):
+        # A bad key never recovers: scoring it as the model's 0 would publish a score near 0.
+        game1, _ = self._recording_judge(server, [401, 401, 401], ["Final: [[B>A]]"])
+
+        row = json.loads((await judge_failsafe(server.verify)(body=self._make_verify_request("Answer."))).body)
+
+        assert len(game1) == 3 and len(set(game1)) == 1
+        assert (row["_ng_failure_cause"], row["_ng_failure_judge_settled"]) == ("infra", True)
+        assert not is_terminal_failure(row)  # Left out of the score, counted as infra-unresolved.
+        assert row["_ng_failure_judge_attempts"] == 3
 
     @mark.parametrize("status", [401, 429, 500])
     async def test_training_keeps_a_failed_judge_call_as_a_skipped_game(

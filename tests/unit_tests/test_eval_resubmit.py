@@ -229,6 +229,23 @@ def test_two_concurrent_resubmits_queue_one_job(tmp_path: Path, slurm_bin: Path)
     assert not (job_dir / ".gym_resubmit.lock").exists()
 
 
+@pytest.mark.parametrize("held_as", ["file", "directory"])
+def test_a_held_lock_refuses_even_when_mkdir_reports_success(tmp_path: Path, slurm_bin: Path, held_as: str) -> None:
+    # uutils coreutils 0.10.0's mkdir exits 0 for a racer that lost; this stub does that every time, so the lock
+    # must not depend on mkdir. A directory is the lock an older Gym left behind.
+    (slurm_bin / "mkdir").write_text("#!/bin/bash\nexit 0\n")
+    (slurm_bin / "mkdir").chmod(0o755)
+    job_dir = _staged_run(tmp_path)
+    lock = job_dir / ".gym_resubmit.lock"
+    lock.mkdir() if held_as == "directory" else lock.touch()
+
+    with pytest.raises(RuntimeError, match="another resubmit holds"):
+        resubmit(*_handle(job_dir))
+
+    assert not (slurm_bin / "cwd").exists()
+    assert lock.exists()
+
+
 # --- The resubmit only queues; the job resets its own run state ---------------------------------------------
 
 

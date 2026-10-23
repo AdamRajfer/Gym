@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 import shutil
 import subprocess
 
@@ -107,8 +108,8 @@ if [[ "$*" == *ElapsedRaw* ]]; then echo "${FAKE_ELAPSED:-}"; else echo "${FAKE_
 _FAKE_SBATCH = """#!/bin/bash
 echo "$*" >> "$FAKE_LOG_DIR/sbatch_calls"
 if [[ -n "${FAKE_SBATCH_FAILS:-}" ]]; then echo "sbatch: error: Socket timed out"; exit 1; fi
-# The queued follow-up waits on its dependency, as squeue would list it.
-echo "999 ${1#--dependency=}(unfulfilled)" >> "$FAKE_LOG_DIR/pending"
+# The queued follow-up waits on its dependency in this job dir, as squeue would list it.
+echo "999|${1#--dependency=}(unfulfilled)|$PWD" >> "$FAKE_LOG_DIR/pending"
 echo "Submitted batch job 999"
 """
 _FAKE_SQUEUE = """#!/bin/bash
@@ -188,6 +189,11 @@ def test_successor_is_killed_if_its_dependency_can_never_be_met(tmp_path):
     assert "--kill-on-invalid-dep=yes" in sbatch_args
 
 
+def _job_dir(tmp_path) -> str:
+    # The prologue's OUTPUT_DIR is the shell's $PWD, the physical path of the job dir.
+    return os.path.realpath(tmp_path)
+
+
 def _sbatch_calls(tmp_path) -> list[str]:
     calls = tmp_path / "sbatch_calls"
     return calls.read_text().splitlines() if calls.exists() else []
@@ -236,7 +242,7 @@ def test_the_claim_records_the_follow_up_and_a_requeue_finds_it_pending(tmp_path
 def test_an_empty_claim_with_its_follow_up_pending_queues_none(tmp_path):
     """The shell died after sbatch queued the follow-up but before the claim recorded its id."""
     (tmp_path / ".gym_followup_queued.200").touch()
-    (tmp_path / "pending").write_text("999 afternotok:200(unfulfilled)\n")
+    (tmp_path / "pending").write_text(f"999|afternotok:200(unfulfilled)|{_job_dir(tmp_path)}\n")
 
     requeued = _run_prologue(tmp_path, ResumeConfig(), None)
 
@@ -247,7 +253,10 @@ def test_an_empty_claim_with_its_follow_up_pending_queues_none(tmp_path):
 @pytest.mark.skipif(shutil.which("bash") is None, reason="bash not installed")
 def test_a_follow_up_pending_on_another_job_does_not_count(tmp_path):
     (tmp_path / ".gym_followup_queued.200").touch()
-    (tmp_path / "pending").write_text("998 afternotok:2000(unfulfilled)\n997 afterok:200(unfulfilled)\n")
+    job_dir = _job_dir(tmp_path)
+    (tmp_path / "pending").write_text(
+        f"998|afternotok:2000(unfulfilled)|{job_dir}\n997|afterok:200(unfulfilled)|{job_dir}\n"
+    )
 
     _run_prologue(tmp_path, ResumeConfig(), None)
 
@@ -330,3 +339,36 @@ def test_a_chain_that_continues_clears_an_earlier_incomplete_marker(tmp_path):
     assert result.returncode == 0, result.stdout
     assert "REACHED_WORK" in result.stdout
     assert not (tmp_path / INCOMPLETE_MARKER_NAME).exists()
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="bash not installed")
+@pytest.mark.parametrize("claim", ["file", "directory"])
+def test_a_dependent_job_of_another_run_is_not_this_runs_follow_up(tmp_path, claim):
+    """Another run's job waits on this job id too; only a job in this job dir is this run's follow-up."""
+    marker = tmp_path / ".gym_followup_queued.200"
+    marker.mkdir() if claim == "directory" else marker.touch()
+    (tmp_path / "pending").write_text("998|afternotok:200(unfulfilled)|/another/run/dir\n")
+
+    requeued = _run_prologue(tmp_path, ResumeConfig(), None)
+
+    assert "REACHED_WORK" in requeued.stdout
+    assert len(_sbatch_calls(tmp_path)) == 1
+    assert "--dependency=afternotok:200" in _sbatch_calls(tmp_path)[0]
+    assert marker.read_text() == "999\n"
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="bash not installed")
+@pytest.mark.parametrize("claim", ["empty", "recorded", "directory"])
+def test_a_follow_up_pending_in_this_job_dir_queues_none(tmp_path, claim):
+    marker = tmp_path / ".gym_followup_queued.200"
+    if claim == "directory":
+        marker.mkdir()
+    else:
+        marker.write_text("" if claim == "empty" else "999\n")
+    (tmp_path / "pending").write_text(f"999|afternotok:200(unfulfilled)|{_job_dir(tmp_path)}\n")
+
+    requeued = _run_prologue(tmp_path, ResumeConfig(), None)
+
+    assert "REACHED_WORK" in requeued.stdout
+    assert "already queued: 999" in requeued.stdout
+    assert _sbatch_calls(tmp_path) == []

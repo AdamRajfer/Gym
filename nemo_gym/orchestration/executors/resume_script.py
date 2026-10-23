@@ -114,12 +114,20 @@ _gym_claim_followup() {{ (set -C; : > "$_guard_marker") 2>/dev/null; }}
 _gym_queue_followup=1
 if ! _gym_claim_followup; then
     _gym_queue_followup=0
-    # squeue's %E lists the dependencies, e.g. "afternotok:123(unfulfilled)".
-    if ! _pending=$(squeue --me --noheader --states=PENDING --format='%i %E' 2>&1); then
+    # squeue's %E lists the dependencies, e.g. "afternotok:123(unfulfilled)", and %Z the job's working directory.
+    # The follow-up runs in this job dir (--chdir), so a dependent job of another run does not count.
+    if ! _pending=$(squeue --me --noheader --states=PENDING --format='%i|%E|%Z' 2>&1); then
         # Unknown is not none: a second follow-up would run the job dir twice, so keep the claim.
         echo "WARNING: squeue failed ($_pending); keeping the follow-up claim of job $SLURM_JOB_ID. Not queueing another."
-    elif _followup=$(echo "$_pending" | grep -E "[ ,]afternotok:$SLURM_JOB_ID([(,]|$)" | cut -d' ' -f1 | head -n 1) \\
-            && [[ -n "$_followup" ]]; then
+    elif _followup=$(
+            while IFS='|' read -r _id _deps _cwd; do
+                [[ "$_cwd" == "$OUTPUT_DIR" ]] || continue
+                if grep -qE "(^|[ ,])afternotok:$SLURM_JOB_ID([(,]|$)" <<< "$_deps"; then
+                    echo "$_id"
+                    break
+                fi
+            done <<< "$_pending"
+        ) && [[ -n "$_followup" ]]; then
         echo "Auto-resume follow-up for job $SLURM_JOB_ID is already queued: $_followup (requeued job). Not queueing another."
     else
         echo "Follow-up claim of job $SLURM_JOB_ID has no pending follow-up (submission interrupted). Queueing one."

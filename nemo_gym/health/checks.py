@@ -448,6 +448,8 @@ def _bind_policy_call_views(
             matched_calls=tuple(matched_calls),
             missing_references=tuple(missing_references),
             duplicated_references=tuple(duplicated_references),
+            # What each reference resolved to, for the hollow-turn exemption. A missing reference resolves to (),
+            # so its empty turn stays flagged.
             resolutions={
                 _call_reference_signature(raw_reference): tuple(resolved[_call_reference_signature(raw_reference)])
                 for _, raw_reference in reference_items

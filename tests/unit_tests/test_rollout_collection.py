@@ -15,7 +15,9 @@
 import asyncio
 import gc
 import json
+import os
 import pickle
+import shutil
 import signal
 import sys
 import time
@@ -63,7 +65,7 @@ from nemo_gym.global_config import (
 )
 from nemo_gym.health.types import RunHealthLimits
 from nemo_gym.openai_utils import NeMoGymResponseCreateParamsNonStreaming
-from nemo_gym.path_utils import materialized_path_for
+from nemo_gym.path_utils import aggregation_sources_path_for, materialized_path_for
 from nemo_gym.reward_profile import compute_aggregate_metrics, compute_subset_metrics
 from nemo_gym.rollout_collection import (
     _DEFAULT_MAX_ROLLOUT_ATTEMPTS,
@@ -111,6 +113,7 @@ from nemo_gym.rollout_collection import (
     loads_jsonl_line,
 )
 from nemo_gym.rollout_correlation import maybe_rollout_id_from_run_body
+from nemo_gym.rollout_health import health_check_run_dir
 from nemo_gym.rollout_reverification import RolloutReverificationConfig
 from nemo_gym.server_utils import ClientDisconnectCancellationMiddleware, ServerClient
 from nemo_gym.telemetry.gym_metrics import ROLLOUT_COMPLETED_INSTRUMENT
@@ -8348,6 +8351,153 @@ class TestRolloutAggregationHelper:
 
         artifacts = orjson.loads((tmp_path / "quality_summary.json").read_bytes())["run"]["artifacts"]
         assert (artifacts["expected"], artifacts["failed"]["total"], artifacts["healthy"]) == (2, 1, True)
+
+    def _landed_and_failed_runs(self, root: Path, *, same_indices: bool) -> tuple[Path, Path]:
+        """run_a landed its rollout after a failed attempt; run_b landed nothing after two failed attempts."""
+        run_a = root / "run_a" / "rollouts.jsonl"
+        run_b = root / "run_b" / "rollouts.jsonl"
+        b_task = 0 if same_indices else 1
+        self._write_rows(materialized_path_for(run_a), self._rollout(0, "agent_a"))
+        self._write_rows(run_a, self._rollout(0, "agent_a", reward=1.0))
+        self._write_rows(
+            _failures_path_for(run_a),
+            self._rollout(0, "agent_a", **{NG_FAILURE_CLASS_KEY: AGENT_RUN_ERROR_FAILURE_CLASS}),
+        )
+        self._write_rows(materialized_path_for(run_b), self._rollout(b_task, "agent_b"))
+        self._write_rows(run_b)
+        self._write_rows(
+            _failures_path_for(run_b),
+            self._rollout(b_task, "agent_b", **{NG_FAILURE_CLASS_KEY: AGENT_RUN_ERROR_FAILURE_CLASS}),
+            self._rollout(b_task, "agent_b", **{NG_FAILURE_CLASS_KEY: "timeout_exceeded"}),
+        )
+        return run_a, run_b
+
+    async def _merge(self, monkeypatch: pytest.MonkeyPatch, merged_dir: Path, *shards: Path, **config) -> Path:
+        self._serve(monkeypatch, {}, {"env_a": "agent_a", "env_b": "agent_b"})
+        await RolloutAggregationHelper().run_from_config(
+            RolloutAggregationConfig(
+                input_glob=",".join(str(shard) for shard in shards),
+                output_jsonl_fpath=str(merged_dir / "rollouts.jsonl"),
+                **config,
+            )
+        )
+        return merged_dir / "quality_summary.json"
+
+    @staticmethod
+    def _accounting(run: dict) -> dict:
+        """The run section without the limits' source, which a recheck records as persisted."""
+        artifacts = {
+            **run["artifacts"],
+            "limits": {k: v for k, v in run["artifacts"]["limits"].items() if k != "source"},
+        }
+        return {**run, "artifacts": artifacts}
+
+    @pytest.mark.parametrize("same_indices", [False, True], ids=["own indices", "both at 0/0"])
+    async def test_a_recheck_of_a_merged_directory_counts_what_the_aggregation_counted(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, empty_global_config: MagicMock, same_indices: bool
+    ) -> None:
+        """The merged rows have none of the shards' failures or inventories; the recheck reads the shards."""
+        run_a, run_b = self._landed_and_failed_runs(tmp_path, same_indices=same_indices)
+        merged_dir = tmp_path / "merged"
+
+        aggregated = orjson.loads((await self._merge(monkeypatch, merged_dir, run_a, run_b)).read_bytes())["run"]
+        rechecked = health_check_run_dir(merged_dir).summary["run"]
+
+        assert self._accounting(rechecked) == self._accounting(aggregated)
+        artifacts = rechecked["artifacts"]
+        # run_a's landed (0, 0) neither hides run_b's failure nor counts its own earlier attempt; run_b's last
+        # attempt stands.
+        assert (artifacts["expected"], artifacts["missing"], artifacts["failed"]["total"]) == (2, 0, 1)
+        assert artifacts["failed"]["by_class"] == {"timeout_exceeded": 1}
+        assert rechecked["verdicts"] == aggregated["verdicts"]
+
+    async def test_a_recheck_reads_the_shards_after_the_tree_moved(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, empty_global_config: MagicMock
+    ) -> None:
+        run_a, run_b = self._landed_and_failed_runs(tmp_path / "tree", same_indices=True)
+        aggregated = orjson.loads(
+            (await self._merge(monkeypatch, tmp_path / "tree" / "merged", run_a, run_b)).read_bytes()
+        )
+        shutil.move(tmp_path / "tree", tmp_path / "moved")
+
+        rechecked = health_check_run_dir(tmp_path / "moved" / "merged").summary["run"]
+
+        assert self._accounting(rechecked) == self._accounting(aggregated["run"])
+        sources = orjson.loads(
+            aggregation_sources_path_for(tmp_path / "moved" / "merged" / "rollouts.jsonl").read_bytes()
+        )
+        assert sources["shards"] == ["../run_a/rollouts.jsonl", "../run_b/rollouts.jsonl"]
+
+    async def test_an_explicit_rollouts_file_is_checked_alone(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, empty_global_config: MagicMock
+    ) -> None:
+        run_a, run_b = self._landed_and_failed_runs(tmp_path, same_indices=True)
+        merged_dir = tmp_path / "merged"
+        await self._merge(monkeypatch, merged_dir, run_a, run_b, disable_health_check=True)
+
+        artifacts = health_check_run_dir(merged_dir, rollout_file="rollouts.jsonl").summary["run"]["artifacts"]
+
+        # The merged file has no sidecar or inventory of its own.
+        assert (artifacts["expected"], artifacts["failed"]) == (None, None)
+
+    @pytest.mark.parametrize("change", ["appended", "removed", "never moved into place", "shard list cut short"])
+    async def test_a_recheck_refuses_a_merged_file_the_aggregation_did_not_leave(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, empty_global_config: MagicMock, change: str
+    ) -> None:
+        """The shards are no longer what the merged file holds, or the aggregation stopped part way: checking
+        either would report a run that is not there."""
+        run_a, run_b = self._landed_and_failed_runs(tmp_path, same_indices=True)
+        merged_dir = tmp_path / "merged"
+        merged = merged_dir / "rollouts.jsonl"
+        if change == "never moved into place":
+
+            def interrupted(source, target):
+                raise OSError("interrupted")
+
+            with monkeypatch.context() as patched:
+                patched.setattr(os, "replace", interrupted)
+                with pytest.raises(OSError, match="interrupted"):
+                    await self._merge(monkeypatch, merged_dir, run_a, run_b)
+            # The shard list is in place, the merged file is not, and its partial copy is cleaned up.
+            assert sorted(path.name for path in merged_dir.iterdir()) == ["rollouts_sources.json"]
+        else:
+            await self._merge(monkeypatch, merged_dir, run_a, run_b, disable_health_check=True)
+            if change == "appended":
+                with merged.open("ab") as out:
+                    out.write(orjson.dumps(self._rollout(5, "agent_a", reward=1.0)) + b"\n")
+            elif change == "removed":
+                merged.unlink()
+            else:
+                sources = aggregation_sources_path_for(merged)
+                sources.write_bytes(sources.read_bytes()[:20])
+
+        error = "Unreadable shard list" if change == "shard list cut short" else "is not the file `gym eval aggregate`"
+        with pytest.raises(ValueError, match=error):
+            health_check_run_dir(merged_dir)
+        assert not (merged_dir / "quality_summary.json").exists()
+
+    async def test_a_recheck_refuses_when_a_shard_is_gone(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, empty_global_config: MagicMock
+    ) -> None:
+        run_a, run_b = self._landed_and_failed_runs(tmp_path, same_indices=True)
+        merged_dir = tmp_path / "merged"
+        summary_fpath = await self._merge(monkeypatch, merged_dir, run_a, run_b)
+        aggregated = summary_fpath.read_bytes()
+        run_b.unlink()
+
+        with pytest.raises(FileNotFoundError, match="run_b/rollouts.jsonl"):
+            health_check_run_dir(merged_dir)
+        assert summary_fpath.read_bytes() == aggregated
+
+    async def test_shards_left_unmerged_are_not_listed(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, empty_global_config: MagicMock
+    ) -> None:
+        run_a, run_b = self._landed_and_failed_runs(tmp_path, same_indices=True)
+        merged_dir = tmp_path / "merged"
+
+        await self._merge(monkeypatch, merged_dir, run_a, run_b, merge_shards=False, disable_health_check=True)
+
+        assert not aggregation_sources_path_for(merged_dir / "rollouts.jsonl").exists()
 
     @pytest.mark.parametrize("run1_has", ["a row", "a failure"])
     async def test_runs_that_reuse_task_indices_do_not_hide_each_others_lost_rollouts(

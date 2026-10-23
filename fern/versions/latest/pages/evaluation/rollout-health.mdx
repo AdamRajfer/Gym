@@ -50,6 +50,11 @@ gym eval health-check results/my-run \
 A relative `--rollouts-file` path resolves under the run directory. An absolute path is used as written. Reports from the
 standalone command are always written in the run directory.
 
+A directory that `gym eval aggregate` merged shards into is checked from those shards, listed in `rollouts_sources.json`,
+because the merged `rollouts.jsonl` has none of their failure sidecars or materialized inputs. The check counts the same
+rollouts the aggregation counted, and fails if a shard is gone or the merged file changed since. An explicit
+`--rollouts-file` checks that file alone.
+
 Refer to the [`gym eval` CLI reference](/main/reference/cli-commands#gym-eval-health-check) for all flags.
 
 ## Required Evidence

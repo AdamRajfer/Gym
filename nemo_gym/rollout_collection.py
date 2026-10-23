@@ -4658,7 +4658,10 @@ class RolloutAggregationConfig(RunHealthConfig, BaseNeMoGymCLIConfig):
     )
     merge_shards: bool = Field(
         default=True,
-        description="Concatenate the matched shard JSONLs into output_jsonl_fpath alongside the metrics file.",
+        description=(
+            "Concatenate the matched shard JSONLs into output_jsonl_fpath alongside the metrics file, and list "
+            "them in '<stem>_sources.json' for `gym eval health-check` of that directory to read."
+        ),
     )
     count_failure_classes_as_zero: List[str] = Field(
         default_factory=list,
@@ -4783,10 +4786,22 @@ class RolloutAggregationHelper(BaseModel):
             batch_tracker.write_status(batch_completed_rows, batch_failure_rows, force=True)
 
         if config.merge_shards:
+            from nemo_gym.rollout_health import write_aggregation_sources
+
             print(f"Merging shards into {output_fpath}")
-            with output_fpath.open("wb") as out:
-                for r in results:
-                    out.write(orjson.dumps(r) + b"\n")
+            # The merged rows have none of the shards' failures or inventories, so a recheck of this directory reads
+            # the shards. Their list is written before the merged file takes its place: never one without the other.
+            merging_fpath = output_fpath.with_name(f".{output_fpath.name}.{os.getpid()}.merging")
+            try:
+                with merging_fpath.open("wb") as out:
+                    for r in results:
+                        out.write(orjson.dumps(r) + b"\n")
+                write_aggregation_sources(
+                    output_fpath, [Path(path) for path in input_paths], merging_fpath.stat().st_size
+                )
+                os.replace(merging_fpath, output_fpath)
+            finally:
+                merging_fpath.unlink(missing_ok=True)
 
         # `_call_aggregate_metrics` groups by the `_ng_environment_server` stamp, falling back to
         # AGENT_REF_KEY_NAME; result rows carry both from the run that produced them.

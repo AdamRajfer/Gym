@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any
 
 import orjson
+from pydantic import BaseModel, ValidationError
 
 from nemo_gym.health.checks import (
     _INCOMPLETE_MODEL_CALL_GAPS,
@@ -66,7 +67,7 @@ from nemo_gym.health.types import (
     _TaskRepeat,
     _WorkerInput,
 )
-from nemo_gym.path_utils import failures_path_for, materialized_path_for
+from nemo_gym.path_utils import aggregation_sources_path_for, failures_path_for, materialized_path_for
 
 
 _PROCESS_POOL_CHUNKS_PER_WORKER = 4
@@ -770,6 +771,57 @@ def _persisted_limits(run_dir: Path) -> RunHealthLimits:
         return RunHealthLimits()
 
 
+class _AggregationSources(BaseModel):
+    """What `gym eval aggregate` merged into a rollout file: the shards, in its order, and the merged file's size."""
+
+    shards: list[str]
+    merged_bytes: int
+
+
+def write_aggregation_sources(merged_fpath: Path, shard_paths: Sequence[Path], merged_bytes: int) -> None:
+    """Record the shards ``merged_fpath`` is merged from, for a recheck of its directory to read.
+
+    The merged file holds only the shards' rows: their failure sidecars and inventories stay next to them. Each
+    shard is recorded relative to the record's directory, so the shards and the merged file can move together.
+    """
+    sources_fpath = aggregation_sources_path_for(merged_fpath)
+    base = sources_fpath.parent.resolve()
+    sources = _AggregationSources(
+        shards=[os.path.relpath(path.resolve(), base) for path in shard_paths], merged_bytes=merged_bytes
+    )
+    sources_fpath.write_text(sources.model_dump_json(indent=2) + "\n")
+
+
+def _aggregated_shards(run_dir: Path) -> list[Path] | None:
+    """The shards `gym eval aggregate` merged into ``run_dir/rollouts.jsonl``, in its order; None if it merged none.
+
+    The merged rows have none of the shards' failures or inventories, so a recheck reads the shards, as the
+    aggregation did. A merged file that is gone or changed since is not theirs any more, and a shard that is gone
+    cannot be read: both raise rather than check rows without their failures.
+    """
+    merged_fpath = run_dir / "rollouts.jsonl"
+    sources_fpath = aggregation_sources_path_for(merged_fpath)
+    if not sources_fpath.is_file():
+        return None
+    try:
+        sources = _AggregationSources.model_validate_json(sources_fpath.read_bytes())
+    except ValidationError as exc:
+        raise ValueError(f"Unreadable shard list {sources_fpath}: {exc}") from exc
+    if not merged_fpath.is_file() or merged_fpath.stat().st_size != sources.merged_bytes:
+        raise ValueError(
+            f"{merged_fpath} is not the file `gym eval aggregate` merged from the shards in {sources_fpath}. Rerun "
+            "the aggregation, or pass --rollouts-file rollouts.jsonl to check that file alone."
+        )
+    shards = [(run_dir / shard).resolve() for shard in sources.shards]
+    missing = [str(shard) for shard in shards if not shard.is_file()]
+    if missing:
+        raise FileNotFoundError(
+            f"{merged_fpath} was merged from shards that are gone: {', '.join(missing)}. Recheck the shards, or pass "
+            "--rollouts-file rollouts.jsonl to check the merged rows alone, without the shards' failures."
+        )
+    return shards
+
+
 def _resolve_rollout_path(run_dir: Path, rollout_file: str | Path | None) -> Path:
     if not run_dir.is_dir():
         raise FileNotFoundError(f"Run directory not found: {run_dir}")
@@ -803,14 +855,18 @@ def health_check_run_dir(
 ) -> HealthCheckResult:
     """Recheck a run directory. The run's own persisted limits judge it, so the verdict of the same artifacts
     does not change. Each limit set explicitly on ``limits`` overrides only that persisted limit and is recorded
-    as an override; set to ``None`` it removes the limit. A limit not set keeps its persisted value."""
+    as an override; set to ``None`` it removes the limit. A limit not set keeps its persisted value.
+
+    A directory ``gym eval aggregate`` merged shards into is rechecked from those shards, so their failures and
+    inventories count as they did for the aggregation. An explicit ``rollout_file`` is checked alone."""
     path = Path(run_dir)
-    rollout_path = _resolve_rollout_path(path, rollout_file)
+    shards = _aggregated_shards(path) if rollout_file is None else None
+    rollout_paths = shards if shards is not None else _resolve_rollout_path(path, rollout_file)
     overrides = {name: getattr(limits, name) for name in limits.model_fields_set} if limits is not None else {}
     limits = _persisted_limits(path).model_copy(update=overrides)
     limits_source = {name: "override" if name in overrides else "persisted" for name in RunHealthLimits.model_fields}
     result = run_health_checks(
-        rollout_path,
+        rollout_paths,
         output_dir=path,
         workers=workers,
         ignored_checks=ignored_checks,

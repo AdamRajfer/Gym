@@ -266,7 +266,7 @@ def evaluate_record(
             for call in failed
         ),
         errors_by_status=dict(errors_by_status),
-        ended_on_error=_ended_on_failed_call(calls),
+        ended_on_error=model_calls_observed and _ended_on_failed_call(calls),
         duplicated_calls=duplicated,
         transcript_prompt_tokens=transcript_prompt,
         transcript_completion_tokens=transcript_completion,

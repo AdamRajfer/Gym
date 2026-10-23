@@ -522,8 +522,10 @@ def _agent_turn_hollow(
     trajectory: dict[str, Any], bindings: _CallBindings, subject: dict[str, int | str]
 ) -> list[Finding]:
     # An empty turn that ended on its own model call being rejected for a full context is the model filling its
-    # context, as in `rollout_ended_on_failed_model_call`. The calls are optional evidence here: without
-    # captured calls, every empty turn is still flagged.
+    # context. Unlike `rollout_ended_on_failed_model_call`, this needs no earlier answer: that check flags a request
+    # that never fit, so the exemption is not applied when an incomplete capture leaves that check unobserved. The
+    # calls are optional evidence here: without captured calls, every empty turn is still flagged.
+    incomplete = _trajectory_has_any_gap(trajectory, _INCOMPLETE_MODEL_CALL_GAPS)
     return [
         Finding(
             check="agent_turn_hollow",
@@ -532,7 +534,9 @@ def _agent_turn_hollow(
             detail={"reason": "agent turn has no message or tool calls"},
         )
         for step, turn in zip(_agent_steps(trajectory), trajectory.get("turns") or [], strict=True)
-        if not step.has_message and not step.has_tool_calls and not _turn_ended_on_context_overflow(turn, bindings)
+        if not step.has_message
+        and not step.has_tool_calls
+        and (incomplete or not _turn_ended_on_context_overflow(turn, bindings))
     ]
 
 
@@ -660,6 +664,24 @@ def _model_chains(calls: Sequence[dict[str, Any]]) -> dict[Any, list[dict[str, A
     return chains
 
 
+def _conversation_head(call: dict[str, Any]) -> Any:
+    """How the conversation a call continues opens: its instructions, system prompt, or first message.
+
+    Calls of one conversation share it; another conversation on the same model server, such as a user simulator's,
+    opens differently. A call whose request was not captured has none.
+    """
+    request = call.get("request")
+    if not isinstance(request, dict):
+        return None
+    for key in ("instructions", "system"):
+        if request.get(key):
+            return request[key]
+    items = request.get("messages", request.get("input"))
+    if isinstance(items, list):
+        return items[0] if items else None
+    return items or None
+
+
 def _chain_ended_on_failure(chain: Sequence[dict[str, Any]]) -> bool:
     """Whether this model's own last call, in time, failed.
 
@@ -674,7 +696,10 @@ def _chain_ended_on_failure(chain: Sequence[dict[str, Any]]) -> bool:
 
     A last call the upstream rejected because the context was full is the
     model's own end, scored like any other answer, once the model has answered
-    in this rollout. Before any answer the request never fit the deployment (a
+    earlier in the same conversation: a successful call whose request opens the
+    same way (`_conversation_head`). A success in another conversation on the
+    same server, such as a user simulator's, says nothing of whether this
+    request fit. Before any answer the request never fit the deployment (a
     prompt or output budget too large for it), which is a failure like any
     other. An unordered chain of only failures has no answer and ended on one of
     them, so it is flagged.
@@ -686,7 +711,10 @@ def _chain_ended_on_failure(chain: Sequence[dict[str, Any]]) -> bool:
         return False
     if all(call.get("started_at") is not None for call in chain):
         last = sorted(chain, key=lambda call: (call.get("started_at") or 0.0, call.get("call_index") or 0))[-1]
-        answered = any(_is_successful(call) for call in chain)
+        head = _conversation_head(last)
+        answered = head is not None and any(
+            _is_successful(call) and _conversation_head(call) == head for call in chain
+        )
         return _is_failed(last) and not (answered and _is_context_overflow_rejection(last))
     return len(failed) == len(chain)
 
@@ -710,7 +738,8 @@ def _rollout_ended_on_failed_model_call(trajectory: dict[str, Any], subject: dic
     stays healthy; the signal is that the rollout ENDED on a failure, which is
     what makes its reward indistinguishable from a genuine zero. A last call
     the upstream rejected as a context-length overflow is not flagged once the
-    model has answered in the rollout: that zero is the model's own result.
+    model has answered earlier in the same conversation: that zero is the
+    model's own result.
     """
     findings = []
     for key, chain in _model_chains(_normalized_trajectory_calls(trajectory)).items():

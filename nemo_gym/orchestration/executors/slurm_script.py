@@ -61,7 +61,7 @@ from nemo_gym.orchestration.executors.script_templates import (
     render_vllm_ray_symmetric_run,
     render_write_file_from_base64,
 )
-from nemo_gym.orchestration.executors.utils import flatten_run_args, ray_extra
+from nemo_gym.orchestration.executors.utils import flatten_run_args
 
 
 _SCRIPT_TEMPLATE = """\
@@ -1143,7 +1143,6 @@ def build_sbatch_script(
                 + exporter_extras(benchmark.run)
                 + gitlab_storage_extras(benchmark.prepare)
                 + gitlab_storage_extras(benchmark.run)
-                + ray_extra(benchmark.run)
             )
         ),
     )

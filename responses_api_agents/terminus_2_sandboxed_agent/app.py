@@ -116,12 +116,12 @@ _MODEL_INFRASTRUCTURE_STATUSES = frozenset({401, 403, 408, 425, 429})
 # visible harness failure.
 _MODEL_GATEWAY_STATUSES = frozenset({502, 503, 504})
 
-# Bounds on the model client. A Gym-internal client retries refused connections forever and extends its HTTP
-# budget on every 429/5xx, so a model outage ran until the task deadline and was verified as the agent's own
-# "timeout". With these bounds (0.5 s between tries) an outage surfaces as ModelUnreachableError within about
-# ten seconds and the episode is recorded as a masked failure.
-MODEL_CONNECTION_RETRIES = 20
-MODEL_HTTP_ATTEMPTS = 20
+# The retry schedule of harbor's LiteLLM.call (harbor 0.22.0, Terminal-Bench's own harness): three attempts,
+# and its wait_exponential(min=4, max=15) waits four seconds after each of the first two failures. The model
+# client does not retry on its own, so a refused connection, a busy or gateway answer, or a call timeout is
+# retried only here. An outage then surfaces as ModelUnreachableError within seconds and the episode is masked,
+# instead of the client waiting it out until the task deadline and the episode being verified as a timeout.
+MODEL_CALL_RETRY_WAITS_S = (4.0, 4.0)
 
 
 class ModelUnreachableError(RuntimeError):
@@ -368,8 +368,8 @@ class NeMoGymLLM(BaseLLM):
         observed_input = deepcopy(request_input) if self.observations is not None else None
         response = None
         start_time = perf_counter()
-        max_attempts = 10  # Harbor does 3 by default and Litellm does 3 by default. Hardcode 10 attempts for now.
-        for _ in range(max_attempts):
+        max_attempts = len(MODEL_CALL_RETRY_WAITS_S) + 1
+        for attempt in range(max_attempts):
             try:
                 async with asyncio.timeout(delay=self._llm_request_timeout):
                     response = NeMoGymResponse.model_validate(
@@ -387,10 +387,13 @@ class NeMoGymLLM(BaseLLM):
             except BaseException as exc:
                 if self.observations is not None:
                     self.observations.gap("model_attempt_without_response", type(exc).__name__)
-                if _is_model_infrastructure_error(exc):
-                    # The client has retried up to its bounds; this is the endpoint failing, not the model answering.
+                if not _is_model_infrastructure_error(exc):
+                    raise
+                if attempt == max_attempts - 1:
+                    # The endpoint kept failing on every attempt: not the model answering.
                     raise ModelUnreachableError(f"{type(exc).__name__}: {exc}") from exc
-                raise
+            if attempt < max_attempts - 1:
+                await asyncio.sleep(MODEL_CALL_RETRY_WAITS_S[attempt])
 
         self._times_spent.append(perf_counter() - start_time)
         if not response:
@@ -723,10 +726,9 @@ class Terminus2Agent(SimpleResponsesAPIAgent):
             client=NeMoGymAsyncOpenAI(
                 base_url=model_base_url,
                 api_key="dummy",
-                # Not `internal`: that client retries forever. The bounds surface an outage to this handler.
+                # Not `internal`: that client retries forever. NeMoGymLLM.call owns the whole retry schedule.
                 internal=False,
-                max_connection_retries=MODEL_CONNECTION_RETRIES,
-                max_http_attempts=MODEL_HTTP_ATTEMPTS,
+                max_num_tries=1,
                 default_headers={"x-session-id": invocation_id} if invocation_id is not None else {},
             ),
             model_name=self.config.model_server.name,

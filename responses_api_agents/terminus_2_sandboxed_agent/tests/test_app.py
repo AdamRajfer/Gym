@@ -1040,8 +1040,8 @@ class TestHarnessOutcomes:
         assert "ModelUnreachableError: ClientConnectionError" in excinfo.value.metrics["error"]
 
     @pytest.mark.asyncio
-    async def test_model_client_retries_are_bounded(self, monkeypatch):
-        """An internal client would retry refused connections forever and extend its HTTP budget on every 5xx."""
+    async def test_model_client_leaves_the_retries_to_the_call(self, monkeypatch):
+        """An internal client would retry refused connections forever and wait out 429 and 503 for an hour."""
         clients = []
 
         async def run(agent, instruction, environment, context):
@@ -1052,9 +1052,7 @@ class TestHarnessOutcomes:
         (client,) = clients
         assert isinstance(client, app_module.NeMoGymAsyncOpenAI)
         assert client.internal is False
-        assert client.max_connection_retries == app_module.MODEL_CONNECTION_RETRIES == 20
-        assert client.max_http_attempts == app_module.MODEL_HTTP_ATTEMPTS == 20
-        assert client.max_num_tries is None
+        assert client.max_num_tries == 1
 
     @pytest.mark.asyncio
     async def test_refused_connections_surface_within_the_bound_not_as_a_timeout(self, monkeypatch):
@@ -1062,7 +1060,7 @@ class TestHarnessOutcomes:
         with socket.socket() as probe:
             probe.bind(("127.0.0.1", 0))
             closed_port = probe.getsockname()[1]
-        monkeypatch.setattr(app_module, "MODEL_CONNECTION_RETRIES", 2)
+        monkeypatch.setattr(app_module, "MODEL_CALL_RETRY_WAITS_S", (0.0, 0.0))
         monkeypatch.setattr(server_utils, "_GLOBAL_AIOHTTP_CLIENT", None)
         monkeypatch.setattr(server_utils, "get_nemo_gym_fastapi_num_workers", lambda: 1)
         monkeypatch.setattr(server_utils, "is_nemo_gym_fastapi_worker", lambda: True)
@@ -1083,12 +1081,63 @@ class TestHarnessOutcomes:
             monkeypatch.setattr(server_utils, "_GLOBAL_AIOHTTP_CLIENT", None)
         elapsed = perf_counter() - started
 
-        # Two connection retries half a second apart, then ModelUnreachableError: a 502, not a verified timeout.
+        # Three attempts, then ModelUnreachableError: a 502, not a verified timeout.
         assert elapsed < 10, elapsed
         assert excinfo.value.status_code == 502
         assert "model unreachable" in excinfo.value.detail
         assert "ClientConnectorError" in excinfo.value.metrics["error"]
         assert "TimeoutError" not in excinfo.value.metrics["error"]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("status", [429, 502, 503, 504])
+    async def test_endpoint_errors_surface_after_three_attempts_not_as_a_timeout(self, monkeypatch, status):
+        """Through the real client against an endpoint that keeps answering a busy or gateway status."""
+        from aiohttp import web
+
+        from nemo_gym import openai_utils
+
+        attempts = []
+
+        async def answer(request):
+            attempts.append(request.path)
+            return web.json_response({"error": {"message": "unavailable"}}, status=status)
+
+        app = web.Application()
+        app.router.add_post("/v1/responses", answer)
+        runner = web.AppRunner(app)
+        await runner.setup()
+        await web.TCPSite(runner, "127.0.0.1", 0).start()
+
+        client_waits = []
+
+        async def record_sleep(seconds):
+            client_waits.append(seconds)
+
+        # Any wait inside the client is recorded instead of slept: there must be none.
+        monkeypatch.setattr(openai_utils, "sleep", record_sleep)
+        monkeypatch.setattr(app_module, "MODEL_CALL_RETRY_WAITS_S", (0.0, 0.0))
+        monkeypatch.setattr(server_utils, "_GLOBAL_AIOHTTP_CLIENT", None)
+        monkeypatch.setattr(server_utils, "get_nemo_gym_fastapi_num_workers", lambda: 1)
+        monkeypatch.setattr(server_utils, "is_nemo_gym_fastapi_worker", lambda: True)
+        http_client = server_utils.set_global_aiohttp_client(GlobalAIOHTTPAsyncClientConfig())
+
+        async def run(agent, instruction, environment, context):
+            llm = agent.kwargs["llm"]
+            llm._client.base_url = f"http://127.0.0.1:{runner.addresses[0][1]}/v1"
+            await llm.call("prompt")
+
+        try:
+            with pytest.raises(app_module.Terminus2InfrastructureError) as excinfo:
+                await _execute_with_harness(monkeypatch, run)
+        finally:
+            await http_client.close()
+            monkeypatch.setattr(server_utils, "_GLOBAL_AIOHTTP_CLIENT", None)
+            await runner.cleanup()
+
+        assert len(attempts) == 3
+        assert client_waits == []
+        assert excinfo.value.status_code == 502
+        assert f"ClientResponseError: {status}" in excinfo.value.metrics["error"]
 
     @pytest.mark.asyncio
     async def test_structured_sandbox_failure_is_a_503_before_any_model_call(self, monkeypatch):
@@ -1266,8 +1315,25 @@ async def test_nemo_gym_llm_classifies_endpoint_failures(exc, expected):
             await llm.call("prompt")
 
 
+def test_model_call_retries_follow_harbors_schedule():
+    """Terminal-Bench's own harness retries a model call by the tenacity decorator on harbor's LiteLLM.call."""
+    from harbor.llms.lite_llm import LiteLLM
+    from tenacity import RetryCallState
+
+    retrying = LiteLLM.call.retry
+    waits = []
+    for failed_attempts in range(1, retrying.stop.max_attempt_number):
+        state = RetryCallState(retrying, fn=None, args=(), kwargs={})
+        state.attempt_number = failed_attempts
+        waits.append(retrying.wait(state))
+
+    assert tuple(waits) == app_module.MODEL_CALL_RETRY_WAITS_S
+
+
 @pytest.mark.asyncio
-async def test_nemo_gym_llm_exhausted_timeouts_mean_the_model_is_unreachable():
+async def test_nemo_gym_llm_exhausted_timeouts_mean_the_model_is_unreachable(monkeypatch):
+    monkeypatch.setattr(app_module, "MODEL_CALL_RETRY_WAITS_S", (0.0, 0.0))
+
     class Client:
         async def create_response(self, **kwargs):
             raise TimeoutError
@@ -1279,9 +1345,9 @@ async def test_nemo_gym_llm_exhausted_timeouts_mean_the_model_is_unreachable():
         model_output_limit=None,
         llm_request_timeout=1,
     )
-    with pytest.raises(app_module.ModelUnreachableError, match="after 10 attempts"):
+    with pytest.raises(app_module.ModelUnreachableError, match="after 3 attempts"):
         await llm.call("prompt")
-    assert llm._model_calls_gt_10min == 10
+    assert llm._model_calls_gt_10min == 3
 
 
 class TestAgentTimeout:

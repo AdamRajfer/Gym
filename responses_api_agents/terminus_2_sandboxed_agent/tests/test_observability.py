@@ -9,7 +9,10 @@ from typing import Any, Dict
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from aiohttp import ClientResponseError, RequestInfo
+from multidict import CIMultiDict, CIMultiDictProxy
 from pydantic import TypeAdapter
+from yarl import URL
 
 import nemo_gym.openai_utils as openai_utils
 from nemo_gym.base_responses_api_model import CaptureStore
@@ -146,14 +149,23 @@ def execution(monkeypatch):
         if synthetic:
             raise ValueError("fallback request failed")
         payload = json.dumps(response).encode()
+        url = URL(kwargs["url"])
+
+        def raise_for_status():
+            # As aiohttp raises for an error answer.
+            info = RequestInfo(url, "POST", CIMultiDictProxy(CIMultiDict()), url)
+            raise ClientResponseError(info, (), status=retry_status, message="retry")
+
         return SimpleNamespace(
             status=retry_status if http_retry else 200,
             ok=not http_retry,
             read=AsyncMock(return_value=payload),
             content=SimpleNamespace(read=AsyncMock(return_value=b"retry")),
+            raise_for_status=raise_for_status,
         )
 
     monkeypatch.setattr(openai_utils, "request", transport)
+    monkeypatch.setattr(app_module, "MODEL_CALL_RETRY_WAITS_S", (0.0, 0.0))
 
     async def setup(agent, environment):
         agents.append(agent)
@@ -291,7 +303,8 @@ async def test_last_turn_completion_is_told_apart_from_step_exhaustion(execution
         ("retry", 3, 2, "completed"),
         ("http_retry", 3, 2, "completed"),
         ("rate_limit", 3, 2, "completed"),
-        ("all_fail", 30, 0, "failed"),
+        # harbor retries its LLM query 3 times, and each query makes 3 attempts.
+        ("all_fail", 9, 0, "failed"),
         ("compaction", 6, 2, "completed"),
         ("compaction_missing_id", 6, 2, "completed"),
         ("cancel_summary", 3, 1, "incomplete"),

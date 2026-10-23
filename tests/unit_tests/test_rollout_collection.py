@@ -8440,7 +8440,9 @@ class TestRolloutAggregationHelper:
         # The merged file has no sidecar or inventory of its own.
         assert (artifacts["expected"], artifacts["failed"]) == (None, None)
 
-    @pytest.mark.parametrize("change", ["appended", "removed", "never moved into place", "shard list cut short"])
+    @pytest.mark.parametrize(
+        "change", ["appended", "edited, same size", "removed", "never moved into place", "shard list cut short"]
+    )
     async def test_a_recheck_refuses_a_merged_file_the_aggregation_did_not_leave(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, empty_global_config: MagicMock, change: str
     ) -> None:
@@ -8465,6 +8467,10 @@ class TestRolloutAggregationHelper:
             if change == "appended":
                 with merged.open("ab") as out:
                     out.write(orjson.dumps(self._rollout(5, "agent_a", reward=1.0)) + b"\n")
+            elif change == "edited, same size":
+                size = merged.stat().st_size
+                merged.write_bytes(merged.read_bytes().replace(b'"reward":1.0', b'"reward":0.0'))
+                assert merged.stat().st_size == size
             elif change == "removed":
                 merged.unlink()
             else:
@@ -8488,6 +8494,71 @@ class TestRolloutAggregationHelper:
         with pytest.raises(FileNotFoundError, match="run_b/rollouts.jsonl"):
             health_check_run_dir(merged_dir)
         assert summary_fpath.read_bytes() == aggregated
+
+    async def test_a_reaggregation_stopped_before_its_merged_file_took_its_place_is_refused(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, empty_global_config: MagicMock
+    ) -> None:
+        """The list names the merged contents, not only their size, so it lends its shards to no other rows."""
+        run_a, run_b = self._landed_and_failed_runs(tmp_path, same_indices=True)
+        merged_dir = tmp_path / "merged"
+        await self._merge(monkeypatch, merged_dir, run_a, run_b)
+        reports = {
+            name: (merged_dir / name).read_bytes() for name in ("quality_summary.json", "rollout_verdicts.jsonl")
+        }
+        # run_c is run_a with another reward: its merged rows differ and keep their size.
+        run_c = tmp_path / "run_c" / "rollouts.jsonl"
+        shutil.copytree(run_a.parent, run_c.parent)
+        run_c.write_bytes(run_a.read_bytes().replace(b'"reward":1.0', b'"reward":0.0'))
+
+        def interrupted(source, target):
+            raise OSError("interrupted")
+
+        with monkeypatch.context() as patched:
+            patched.setattr(os, "replace", interrupted)
+            with pytest.raises(OSError, match="interrupted"):
+                await self._merge(monkeypatch, merged_dir, run_c, run_b)
+        sources = orjson.loads(aggregation_sources_path_for(merged_dir / "rollouts.jsonl").read_bytes())
+        assert sources["merged_bytes"] == (merged_dir / "rollouts.jsonl").stat().st_size
+
+        with pytest.raises(ValueError, match="is not the file `gym eval aggregate`"):
+            health_check_run_dir(merged_dir)
+        assert {name: (merged_dir / name).read_bytes() for name in reports} == reports
+
+        aggregated = orjson.loads((await self._merge(monkeypatch, merged_dir, run_c, run_b)).read_bytes())["run"]
+        assert self._accounting(health_check_run_dir(merged_dir).summary["run"]) == self._accounting(aggregated)
+
+    @pytest.mark.parametrize(
+        "link", ["file link, artifacts beside it", "file link, artifacts beside its target", "directory link"]
+    )
+    async def test_a_recheck_reads_the_artifacts_beside_the_path_the_aggregation_read(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, empty_global_config: MagicMock, link: str
+    ) -> None:
+        """A shard's sidecars and inventory are the ones beside the path the aggregation was given, link or not."""
+        shard = tmp_path / "alias" / "rollouts.jsonl"
+        target = tmp_path / "pool" / ("rollouts.jsonl" if link == "directory link" else "data.jsonl")
+        self._write_rows(target, self._rollout(0, "agent_a", reward=1.0))
+        if link == "directory link":
+            shard.parent.symlink_to(target.parent, target_is_directory=True)
+        else:
+            shard.parent.mkdir()
+            shard.symlink_to(target)
+        beside = target if link == "file link, artifacts beside its target" else shard
+        self._write_rows(materialized_path_for(beside), self._rollout(0, "agent_a"), self._rollout(1, "agent_a"))
+        self._write_rows(
+            _failures_path_for(beside), self._rollout(1, "agent_a", **{NG_FAILURE_CLASS_KEY: "timeout_exceeded"})
+        )
+        merged_dir = tmp_path / "merged"
+
+        aggregated = orjson.loads((await self._merge(monkeypatch, merged_dir, shard)).read_bytes())["run"]
+        rechecked = health_check_run_dir(merged_dir).summary["run"]
+
+        assert self._accounting(rechecked) == self._accounting(aggregated)
+        artifacts = rechecked["artifacts"]
+        if beside == target:
+            # The aggregation never read the target's artifacts, so the recheck does not either.
+            assert (artifacts["expected"], artifacts["failed"]) == (None, None)
+        else:
+            assert (artifacts["expected"], artifacts["missing"], artifacts["failed"]["total"]) == (2, 0, 1)
 
     async def test_shards_left_unmerged_are_not_listed(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, empty_global_config: MagicMock

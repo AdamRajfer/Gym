@@ -10,6 +10,7 @@ and writes reports.
 
 from __future__ import annotations
 
+import hashlib
 import os
 import warnings
 from collections import Counter, defaultdict
@@ -772,22 +773,33 @@ def _persisted_limits(run_dir: Path) -> RunHealthLimits:
 
 
 class _AggregationSources(BaseModel):
-    """What `gym eval aggregate` merged into a rollout file: the shards, in its order, and the merged file's size."""
+    """The shards `gym eval aggregate` merged into a rollout file, in its order, and that file's size and SHA-256."""
 
     shards: list[str]
     merged_bytes: int
+    merged_sha256: str
 
 
-def write_aggregation_sources(merged_fpath: Path, shard_paths: Sequence[Path], merged_bytes: int) -> None:
+def _sha256(fpath: Path) -> str:
+    with fpath.open("rb") as stream:
+        return hashlib.file_digest(stream, "sha256").hexdigest()
+
+
+def write_aggregation_sources(merged_fpath: Path, shard_paths: Sequence[Path], merged_contents_fpath: Path) -> None:
     """Record the shards ``merged_fpath`` is merged from, for a recheck of its directory to read.
 
-    The merged file holds only the shards' rows: their failure sidecars and inventories stay next to them. Each
-    shard is recorded relative to the record's directory, so the shards and the merged file can move together.
+    The merged file holds only the shards' rows: their failure sidecars and inventories stay next to them.
+    ``merged_contents_fpath`` holds the rows about to take ``merged_fpath``'s place; the record names them by size
+    and SHA-256, so it never vouches for other contents. Each shard is recorded relative to the record's directory,
+    so the shards and the merged file can move together, and under its own file name: a shard reached through a
+    file link keeps the sidecars beside the link, as the aggregation read them.
     """
     sources_fpath = aggregation_sources_path_for(merged_fpath)
     base = sources_fpath.parent.resolve()
     sources = _AggregationSources(
-        shards=[os.path.relpath(path.resolve(), base) for path in shard_paths], merged_bytes=merged_bytes
+        shards=[os.path.relpath(path.parent.resolve() / path.name, base) for path in shard_paths],
+        merged_bytes=merged_contents_fpath.stat().st_size,
+        merged_sha256=_sha256(merged_contents_fpath),
     )
     sources_fpath.write_text(sources.model_dump_json(indent=2) + "\n")
 
@@ -796,8 +808,8 @@ def _aggregated_shards(run_dir: Path) -> list[Path] | None:
     """The shards `gym eval aggregate` merged into ``run_dir/rollouts.jsonl``, in its order; None if it merged none.
 
     The merged rows have none of the shards' failures or inventories, so a recheck reads the shards, as the
-    aggregation did. A merged file that is gone or changed since is not theirs any more, and a shard that is gone
-    cannot be read: both raise rather than check rows without their failures.
+    aggregation did. A merged file that is gone, or not byte for byte the one the list was written for, is not
+    theirs, and a shard that is gone cannot be read: both raise rather than check rows without their failures.
     """
     merged_fpath = run_dir / "rollouts.jsonl"
     sources_fpath = aggregation_sources_path_for(merged_fpath)
@@ -807,12 +819,18 @@ def _aggregated_shards(run_dir: Path) -> list[Path] | None:
         sources = _AggregationSources.model_validate_json(sources_fpath.read_bytes())
     except ValidationError as exc:
         raise ValueError(f"Unreadable shard list {sources_fpath}: {exc}") from exc
-    if not merged_fpath.is_file() or merged_fpath.stat().st_size != sources.merged_bytes:
+    # The size first, as it is cheap; equal sizes alone do not make equal contents.
+    if (
+        not merged_fpath.is_file()
+        or merged_fpath.stat().st_size != sources.merged_bytes
+        or _sha256(merged_fpath) != sources.merged_sha256
+    ):
         raise ValueError(
             f"{merged_fpath} is not the file `gym eval aggregate` merged from the shards in {sources_fpath}. Rerun "
             "the aggregation, or pass --rollouts-file rollouts.jsonl to check that file alone."
         )
-    shards = [(run_dir / shard).resolve() for shard in sources.shards]
+    # Only the directories are resolved: each shard keeps its own name, and with it the sidecars beside it.
+    shards = [path.parent.resolve() / path.name for path in (run_dir / shard for shard in sources.shards)]
     missing = [str(shard) for shard in shards if not shard.is_file()]
     if missing:
         raise FileNotFoundError(

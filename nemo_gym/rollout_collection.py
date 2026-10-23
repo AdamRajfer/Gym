@@ -4790,15 +4790,13 @@ class RolloutAggregationHelper(BaseModel):
 
             print(f"Merging shards into {output_fpath}")
             # The merged rows have none of the shards' failures or inventories, so a recheck of this directory reads
-            # the shards. Their list is written before the merged file takes its place: never one without the other.
+            # the shards. Their list names the merged contents and is written before those take their place.
             merging_fpath = output_fpath.with_name(f".{output_fpath.name}.{os.getpid()}.merging")
             try:
                 with merging_fpath.open("wb") as out:
                     for r in results:
                         out.write(orjson.dumps(r) + b"\n")
-                write_aggregation_sources(
-                    output_fpath, [Path(path) for path in input_paths], merging_fpath.stat().st_size
-                )
+                write_aggregation_sources(output_fpath, [Path(path) for path in input_paths], merging_fpath)
                 os.replace(merging_fpath, output_fpath)
             finally:
                 merging_fpath.unlink(missing_ok=True)

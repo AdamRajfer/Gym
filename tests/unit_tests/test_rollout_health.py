@@ -100,6 +100,7 @@ def _call(**updates) -> dict:
 def _trajectory_call(call: dict) -> dict:
     return {
         "model_call_id": call.get("model_call_id"),
+        "client_session_id": call.get("client_session_id"),
         "started_at": call.get("started_at"),
         "request": call.get("request"),
         "response": call.get("response"),
@@ -1650,6 +1651,46 @@ def test_an_answer_outside_the_overflowing_conversation_does_not_excuse_it(tmp_p
 
     assert "rollout_ended_on_failed_model_call" in {finding.check for finding in digest.findings}
     assert result.summary["run"]["stats"]["model_call_errors"]["ended_on_error"] == 1
+
+
+@pytest.mark.parametrize(
+    "harness_sessions,flagged",
+    [((None, None), True), (("shared", "shared"), False)],
+    ids=["two_sessions", "two_activations_of_one_harness_session"],
+)
+def test_a_session_tells_apart_conversations_that_open_alike(tmp_path, harness_sessions, flagged):
+    """Two sessions can share an agent's instructions: one session's answer says nothing of whether the other's first
+    request fit. Activations of one harness session continue one conversation."""
+    answered = _call(
+        model_call_id="first",
+        started_at=1.0,
+        model_ref=_POLICY_REF,
+        client_session_id="s1",
+        request=_conversation("chat", "You are an agent.", "task A"),
+    )
+    overflow = _call(
+        model_call_id="second",
+        started_at=2.0,
+        tokens_in=None,
+        tokens_out=0,
+        model_ref=_POLICY_REF,
+        client_session_id="s2",
+        request=_conversation("chat", "You are an agent.", "task B"),
+        **CONTEXT_OVERFLOWS["propagated"],
+    )
+    record = _unreferenced_failure_record([])
+    record["ng_trajectory"]["invocations"] = [
+        {"kind": "agent_invocation", "invocation_id": session, "status": "completed"}
+        | ({"harness_session_id": harness} if harness else {})
+        for session, harness in zip(("s1", "s2"), harness_sessions)
+    ]
+    rollout_path = _write_fixture(tmp_path, [(record, [answered, overflow])])
+
+    result = run_health_checks(rollout_path, workers=1)
+    [digest] = result.rollouts
+
+    assert ("rollout_ended_on_failed_model_call" in {finding.check for finding in digest.findings}) is flagged
+    assert result.summary["run"]["stats"]["model_call_errors"]["ended_on_error"] == int(flagged)
 
 
 def test_an_unordered_chain_of_an_overflow_and_a_transport_failure_still_flags(tmp_path: Path) -> None:

@@ -266,6 +266,12 @@ def _agent_steps(trajectory: dict[str, Any]) -> list[_AgentStep]:
 
 
 def _normalized_trajectory_calls(trajectory: dict[str, Any]) -> list[dict[str, Any]]:
+    # The session each invocation belongs to: activations of one harness session share it.
+    sessions = {
+        invocation["invocation_id"]: invocation.get("harness_session_id") or invocation["invocation_id"]
+        for invocation in trajectory.get("invocations") or []
+        if isinstance(invocation, dict) and invocation.get("invocation_id")
+    }
     calls: list[dict[str, Any]] = []
     for position, raw in enumerate(trajectory.get("model_calls") or []):
         metadata = raw.get("response_metadata") or {}
@@ -290,6 +296,7 @@ def _normalized_trajectory_calls(trajectory: dict[str, Any]) -> list[dict[str, A
                 "tokens_out": tokens.get("completion_tokens"),
                 "request": raw.get("request"),
                 "response": raw.get("response"),
+                "session": sessions.get(raw.get("client_session_id"), raw.get("client_session_id")),
             }
         )
     return calls
@@ -684,6 +691,14 @@ def _conversation_head(call: dict[str, Any]) -> Any:
     return items or None
 
 
+def _same_conversation(call: dict[str, Any], other: dict[str, Any]) -> bool:
+    """Whether two calls continue one conversation: their requests open the same way, and no captured session
+    tells them apart. Two agents can share instructions, so a session only ever separates calls."""
+    head = _conversation_head(call)
+    sessions = {call.get("session"), other.get("session")} - {None}
+    return head is not None and head == _conversation_head(other) and len(sessions) <= 1
+
+
 def _chain_ended_on_failure(chain: Sequence[dict[str, Any]]) -> bool:
     """Whether this model's own last call, in time, failed.
 
@@ -698,10 +713,9 @@ def _chain_ended_on_failure(chain: Sequence[dict[str, Any]]) -> bool:
 
     A last call the upstream rejected because the context was full is the
     model's own end, scored like any other answer, once the model has answered
-    earlier in the same conversation: a successful call whose request opens the
-    same way (`_conversation_head`). A success in another conversation on the
-    same server, such as a user simulator's, says nothing of whether this
-    request fit. Before any answer the request never fit the deployment (a
+    earlier in the same conversation (`_same_conversation`). A success in another
+    conversation on the same server, such as a user simulator's or another
+    session's, says nothing of whether this request fit. Before any answer the request never fit the deployment (a
     prompt or output budget too large for it), which is a failure like any
     other. An unordered chain of only failures has no answer and ended on one of
     them, so it is flagged.
@@ -713,10 +727,7 @@ def _chain_ended_on_failure(chain: Sequence[dict[str, Any]]) -> bool:
         return False
     if all(call.get("started_at") is not None for call in chain):
         last = sorted(chain, key=lambda call: (call.get("started_at") or 0.0, call.get("call_index") or 0))[-1]
-        head = _conversation_head(last)
-        answered = head is not None and any(
-            _is_successful(call) and _conversation_head(call) == head for call in chain
-        )
+        answered = any(_is_successful(call) and _same_conversation(call, last) for call in chain)
         return _is_failed(last) and not (answered and _is_context_overflow_rejection(last))
     return len(failed) == len(chain)
 

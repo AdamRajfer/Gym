@@ -773,9 +773,10 @@ def _persisted_limits(run_dir: Path) -> RunHealthLimits:
 
 
 class _AggregationSources(BaseModel):
-    """The shards `gym eval aggregate` merged into a rollout file, in its order, and that file's size and SHA-256."""
+    """The shards `gym eval aggregate` merged into a rollout file, in its order, each as its path, size and SHA-256,
+    and that file's size and SHA-256."""
 
-    shards: list[str]
+    shards: list[tuple[str, int, str]]
     merged_bytes: int
     merged_sha256: str
 
@@ -785,19 +786,24 @@ def _sha256(fpath: Path) -> str:
         return hashlib.file_digest(stream, "sha256").hexdigest()
 
 
-def write_aggregation_sources(merged_fpath: Path, shard_paths: Sequence[Path], merged_contents_fpath: Path) -> None:
+def write_aggregation_sources(
+    merged_fpath: Path, shards: Sequence[tuple[Path, int, str]], merged_contents_fpath: Path
+) -> None:
     """Record the shards ``merged_fpath`` is merged from, for a recheck of its directory to read.
 
     The merged file holds only the shards' rows: their failure sidecars and inventories stay next to them.
-    ``merged_contents_fpath`` holds the rows about to take ``merged_fpath``'s place; the record names them by size
-    and SHA-256, so it never vouches for other contents. Each shard is recorded relative to the record's directory,
+    ``shards`` holds each shard's path with the size and SHA-256 of what the merge read from it, and
+    ``merged_contents_fpath`` the rows about to take ``merged_fpath``'s place; the record names both by size and
+    SHA-256, so it never vouches for other contents. Each shard is recorded relative to the record's directory,
     so the shards and the merged file can move together, and under its own file name: a shard reached through a
     file link keeps the sidecars beside the link, as the aggregation read them.
     """
     sources_fpath = aggregation_sources_path_for(merged_fpath)
     base = sources_fpath.parent.resolve()
     sources = _AggregationSources(
-        shards=[os.path.relpath(path.parent.resolve() / path.name, base) for path in shard_paths],
+        shards=[
+            (os.path.relpath(path.parent.resolve() / path.name, base), size, sha256) for path, size, sha256 in shards
+        ],
         merged_bytes=merged_contents_fpath.stat().st_size,
         merged_sha256=_sha256(merged_contents_fpath),
     )
@@ -809,7 +815,8 @@ def _aggregated_shards(run_dir: Path) -> list[Path] | None:
 
     The merged rows have none of the shards' failures or inventories, so a recheck reads the shards, as the
     aggregation did. A merged file that is gone, or not byte for byte the one the list was written for, is not
-    theirs, and a shard that is gone cannot be read: both raise rather than check rows without their failures.
+    theirs; a shard that is gone cannot be read, and one not byte for byte the one merged holds other rows. Each
+    raises rather than check rows other than the merged ones, or without their failures.
     """
     merged_fpath = run_dir / "rollouts.jsonl"
     sources_fpath = aggregation_sources_path_for(merged_fpath)
@@ -830,12 +837,22 @@ def _aggregated_shards(run_dir: Path) -> list[Path] | None:
             "the aggregation, or pass --rollouts-file rollouts.jsonl to check that file alone."
         )
     # Only the directories are resolved: each shard keeps its own name, and with it the sidecars beside it.
-    shards = [path.parent.resolve() / path.name for path in (run_dir / shard for shard in sources.shards)]
+    shards = [path.parent.resolve() / path.name for path in (run_dir / shard for shard, _, _ in sources.shards)]
     missing = [str(shard) for shard in shards if not shard.is_file()]
     if missing:
         raise FileNotFoundError(
             f"{merged_fpath} was merged from shards that are gone: {', '.join(missing)}. Recheck the shards, or pass "
             "--rollouts-file rollouts.jsonl to check the merged rows alone, without the shards' failures."
+        )
+    changed = [
+        str(shard)
+        for shard, (_, size, sha256) in zip(shards, sources.shards)
+        if shard.stat().st_size != size or _sha256(shard) != sha256
+    ]
+    if changed:
+        raise ValueError(
+            f"{merged_fpath} was merged from shards that changed since: {', '.join(changed)}. Rerun "
+            "`gym eval aggregate` to merge and check them as they are now."
         )
     return shards
 
@@ -875,8 +892,8 @@ def health_check_run_dir(
     does not change. Each limit set explicitly on ``limits`` overrides only that persisted limit and is recorded
     as an override; set to ``None`` it removes the limit. A limit not set keeps its persisted value.
 
-    A directory ``gym eval aggregate`` merged shards into is rechecked from those shards, so their failures and
-    inventories count as they did for the aggregation. An explicit ``rollout_file`` is checked alone."""
+    A directory ``gym eval aggregate`` merged shards into is rechecked from those shards, with the failures and
+    inventories beside them, as the aggregation checked them. An explicit ``rollout_file`` is checked alone."""
     path = Path(run_dir)
     shards = _aggregated_shards(path) if rollout_file is None else None
     rollout_paths = shards if shards is not None else _resolve_rollout_path(path, rollout_file)

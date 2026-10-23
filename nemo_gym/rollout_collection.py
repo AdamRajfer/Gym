@@ -16,6 +16,7 @@ import asyncio
 import bisect
 import functools
 import glob as glob_module
+import hashlib
 import json
 import logging
 import math
@@ -92,6 +93,7 @@ from nemo_gym.observability.model_calls import (
 )
 from nemo_gym.path_utils import (
     aggregate_metrics_path_for,
+    aggregation_sources_path_for,
     failures_path_for,
     materialized_path_for,
     resubmit_offset_path_for,
@@ -3195,6 +3197,8 @@ class RolloutCollectionHelper(BaseModel):
         persisted_success_keys.clear()
         if config.resume_from_cache and config.materialized_jsonl_fpath.exists() and output_fpath.exists():
             should_clear_outputs = False
+            # The rows this run adds are not the merged ones an aggregation's shard list names.
+            aggregation_sources_path_for(output_fpath).unlink(missing_ok=True)
             _drop_truncated_tail(output_fpath)
             if failures_fpath.exists():
                 _drop_truncated_tail(failures_fpath)
@@ -3273,11 +3277,12 @@ class RolloutCollectionHelper(BaseModel):
             if observer is not None:
                 observer.materialize.record((perf_counter() - materialize_started) * 1000.0)
             output_fpath.unlink(missing_ok=True)
-            # A fresh run must not inherit retry attempts or published metrics
+            # A fresh run must not inherit retry attempts, published metrics or a shard list
             # from an older run that used the same output path.
             failures_fpath.unlink(missing_ok=True)
             resubmit_offset_path_for(output_fpath).unlink(missing_ok=True)
             aggregate_metrics_path_for(output_fpath).unlink(missing_ok=True)
+            aggregation_sources_path_for(output_fpath).unlink(missing_ok=True)
 
         batch_completed_rows: List[Dict] = []
         batch_failure_rows: List[Dict] = []
@@ -4660,7 +4665,8 @@ class RolloutAggregationConfig(RunHealthConfig, BaseNeMoGymCLIConfig):
         default=True,
         description=(
             "Concatenate the matched shard JSONLs into output_jsonl_fpath alongside the metrics file, and list "
-            "them in '<stem>_sources.json' for `gym eval health-check` of that directory to read."
+            "them in '<stem>_sources.json', which `gym eval health-check` reads for a merged 'rollouts.jsonl'. "
+            "output_jsonl_fpath may be a shard only when it is the only one, and then nothing is listed."
         ),
     )
     count_failure_classes_as_zero: List[str] = Field(
@@ -4736,28 +4742,39 @@ class RolloutAggregationHelper(BaseModel):
         input_paths = _expand_input_glob(config.input_glob)
         if not input_paths:
             raise ConfigPathNotFoundError(f"No shards matched input_glob={config.input_glob!r}")
+        output_fpath = Path(config.output_jsonl_fpath)
+        in_place = output_fpath.resolve() in {Path(path).resolve() for path in input_paths}
+        if config.merge_shards and in_place and len(input_paths) > 1:
+            raise ConfigError(
+                f"output_jsonl_fpath={config.output_jsonl_fpath!r} is one of the shards input_glob matched, and "
+                "merging would replace it. Merge into another path, or set merge_shards=false."
+            )
         print(f"Aggregating {len(input_paths)} shard(s):")
         for p in input_paths:
             print(f"  - {p}")
 
         results: List[Dict] = []
         shard_keys: Dict[str, set] = {}
+        # Each shard's size and SHA-256 as read, for the merged file's shard list to name.
+        shard_digests: Dict[str, Tuple[int, str]] = {}
         for shard_path in input_paths:
             keys = shard_keys[shard_path] = set()
+            digest = hashlib.sha256()
             with open(shard_path, "rb") as f:
                 for line_no, line in enumerate(f, 1):
+                    digest.update(line)
                     line = line.strip()
                     if not line:
                         continue
                     result = loads_jsonl_line(line, shard_path, line_no)
                     keys.add((result.get(TASK_INDEX_KEY_NAME), result.get(ROLLOUT_INDEX_KEY_NAME)))
                     results.append(result)
+                shard_digests[shard_path] = (f.tell(), digest.hexdigest())
         print(f"Loaded {len(results)} rollout record(s) from {len(input_paths)} shard(s)")
 
         # Sort for deterministic aggregation ordering (matches run_from_config's post-collection sort)
         results.sort(key=lambda r: (r.get(TASK_INDEX_KEY_NAME), r.get(ROLLOUT_INDEX_KEY_NAME)))
 
-        output_fpath = Path(config.output_jsonl_fpath)
         output_fpath.parent.mkdir(parents=True, exist_ok=True)
 
         failures_fpaths = [failures_path_for(Path(path)) for path in input_paths]
@@ -4790,14 +4807,20 @@ class RolloutAggregationHelper(BaseModel):
 
             print(f"Merging shards into {output_fpath}")
             # The merged rows have none of the shards' failures or inventories, so a recheck of this directory reads
-            # the shards. Their list names the merged contents and is written before those take their place.
-            merging_fpath = output_fpath.with_name(f".{output_fpath.name}.{os.getpid()}.merging")
+            # the shards. Their list names what was read from them and the merged contents, and is written before
+            # those take their place. A symlinked output keeps its link, and the merged rows replace its target.
+            merged_fpath = output_fpath.resolve()
+            merging_fpath = merged_fpath.with_name(f".{merged_fpath.name}.{os.getpid()}.merging")
             try:
                 with merging_fpath.open("wb") as out:
                     for r in results:
                         out.write(orjson.dumps(r) + b"\n")
-                write_aggregation_sources(output_fpath, [Path(path) for path in input_paths], merging_fpath)
-                os.replace(merging_fpath, output_fpath)
+                # A run merged onto itself keeps its own sidecars beside it: a recheck of it alone is this check.
+                if not in_place:
+                    write_aggregation_sources(
+                        output_fpath, [(Path(path), *shard_digests[path]) for path in input_paths], merging_fpath
+                    )
+                os.replace(merging_fpath, merged_fpath)
             finally:
                 merging_fpath.unlink(missing_ok=True)
 

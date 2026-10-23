@@ -85,7 +85,12 @@ from nemo_gym.global_config import (
     TASK_SOURCE_KEY_NAME,
 )
 from nemo_gym.openai_utils import NeMoGymResponse, NeMoGymResponseOutputMessage, NeMoGymResponseOutputText
-from nemo_gym.path_utils import failures_path_for, materialized_path_for, resubmit_offset_path_for
+from nemo_gym.path_utils import (
+    aggregation_sources_path_for,
+    failures_path_for,
+    materialized_path_for,
+    resubmit_offset_path_for,
+)
 from nemo_gym.rollout_collection import (
     _NO_RESULT_FAILURE_CLASSES,
     _RUN_FAILURE_ERRORS,
@@ -2745,6 +2750,8 @@ def _prepare_resume(
         print("[multistage-elo] resuming multi-stage run from cache (fingerprint match)", file=sys.stderr, flush=True)
         if getattr(rollout_collection_config, "resubmit", False):
             record_resubmit_offset(output_fpath)
+    # The rows this run writes are not the merged ones an aggregation's shard list names.
+    aggregation_sources_path_for(output_fpath).unlink(missing_ok=True)
     return build_file_resume(output_fpath, journal_fpath, fingerprint)
 
 

@@ -37,7 +37,7 @@ from nemo_gym.global_config import (
     TASK_INDEX_KEY_NAME,
     TASK_SOURCE_KEY_NAME,
 )
-from nemo_gym.path_utils import failures_path_for
+from nemo_gym.path_utils import aggregation_sources_path_for, failures_path_for
 from nemo_gym.rollout_collection import (
     ENVIRONMENT_SERVER_FAILURE_CLASS,
     NG_DISPATCH_DRAINED_KEY,
@@ -3416,6 +3416,19 @@ class TestPrepareResume:
 
         assert (tmp_path / "rollouts_resubmit_offset").read_text() == "3\n"
         assert (0, 0) not in resume.gated_keys.get(0, set())
+
+    @pytest.mark.parametrize("resume_from_cache", [False, True])
+    def test_drops_the_shard_list_of_the_output_it_takes_over(self, tmp_path: Path, resume_from_cache: bool) -> None:
+        out = tmp_path / "rollouts.jsonl"
+        journal = journal_path_for(out)
+        fp = compute_fingerprint(_two_stage_cfg(), REF_ELOS, _distribution(["t0"]))
+        out.write_bytes(b"")
+        append_journal_record(journal, {"stage_index": 0, "status": "planned", "task_ids": ["t0"]}, fp)
+        aggregation_sources_path_for(out).write_text("{}")
+
+        _prepare_resume(self._cfg(resume_from_cache), out, journal, fp)
+
+        assert not aggregation_sources_path_for(out).exists()
 
     def test_resume_disabled_clears_existing_and_empties_state(self, tmp_path: Path) -> None:
         out = tmp_path / "rollouts.jsonl"

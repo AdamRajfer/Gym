@@ -33,6 +33,7 @@ from nemo_gym.global_config import (
     TASK_INDEX_KEY_NAME,
     TASK_SOURCE_KEY_NAME,
 )
+from nemo_gym.path_utils import aggregation_sources_path_for
 from nemo_gym.rollout_collection import NG_TERMINAL_KEY
 from nemo_gym.rollout_reverification import (
     _RECOVERY_TWO_SOURCES_WARNING,
@@ -1749,6 +1750,23 @@ class TestPrepareOutputFpaths:
             "", str(tmp_path / "out.jsonl"), resume_from_cache=False, overwrite=False, append=False
         )
         assert not paths.output.exists()
+
+    @pytest.mark.parametrize("mode", ["overwrite", "append", "resume_from_cache"])
+    def test_drops_the_shard_list_of_an_output_it_takes_over(self, tmp_path: Path, mode: str) -> None:
+        """`gym eval aggregate` listed the shards of the rows this run replaces or appends to."""
+        out = tmp_path / "out.jsonl"
+        out.write_text("merged rows\n")
+        aggregation_sources_path_for(out).write_text("{}")
+
+        _prepare_output_fpaths(
+            "",
+            str(out),
+            resume_from_cache=mode == "resume_from_cache",
+            overwrite=mode == "overwrite",
+            append=mode == "append",
+        )
+
+        assert not aggregation_sources_path_for(out).exists()
 
     def test_keeps_existing_files_when_resuming_regardless_of_overwrite(self, tmp_path: Path) -> None:
         out = tmp_path / "out.jsonl"

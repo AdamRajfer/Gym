@@ -1365,8 +1365,8 @@ COMMANDS = {
                     type=Path,
                     metavar="PATH",
                     help=(
-                        "Rollout JSONL path; relative paths resolve under RUN_DIR (default: rollouts.jsonl, or the "
-                        "shards `gym eval aggregate` merged into it)."
+                        "Rollout JSONL path, checked alone; relative paths resolve under RUN_DIR (default: "
+                        "rollouts.jsonl, or the shards `gym eval aggregate` merged into it)."
                     ),
                 )
             ),

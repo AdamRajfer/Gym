@@ -8426,7 +8426,7 @@ class TestRolloutAggregationHelper:
         sources = orjson.loads(
             aggregation_sources_path_for(tmp_path / "moved" / "merged" / "rollouts.jsonl").read_bytes()
         )
-        assert sources["shards"] == ["../run_a/rollouts.jsonl", "../run_b/rollouts.jsonl"]
+        assert [shard for shard, _, _ in sources["shards"]] == ["../run_a/rollouts.jsonl", "../run_b/rollouts.jsonl"]
 
     async def test_an_explicit_rollouts_file_is_checked_alone(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, empty_global_config: MagicMock
@@ -8569,6 +8569,110 @@ class TestRolloutAggregationHelper:
         await self._merge(monkeypatch, merged_dir, run_a, run_b, merge_shards=False, disable_health_check=True)
 
         assert not aggregation_sources_path_for(merged_dir / "rollouts.jsonl").exists()
+
+    @pytest.mark.parametrize("resume", [False, True], ids=["fresh run", "resumed run"])
+    async def test_a_run_that_takes_over_a_merged_output_drops_its_shard_list(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, empty_global_config: MagicMock, resume: bool
+    ) -> None:
+        """The run's rows, sidecar and inventory are the ones beside the output now, not the listed shards."""
+
+        class Helper(RolloutCollectionHelper):
+            def _run_examples_with_metadata(self, examples, *args, **kwargs):
+                futures = [Future() for _ in examples]
+                for future, example in zip(futures, examples):
+                    future.set_result(_CompletedRollout(row=example, result={"reward": 1.0}, rollout_latency_ms=None))
+                return futures
+
+        output = tmp_path / "results" / "rollouts.jsonl"
+        self._write_rows(
+            tmp_path / "input.jsonl",
+            *(
+                {"responses_create_params": {"input": []}, AGENT_REF_KEY_NAME: {"name": "agent_a"}, "i": i}
+                for i in range(2)
+            ),
+        )
+        config = dict(
+            input_jsonl_fpath=str(tmp_path / "input.jsonl"), output_jsonl_fpath=str(output), disable_aggregation=True
+        )
+        await Helper().run_from_config(RolloutCollectionConfig(**config, resume_from_cache=False))
+        # An aggregation into the run's output leaves the run's first rollout there, and its shard list.
+        shard = tmp_path / "shard" / "rollouts.jsonl"
+        self._write_rows(shard, orjson.loads(output.read_bytes().splitlines()[0]))
+        await self._merge(monkeypatch, output.parent, shard, disable_health_check=True)
+
+        await Helper().run_from_config(RolloutCollectionConfig(**config, resume_from_cache=resume))
+
+        artifacts = health_check_run_dir(output.parent).summary["run"]["artifacts"]
+        assert (artifacts["expected"], artifacts["missing"]) == (2, 0)
+
+    @pytest.mark.parametrize("change", ["appended", "edited, same size"])
+    async def test_a_recheck_refuses_a_shard_changed_since_the_aggregation(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, empty_global_config: MagicMock, change: str
+    ) -> None:
+        """The merged rows and metrics hold what the shard held then: its rows now would be checked in their place."""
+        run_a, run_b = self._landed_and_failed_runs(tmp_path, same_indices=False)
+        merged_dir = tmp_path / "merged"
+        summary_fpath = await self._merge(monkeypatch, merged_dir, run_a, run_b)
+        aggregated = summary_fpath.read_bytes()
+        if change == "appended":
+            with run_a.open("ab") as out:
+                out.write(orjson.dumps(self._rollout(1, "agent_a", reward=1.0)) + b"\n")
+        else:
+            run_a.write_bytes(run_a.read_bytes().replace(b'"reward":1.0', b'"reward":0.0'))
+
+        with pytest.raises(ValueError, match="run_a/rollouts.jsonl") as error:
+            health_check_run_dir(merged_dir)
+        assert "Rerun `gym eval aggregate`" in str(error.value)
+        assert summary_fpath.read_bytes() == aggregated
+
+    @pytest.mark.parametrize("output", ["the shard", "a link to it"])
+    async def test_merging_into_one_of_the_shards_is_refused_before_anything_is_written(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, empty_global_config: MagicMock, output: str
+    ) -> None:
+        """The merge would replace a shard it read, and its list would name the merged rows as that shard's."""
+        run_a, run_b = self._landed_and_failed_runs(tmp_path, same_indices=False)
+        merged_dir = run_a.parent
+        if output == "a link to it":
+            merged_dir = tmp_path / "merged"
+            merged_dir.mkdir()
+            (merged_dir / "rollouts.jsonl").symlink_to(run_a)
+        files = {path: path.read_bytes() for path in tmp_path.rglob("*") if path.is_file()}
+
+        with pytest.raises(ConfigError, match="one of the shards"):
+            await self._merge(monkeypatch, merged_dir, run_a, run_b)
+
+        assert {path: path.read_bytes() for path in tmp_path.rglob("*") if path.is_file()} == files
+
+    async def test_a_run_merged_onto_itself_is_rechecked_alone(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, empty_global_config: MagicMock
+    ) -> None:
+        """The in-place repair of a run's metrics: its rows are re-sorted, and its sidecars stay beside it."""
+        run_a, _ = self._landed_and_failed_runs(tmp_path, same_indices=True)
+        self._write_rows(materialized_path_for(run_a), self._rollout(0, "agent_a"), self._rollout(1, "agent_a"))
+        self._write_rows(run_a, self._rollout(1, "agent_a", reward=1.0), self._rollout(0, "agent_a", reward=1.0))
+        unsorted = run_a.read_bytes()
+
+        aggregated = orjson.loads((await self._merge(monkeypatch, run_a.parent, run_a)).read_bytes())["run"]
+
+        assert run_a.read_bytes() != unsorted
+        assert self._accounting(health_check_run_dir(run_a.parent).summary["run"]) == self._accounting(aggregated)
+
+    async def test_a_linked_output_is_written_through(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, empty_global_config: MagicMock
+    ) -> None:
+        """The link stays, its target holds the merged rows, and the list sits beside the link."""
+        run_a, run_b = self._landed_and_failed_runs(tmp_path, same_indices=False)
+        target = tmp_path / "store" / "rollouts.jsonl"
+        self._write_rows(target)
+        link = tmp_path / "merged" / "rollouts.jsonl"
+        link.parent.mkdir()
+        link.symlink_to(target)
+
+        aggregated = orjson.loads((await self._merge(monkeypatch, link.parent, run_a, run_b)).read_bytes())["run"]
+
+        assert link.is_symlink() and target.read_bytes() == run_a.read_bytes()
+        assert [path.name for path in target.parent.iterdir()] == ["rollouts.jsonl"]
+        assert self._accounting(health_check_run_dir(link.parent).summary["run"]) == self._accounting(aggregated)
 
     @pytest.mark.parametrize("run1_has", ["a row", "a failure"])
     async def test_runs_that_reuse_task_indices_do_not_hide_each_others_lost_rollouts(

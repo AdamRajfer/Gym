@@ -54,7 +54,7 @@ from nemo_gym.global_config import (
     rollout_run_key,
     rollout_run_labels,
 )
-from nemo_gym.path_utils import aggregate_metrics_path_for, failures_path_for
+from nemo_gym.path_utils import aggregate_metrics_path_for, aggregation_sources_path_for, failures_path_for
 from nemo_gym.rollout_collection import (
     NG_FAILURE_CLASS_KEY,
     NG_NO_PERSIST_KEY,
@@ -946,6 +946,8 @@ def _prepare_output_fpaths(
                     f"Output file already exists: '{fpath}'. Pass --overwrite to delete it and start fresh, "
                     "or --resume to continue from it."
                 )
+    # The rows this run writes are not the merged ones an aggregation's shard list names.
+    aggregation_sources_path_for(output_fpath).unlink(missing_ok=True)
     return OutputPaths(output=output_fpath, failures=failures_fpath)
 
 

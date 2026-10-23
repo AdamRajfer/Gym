@@ -133,6 +133,7 @@ def _open_mlflow_exporter(monkeypatch: MonkeyPatch, config: DictConfig) -> tuple
     client = MagicMock()
     client.get_experiment_by_name.return_value = MagicMock(experiment_id="exp-1")
     client.create_run.return_value = MagicMock(info=MagicMock(run_id="run-1"))
+    client.get_run.return_value.info.lifecycle_stage = "active"
     monkeypatch.setattr(mlflow_module, "MlflowClient", MagicMock(return_value=client))
     exporter = MLflowExporter(config)
     exporter.setup()
@@ -161,7 +162,10 @@ class FakeMlflowClient:
         pass
 
     def get_run(self, run_id: str) -> SimpleNamespace:
-        return SimpleNamespace(data=SimpleNamespace(params=dict(self.params), tags=dict(self.tags)))
+        return SimpleNamespace(
+            info=SimpleNamespace(lifecycle_stage="active"),
+            data=SimpleNamespace(params=dict(self.params), tags=dict(self.tags)),
+        )
 
     def set_tag(self, run_id: str, key: str, value: str) -> None:
         self.tags[key] = value
@@ -183,6 +187,7 @@ class FakeMlflowClient:
 def _segment_config(mlflow_config: DictConfig, tmp_path: Path, *, host: str, port: int) -> DictConfig:
     config = deepcopy(mlflow_config)
     config["output_jsonl_fpath"] = str(tmp_path / "rollouts.jsonl")
+    config["resume_from_cache"] = True
     config["policy_model"] = {"vllm_model": {"host": host, "port": port, "model": "qwen"}}
     config["seed"] = 7
     return config
@@ -367,6 +372,7 @@ class TestWandbExporter:
         self, monkeypatch: MonkeyPatch, wandb_config: DictConfig, tmp_path
     ) -> None:
         wandb_config["output_jsonl_fpath"] = str(tmp_path / "rollouts.jsonl")
+        wandb_config["resume_from_cache"] = True
         init = MagicMock(return_value=MagicMock(id="run-1"))
         monkeypatch.setattr(wandb_module.wandb, "init", init)
         monkeypatch.delenv("WANDB_API_KEY", raising=False)
@@ -378,6 +384,20 @@ class TestWandbExporter:
         first, second = init.call_args_list
         assert "id" not in first.kwargs
         assert (second.kwargs["id"], second.kwargs["resume"]) == ("run-1", "allow")
+
+    def test_a_fresh_run_into_the_same_output_starts_a_new_wandb_run(
+        self, monkeypatch: MonkeyPatch, wandb_config: DictConfig, tmp_path
+    ) -> None:
+        wandb_config["output_jsonl_fpath"] = str(tmp_path / "rollouts.jsonl")
+        (tmp_path / "rollouts_wandb_run_id").write_text("old-run")
+        init = MagicMock(return_value=MagicMock(id="new-run"))
+        monkeypatch.setattr(wandb_module.wandb, "init", init)
+        monkeypatch.delenv("WANDB_API_KEY", raising=False)
+
+        WandbExporter(wandb_config).setup()
+
+        assert "id" not in init.call_args.kwargs
+        assert (tmp_path / "rollouts_wandb_run_id").read_text() == "new-run"
 
     def test_logging_before_setup_raises(self, wandb_config: DictConfig) -> None:
         with pytest.raises(RuntimeError, match="not open"):
@@ -538,6 +558,7 @@ class TestMLflowExporter:
         self, monkeypatch: MonkeyPatch, mlflow_config: DictConfig, tmp_path
     ) -> None:
         mlflow_config["output_jsonl_fpath"] = str(tmp_path / "rollouts.jsonl")
+        mlflow_config["resume_from_cache"] = True
 
         first, _ = _open_mlflow_exporter(monkeypatch, mlflow_config)
         second, client = _open_mlflow_exporter(monkeypatch, mlflow_config)
@@ -551,14 +572,17 @@ class TestMLflowExporter:
         self, monkeypatch: MonkeyPatch, mlflow_config: DictConfig, tmp_path
     ) -> None:
         mlflow_config["output_jsonl_fpath"] = str(tmp_path / "rollouts.jsonl")
+        mlflow_config["resume_from_cache"] = True
         first, created = _open_mlflow_exporter(monkeypatch, mlflow_config)
         created.set_tag.assert_not_called()
 
         client = MagicMock()
-        client.get_run.return_value = MagicMock(data=MagicMock(tags={}))
+        client.get_run.return_value = MagicMock(info=MagicMock(lifecycle_stage="active"), data=MagicMock(tags={}))
         monkeypatch.setattr(mlflow_module, "MlflowClient", MagicMock(return_value=client))
         MLflowExporter(mlflow_config).setup()
-        client.get_run.return_value = MagicMock(data=MagicMock(tags={"gym_resume_count": "1"}))
+        client.get_run.return_value = MagicMock(
+            info=MagicMock(lifecycle_stage="active"), data=MagicMock(tags={"gym_resume_count": "1"})
+        )
         MLflowExporter(mlflow_config).setup()
 
         assert client.set_tag.call_args_list == [
@@ -780,3 +804,70 @@ class TestMLflowResumedRunConfig:
         resumed_keys = [key for batch in client.logged_param_batches[first_segment_batches:] for key in batch]
         assert resumed_keys == ["num_repeats"]
         assert client.params["num_repeats"] == "4"
+
+
+@pytest.fixture
+def mlflow_store(tmp_path: Path, monkeypatch: MonkeyPatch, mlflow_config: DictConfig) -> DictConfig:
+    """A run writing `tmp_path / "rollouts.jsonl"` that resumes its output, tracked in a real local MLflow store."""
+    monkeypatch.setenv("MLFLOW_ALLOW_FILE_STORE", "true")
+    config = deepcopy(mlflow_config)
+    config["mlflow_tracking_uri"] = f"file://{tmp_path / 'mlruns'}"
+    config["mlflow_tracking_token"] = None
+    config["output_jsonl_fpath"] = str(tmp_path / "rollouts.jsonl")
+    config["resume_from_cache"] = True
+    return config
+
+
+def _rollout(task: int) -> dict[str, Any]:
+    return {"_ng_task_index": task, "_ng_rollout_index": 0, "reward": 1.0}
+
+
+class TestMLflowReopenAgainstARealStore:
+    """The real MLflow client: `log_table` appends to an existing table, and a deleted run cannot be reopened."""
+
+    def test_a_resumed_run_logs_each_rollout_once(self, mlflow_store: DictConfig) -> None:
+        first = MLflowExporter(mlflow_store)
+        first.setup()
+        first.export_rollouts([_rollout(0), _rollout(1)])
+        first.teardown()
+
+        # A resumed job is handed every rollout of its output, the earlier ones too.
+        second = MLflowExporter(mlflow_store)
+        second.setup()
+        second.export_rollouts([_rollout(0), _rollout(1), _rollout(2)])
+        table = orjson.loads(Path(second.client.download_artifacts(second.run_id, "rollouts.json")).read_bytes())
+        second.teardown()
+
+        tasks = sorted(orjson.loads(row[table["columns"].index("Rollout")])["_ng_task_index"] for row in table["data"])
+        assert tasks == [0, 1, 2]
+
+    def test_a_fresh_run_into_the_same_output_starts_a_new_run(self, mlflow_store: DictConfig) -> None:
+        first = MLflowExporter(mlflow_store)
+        first.setup()
+        first_run = first.run_id
+        first.teardown()
+
+        mlflow_store["resume_from_cache"] = False
+        fresh = MLflowExporter(mlflow_store)
+        fresh.setup()
+        fresh_run = fresh.run_id
+        fresh.teardown()
+
+        assert fresh_run != first_run
+        assert Path(mlflow_store["output_jsonl_fpath"]).with_name("rollouts_mlflow_run_id").read_text() == fresh_run
+
+    def test_a_deleted_run_is_replaced_by_a_new_one(self, mlflow_store: DictConfig) -> None:
+        first = MLflowExporter(mlflow_store)
+        first.setup()
+        deleted = first.run_id
+        first.teardown()
+        mlflow_module.MlflowClient(tracking_uri=mlflow_store["mlflow_tracking_uri"]).delete_run(deleted)
+
+        resumed = MLflowExporter(mlflow_store)
+        resumed.setup()
+        resumed.export_rollouts([_rollout(0)])
+        replacement = resumed.run_id
+        resumed.teardown()
+
+        assert replacement != deleted
+        assert Path(mlflow_store["output_jsonl_fpath"]).with_name("rollouts_mlflow_run_id").read_text() == replacement

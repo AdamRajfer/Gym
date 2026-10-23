@@ -96,8 +96,12 @@ class BaseExporter(ABC):
         return output.with_name(f"{output.stem}_{self.name}_run_id")
 
     def _recorded_run_id(self) -> Optional[str]:
+        """The run to reopen: the one recorded next to the output, when this run resumes that output.
+
+        A fresh run into the same output starts its rollouts anew, so it starts a new tracking run too.
+        """
         run_id_fpath = self._run_id_fpath()
-        if run_id_fpath is None or not run_id_fpath.exists():
+        if run_id_fpath is None or not run_id_fpath.exists() or not self.global_config_dict.get("resume_from_cache"):
             return None
         return run_id_fpath.read_text().strip()
 

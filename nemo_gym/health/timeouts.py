@@ -73,7 +73,7 @@ class TimeoutEvent(BaseModel):
 
 
 class LegacySignal(NamedTuple):
-    """A row field that a Gym component sets when its own deadline fires.
+    """A row field that a Gym component sets when its own deadline fires; a dotted name reaches a nested field.
 
     ``value`` is the field's value on a timeout, or None for a flag that is set when nonzero. ``written_as``
     is the source text in ``producer`` that writes it; the tests check that it is still there.
@@ -85,7 +85,10 @@ class LegacySignal(NamedTuple):
     written_as: str
 
     def matches(self, row: Mapping[str, Any]) -> bool:
-        found = row.get(self.field)
+        *parents, field = self.field.split(".")
+        for parent in parents:
+            row = _mapping(row.get(parent))
+        found = row.get(field)
         return bool(found) if self.value is None else found == self.value
 
     @property
@@ -106,14 +109,21 @@ LEGACY_TIMEOUT_SIGNALS = (
         "nemo_gym/base_environment_server.py",
         'failure_reason="Episode timed out"',
     ),
-    LegacySignal("agent_timed_out", None, "responses_api_agents/codex_agent/app.py", "agent_timed_out: bool"),
+    LegacySignal("agent_timed_out", None, "responses_api_agents/codex_agent/app.py", '"agent_timed_out": timed_out}'),
     LegacySignal("agent_timeout_error", None, "responses_api_agents/harbor_agent/app.py", "agent_timeout_error=int("),
     LegacySignal(
         "eval_timed_out", None, "resources_servers/swebench_pro/app.py", '"eval_timed_out": result.timed_out'
     ),
+    # BrowseComp's per-rollout `rollout_timeout_s`.
+    LegacySignal("timed_out", None, "responses_api_agents/browsecomp_agent/app.py", 'update={"timed_out": int(bool('),
+    # Terminal-Bench's agent termination record, which the row carries.
+    LegacySignal(
+        "termination.reason",
+        "timeout",
+        "resources_servers/terminal_bench_4/app.py",
+        'session.termination = AgentTermination(reason="timeout"',
+    ),
 )
-# Terminal-Bench writes its agent's termination record onto the row; "timeout" means its deadline fired.
-TERMINATION_TIMEOUT = "timeout"
 
 
 class TimedOut(NamedTuple):
@@ -154,29 +164,43 @@ class _Span:
 
     @property
     def is_timed(self) -> bool:
-        return (self.start is not None and self.end is not None) or self.duration_s is not None
+        # A call that ends before it starts, as a clock stepped back can record, or lasts less than nothing has
+        # no usable timing.
+        if self.start is not None and self.end is not None:
+            return self.start <= self.end
+        return self.duration_s is not None and self.duration_s >= 0
+
+
+# The collector's join attaches one of these when it read a capture only in part.
+_PARTIAL_CAPTURE_GAPS = frozenset(
+    {"model_call_capture_records_unreadable", "model_call_capture_pending", "model_call_capture_incomplete"}
+)
 
 
 def read_rollout_timing(row: Mapping[str, Any]) -> RolloutTiming:
     """Everything the section needs from one rollout's final record.
 
     A malformed record never raises: a value of the wrong type reads as not measured, and the record checks
-    report the record itself.
+    report the record itself. A capture read only in part does not measure the model time, so its calls are left
+    out.
     """
     row = _mapping(row)
     trajectory = _mapping(row.get("ng_trajectory"))
-    model_calls = _objects(_mapping(row.get("ng_model_call_capture")).get("calls"))
+    capture = _mapping(row.get("ng_model_call_capture"))
+    partial = any(gap.get("code") in _PARTIAL_CAPTURE_GAPS for gap in _objects(capture.get("gaps")))
+    model_calls = [] if partial else _objects(capture.get("calls"))
     policy_calls = [call for call in model_calls if _is_policy_call(call)]
     other_calls = [call for call in model_calls if not _is_policy_call(call)]
     events, invalid_events = _timeout_events(row)
     speeds = (_tokens_per_s(call) for call in policy_calls)
     tool_spans = _tool_spans(trajectory)
+    elapsed_s = _number(row.get(ELAPSED_S_KEY))
     return RolloutTiming(
         failed=row.get("_ng_failure_class") is not None,
-        timed_out=_timed_out(row, events),
+        timed_out=classify_timeout(row),
         event_ids=tuple(event.event_id for event in events),
         invalid_events=invalid_events,
-        elapsed_s=_number(row.get(ELAPSED_S_KEY)),
+        elapsed_s=elapsed_s if elapsed_s and elapsed_s > 0 else None,
         has_model_calls=bool(model_calls),
         policy_s=_busy_seconds([_model_call_span(call) for call in policy_calls]),
         other_model_s=_busy_seconds([_model_call_span(call) for call in other_calls]),
@@ -224,16 +248,15 @@ def _timeout_events(row: Mapping[str, Any]) -> tuple[list[TimeoutEvent], int]:
     return list(events.values()), invalid
 
 
-def _timed_out(row: Mapping[str, Any], events: list[TimeoutEvent]) -> Optional[TimedOut]:
-    """Why the rollout counts as timed out, or None. A typed event wins over a legacy signal; of several
-    events, the first one names the limit."""
+def classify_timeout(row: Mapping[str, Any]) -> Optional[TimedOut]:
+    """Why a rollout's record counts as timed out, or None: the one classifier for this section and the run timing
+    table. A typed event wins over a legacy signal; of several events, the first one names the limit."""
+    events, _ = _timeout_events(row)
     if events:
         return TimedOut("typed", events[0].limit, events[0].enforcer)
     for signal in LEGACY_TIMEOUT_SIGNALS:
         if signal.matches(row):
             return TimedOut("legacy", signal.name, None)
-    if _mapping(row.get("termination")).get("reason") == TERMINATION_TIMEOUT:
-        return TimedOut("legacy", "termination.reason=timeout", None)
     return None
 
 
@@ -286,9 +309,12 @@ def _tool_call_span(call: Mapping[str, Any]) -> _Span:
 def _busy_seconds(spans: list[_Span]) -> Optional[float]:
     """How long at least one of the calls was running, or None when a call has no timing.
 
-    Overlapping calls, such as parallel subagents, count once. A call that reports only its duration adds it.
+    Overlapping calls, such as parallel subagents, count once. A call that reports only its duration cannot be
+    placed against other calls, so it is measured alone and leaves a union with other calls unknown.
     """
     if not all(span.is_timed for span in spans):
+        return None
+    if len(spans) > 1 and any(span.start is None or span.end is None for span in spans):
         return None
     busy = sum(span.duration_s for span in spans if span.start is None or span.end is None)
     covered_until = None
@@ -338,18 +364,28 @@ class TimeoutsSection(BaseModel):
     time_split: TimeSplit
 
 
-def summarize_timeouts(timings: Iterable[RolloutTiming]) -> TimeoutsSection:
-    """The section for a run, from the timing of every rollout's final record."""
+def summarize_timeouts(timings: Iterable[RolloutTiming], attempts: Iterable[RolloutTiming] = ()) -> TimeoutsSection:
+    """The section for a run, from the timing of every rollout's final record.
+
+    A limit or enforcer named only by ``attempts``, the run's earlier failed attempts, is counted 0, as the failure
+    export counts each failure class the sidecars name: a reopened tracking run keeps a counter's last value until
+    it is sent.
+    """
     timings = list(timings)
     timed_out = [timing for timing in timings if timing.timed_out]
+    named = [timing.timed_out for timing in attempts if timing.timed_out]
+    by_limit = Counter(dict.fromkeys((t.limit or "unknown" for t in named), 0))
+    by_limit.update(t.timed_out.limit or "unknown" for t in timed_out)
+    by_enforcer = Counter(dict.fromkeys((t.enforcer for t in named if t.enforcer), 0))
+    by_enforcer.update(t.timed_out.enforcer for t in timed_out if t.timed_out.enforcer)
     return TimeoutsSection(
         rollouts=len(timings),
         timed_out=len(timed_out),
         by_evidence={
             evidence: sum(t.timed_out.evidence == evidence for t in timed_out) for evidence in ("typed", "legacy")
         },
-        by_limit=dict(sorted(Counter(t.timed_out.limit or "unknown" for t in timed_out).items())),
-        by_enforcer=dict(sorted(Counter(t.timed_out.enforcer for t in timed_out if t.timed_out.enforcer).items())),
+        by_limit=dict(sorted(by_limit.items())),
+        by_enforcer=dict(sorted(by_enforcer.items())),
         events=sum(len(t.event_ids) for t in timed_out),
         invalid_events=sum(t.invalid_events for t in timings),
         failed_without_signal=sum(t.failed and not t.timed_out for t in timings),

@@ -294,8 +294,9 @@ as a number of calls.
 
 `run.stats.timeouts` counts the rollouts that ran out of time. It reads each rollout's final record: its row in the
 rollout file, or the last failure row of a rollout that never landed. `gym eval health-check` recomputes it from the
-same files. After `gym eval aggregate` merges shards, recheck the shards: the merged file holds their rows but not
-their failure rows. It is a report only and changes no score, verdict or row.
+same files, and from the run's model-call captures when given `--model-call-capture-dir` (see `time_split`). After
+`gym eval aggregate` merges shards, recheck the shards: the merged file holds their rows but not their failure rows.
+It is a report only and changes no score or verdict.
 
 A rollout counts as timed out on one of two kinds of evidence:
 
@@ -314,6 +315,7 @@ A rollout counts as timed out on one of two kinds of evidence:
    | `agent_timed_out` | the Codex agent |
    | `agent_timeout_error` | the Harbor agent |
    | `eval_timed_out` | SWE-bench Pro's verification |
+   | `timed_out` | BrowseComp's per-rollout limit (`rollout_timeout_s`) |
    | `termination.reason=timeout` | Terminal-Bench's agent termination record |
 
 How long a rollout took never makes it count as timed out. A failed rollout with no evidence is counted in
@@ -343,18 +345,25 @@ How long a rollout took never makes it count as timed out. A failed rollout with
 ```
 
 `elapsed_s` is the `/run` wall clock that `gym eval run` stamps on each row as `_ng_elapsed_s`. `time_split` shows
-where the time of the timed-out rollouts went. It covers the timed-out rollouts that have both that stamp and captured
-model calls. Each share is the time spent in one kind of call over their summed elapsed time: policy-model calls,
-other models' calls (a judge or a user simulator) and tool calls. `untracked` is the time in which none of these calls
-ran, such as setup, verification or a call still running at the deadline. Overlapping calls count once, also across
-kinds for `untracked`, so the shares can add up to more than the rest when, for example, a tool calls the policy
-model. A rollout's busy time is capped at its elapsed time. A share is null when one of those rollouts does not measure that kind of time: a model call without
-timing, or a trajectory without tool timing. `policy_output_tokens_per_s` is end to end, so it includes queue and
-prefill time.
+where the time of the timed-out rollouts went. It covers the timed-out rollouts that have both that stamp and a whole
+capture of their model calls. A rollout that failed without a row has no capture on it, so the check reads its capture
+file from the run's capture dir: collection passes its `model_call_capture_dir`, a recheck needs
+`--model-call-capture-dir` and without it warns when the run has failed rollouts and timed-out rollouts left out of the
+split, and `gym eval aggregate` does not read capture files yet. A capture with a write still pending, a failed write
+or an unreadable record leaves its rollout out. Each share is the time spent in one kind of call over their summed
+elapsed time: policy-model calls, other models' calls (a judge or a user simulator) and tool calls. `untracked` is the time in which none of these calls ran, such as setup or verification.
+Overlapping calls count once, also across kinds for `untracked`, so the shares can add up to more than the rest when,
+for example, a tool calls the policy model. A rollout's busy time is capped at its elapsed time. A share is null when
+one of those rollouts does not measure that kind of time: a call without timing or one that ends before it starts,
+calls of which one reports only its duration and so cannot be placed against the others, or a trajectory without
+tool timing. Collection marks a row whose agent sent no valid trajectory or observations with a
+`tool_timing_unavailable` gap, so its tool time is unknown rather than zero. `policy_output_tokens_per_s` is end to
+end, so it includes queue and prefill time.
 
 When an exporter is configured, `gym eval run` and `gym eval aggregate` also send this section's numbers as flat keys,
-such as `health/timeouts/timed_out` and `health/timeouts/by_evidence/typed`. A null value is not sent. A failed export
-is logged and does not stop the run.
+such as `health/timeouts/timed_out` and `health/timeouts/by_evidence/typed`. A null value is not sent. A limit or
+enforcer that only an earlier failed attempt named is sent as 0, so a resumed tracking run does not keep its old
+count. A failed export is logged and does not stop the run.
 
 A run stopped by SIGTERM gets a provisional summary: the run accounting in `run.artifacts`, with `partial: true`, and no `run.verdicts` or `rollout_verdicts.jsonl`. It evaluates only `run_excessive_failures`, which needs no rollouts, and lists every other check in `run.artifacts.not_evaluated`. Its `healthy` is false when the accounting already has a reason and null otherwise. Run `gym eval health-check` on the run directory for the full summary; it judges the run by the limits the provisional summary recorded. A stopped run exits with status 143, or with status 1 (`EVAL FAILED`) when `require_complete` is on, which is the default under `gym eval submit`.
 

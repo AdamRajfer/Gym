@@ -45,6 +45,7 @@ from nemo_gym.rollout_collection import (
     RolloutAggregationHelper,
     RolloutCollectionConfig,
     RolloutCollectionHelper,
+    _attach_trajectory_record,
 )
 from nemo_gym.rollout_health import health_check_run_dir
 from tests.unit_tests.test_rollout_collection import (  # noqa: F401 - fixture
@@ -124,15 +125,19 @@ class TestEvidence:
 
     @pytest.mark.parametrize("signal", LEGACY_TIMEOUT_SIGNALS, ids=lambda signal: signal.name)
     def test_each_legacy_signal_counts_as_a_legacy_timeout(self, signal) -> None:
-        result = section({signal.field: signal.value if signal.value is not None else 1})
+        *parents, field = signal.field.split(".")
+        row = {field: signal.value if signal.value is not None else 1}
+        for parent in reversed(parents):
+            row = {parent: row}
 
-        assert result["by_limit"] == {signal.name: 1}
+        assert section(row)["by_limit"] == {signal.name: 1}
 
     def test_a_flag_set_to_zero_is_not_a_timeout(self) -> None:
         assert section({"agent_timeout_error": 0})["timed_out"] == 0
 
-    def test_a_terminal_bench_termination_by_timeout_is_a_legacy_timeout(self) -> None:
-        assert section({"termination": {"reason": "timeout"}})["by_limit"] == {"termination.reason=timeout": 1}
+    def test_a_browsecomp_rollout_stopped_by_its_limit_is_timed_out(self) -> None:
+        """The run timing table counts BrowseComp's `timed_out`; this section classifies the same way."""
+        assert section({"timed_out": 1, "reward": 0.0})["by_limit"] == {"timed_out": 1}
 
     def test_a_slow_failure_with_no_signal_is_never_counted_as_timed_out(self) -> None:
         row = {NG_FAILURE_CLASS_KEY: "agent_run_error", ELAPSED_S_KEY: 10_000.0}
@@ -214,6 +219,46 @@ class TestTimeSplit:
 
     def test_rollouts_without_captured_calls_are_not_split(self) -> None:
         assert section(timed_out_row())["time_split"]["rollouts_with_captures"] == 0
+
+    def test_a_call_that_ends_before_it_starts_is_not_timed(self) -> None:
+        """Call bounds are wall-clock times, which a clock stepped back during the call inverts."""
+        call = {**model_call(0, 2), "started_at": T0 + 5, "completed_at": T0 + 3}
+
+        split = section(timed_out_row(elapsed=10.0, calls=[call], tools=[]))["time_split"]
+
+        assert (split["policy_model"], split["untracked"]) == (None, None)
+
+    def test_a_rollout_without_a_positive_elapsed_time_is_not_split(self) -> None:
+        rows = [timed_out_row(elapsed=elapsed, calls=[model_call(0, 4)], tools=[]) for elapsed in (10.0, -10.0)]
+
+        split = section(*rows)["time_split"]
+
+        assert (split["rollouts_with_captures"], split["policy_model"]) == (1, 0.4)
+
+    @pytest.mark.parametrize(
+        ("calls", "tools", "expected"),
+        [
+            ([model_call(0, 40)], [{"duration_ms": 40_000}], (0.4, 0.4, None)),
+            ([{"latency_total_ms": 20_000}, {"latency_total_ms": 20_000}], [], (None, 0.0, None)),
+            ([{"latency_total_ms": 40_000}], [], (0.4, 0.0, 0.6)),
+        ],
+        ids=["tool-beside-a-timed-call", "two-policy-calls", "one-policy-call"],
+    )
+    def test_a_call_known_only_by_its_duration_is_measured_only_alone(self, calls, tools, expected) -> None:
+        """Such a call cannot be placed against other calls, so how far it overlapped them is unknown."""
+        split = section(timed_out_row(elapsed=100.0, calls=calls, tools=tools))["time_split"]
+
+        assert (split["policy_model"], split["tool"], split["untracked"]) == expected
+
+    @pytest.mark.parametrize(
+        "code",
+        ["model_call_capture_records_unreadable", "model_call_capture_pending", "model_call_capture_incomplete"],
+    )
+    def test_a_capture_read_in_part_is_not_split(self, code: str) -> None:
+        row = timed_out_row(calls=[model_call(0, 40)], tools=[])
+        row["ng_model_call_capture"]["gaps"] = [{"code": code}]
+
+        assert section(row)["time_split"]["rollouts_with_captures"] == 0
 
 
 def test_an_empty_run_has_an_empty_section() -> None:
@@ -351,6 +396,107 @@ class TestCapturesOfFailedRollouts:
 
         assert timeouts["time_split"]["rollouts_with_captures"] == 0
 
+    def test_a_recheck_without_the_capture_dir_says_how_to_time_failed_rollouts(self, tmp_path: Path) -> None:
+        with pytest.warns(RuntimeWarning, match="--model-call-capture-dir") as warned:
+            self.timeouts(tmp_path, [deadline_failure(0), deadline_failure(1)], {}, with_dir=False)
+
+        assert len([warning for warning in warned if "--model-call-capture-dir" in str(warning.message)]) == 1
+
+    def test_failed_rollouts_are_looked_up_in_one_listing_of_the_capture_dir(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A scan of the capture dir for each failed rollout made the check of a large run quadratic."""
+        monkeypatch.setattr(CaptureStore, "has_pending", lambda *_: pytest.fail("scanned the dir for one rollout"))
+        captures = {f"{task}-0": [exchange(0, 40)] for task in range(3)}
+
+        timeouts = self.timeouts(tmp_path, [deadline_failure(task) for task in range(3)], captures)
+
+        assert timeouts["time_split"]["rollouts_with_captures"] == 3
+
+    @pytest.mark.parametrize("partial", ["torn record", "pending write", "failed write"])
+    def test_a_partial_capture_leaves_the_rollout_unmeasured(self, tmp_path: Path, partial: str) -> None:
+        """Each capture here lacks the second of two 40 s calls, so timing it would halve the policy share."""
+        store = CaptureStore(tmp_path / "model-calls")
+        if partial == "torn record":
+            store.path_for("0-0").write_bytes(orjson.dumps(exchange(40, 80))[:40] + b"\n")
+        elif partial == "pending write":
+            store.mark_pending("0-0", "second-call")
+        else:
+            store.mark_incomplete("0-0")
+
+        timeouts = self.timeouts(tmp_path, [deadline_failure(0)], {"0-0": [exchange(0, 40)]})
+
+        assert (timeouts["timed_out"], timeouts["time_split"]["rollouts_with_captures"]) == (1, 0)
+
+    def test_a_malformed_failure_row_leaves_only_itself_unmeasured(self, tmp_path: Path) -> None:
+        failures = [deadline_failure(0, **{ATTEMPT_INDEX_KEY_NAME: [1]}), deadline_failure(1)]
+
+        timeouts = self.timeouts(tmp_path, failures, {"0-0": [exchange(0, 40)], "1-0": [exchange(0, 40)]})
+
+        assert (timeouts["timed_out"], timeouts["time_split"]["rollouts_with_captures"]) == (2, 1)
+
+    @pytest.mark.parametrize("unusable", ["a regular file", "missing"])
+    def test_an_unusable_capture_dir_leaves_failed_rollouts_unmeasured(self, tmp_path: Path, unusable: str) -> None:
+        """Captures are optional input: the check warns once, still writes its reports, and creates nothing."""
+        output = tmp_path / "rollouts.jsonl"
+        output.write_text(json.dumps({TASK_INDEX_KEY_NAME: 0, ROLLOUT_INDEX_KEY_NAME: 0, "reward": 1.0}) + "\n")
+        failures_path_for(output).write_text("".join(json.dumps(deadline_failure(task)) + "\n" for task in (1, 2)))
+        capture_dir = tmp_path / "model-calls"
+        if unusable == "a regular file":
+            capture_dir.write_text("")
+
+        with pytest.warns(RuntimeWarning, match="model-call capture dir") as warned:
+            timeouts = health_check_run_dir(tmp_path, model_call_capture_dir=capture_dir).summary["run"]["stats"][
+                "timeouts"
+            ]
+
+        assert (timeouts["rollouts"], timeouts["timed_out"], timeouts["time_split"]["rollouts_with_captures"]) == (
+            3,
+            2,
+            0,
+        )
+        assert len([warning for warning in warned if "model-call capture dir" in str(warning.message)]) == 1
+        assert capture_dir.is_file() if unusable == "a regular file" else not capture_dir.exists()
+        assert (tmp_path / QUALITY_SUMMARY_FILENAME).is_file()
+
+
+@pytest.mark.parametrize(
+    ("producer", "tool"),
+    [
+        ({}, None),
+        ({"ng_trajectory": {"turns": "not a list"}}, None),
+        ({"ng_agent_observations": {"records": "not a list"}}, None),
+        (
+            {
+                "ng_trajectory": {
+                    "task_id": "0",
+                    "rollout_id": "0-0",
+                    "tool_calls": [{"invocation_id": "a", "tool_call_id": "t", **tool_call(40, 50)}],
+                }
+            },
+            0.1,
+        ),
+        (
+            {
+                "ng_agent_observations": {
+                    "source": "agent",
+                    "records": [{"kind": "tool_call", "invocation_id": "a", "tool_call_id": "t", **tool_call(40, 50)}],
+                }
+            },
+            0.1,
+        ),
+    ],
+    ids=["no-report", "invalid-trajectory", "invalid-observations", "trajectory", "observations"],
+)
+def test_collection_marks_tool_time_unknown_without_a_valid_report(producer: dict, tool: float | None) -> None:
+    """Without a valid trajectory or observations, the empty tool list is the collector's default, not a report."""
+    result = timed_out_row(calls=[model_call(0, 40)], **producer)
+
+    _attach_trajectory_record({TASK_INDEX_KEY_NAME: 0, ROLLOUT_INDEX_KEY_NAME: 0}, result)
+
+    codes = {gap["code"] for gap in result["ng_trajectory"]["gaps"]}
+    assert ("tool_timing_unavailable" in codes, section(result)["time_split"]["tool"]) == (tool is None, tool)
+
 
 def test_export_keys_are_flat_and_leave_out_unknowns() -> None:
     keys = export_keys(section(timed_out_row()))
@@ -358,6 +504,32 @@ def test_export_keys_are_flat_and_leave_out_unknowns() -> None:
     assert keys["health/timeouts/timed_out"] == 1
     assert keys["health/timeouts/by_evidence/legacy"] == 1
     assert "health/timeouts/time_split/policy_model" not in keys
+
+
+def test_a_counter_only_an_earlier_attempt_named_is_sent_as_zero(tmp_path: Path) -> None:
+    """A resumed run reopens its tracking run, which keeps each key's last value until it is sent again."""
+    output = tmp_path / "rollouts.jsonl"
+    output.write_text("")
+    typed = {"timeouts": [event(limit="agent_timeout_seconds")]}
+    attempts = [
+        {TASK_INDEX_KEY_NAME: 0, ROLLOUT_INDEX_KEY_NAME: 0, NG_FAILURE_CLASS_KEY: "timeout_exceeded"},
+        {TASK_INDEX_KEY_NAME: 1, ROLLOUT_INDEX_KEY_NAME: 0, NG_FAILURE_CLASS_KEY: "agent_run_error", **typed},
+    ]
+    failures_path_for(output).write_text("".join(json.dumps(row) + "\n" for row in attempts))
+    tracked = export_keys(health_check_run_dir(tmp_path).summary["run"]["stats"]["timeouts"])
+
+    # The resumed run lands both rollouts; the sidecar keeps their failed attempts.
+    landed = [{TASK_INDEX_KEY_NAME: task, ROLLOUT_INDEX_KEY_NAME: 0, "reward": 1.0} for task in (0, 1)]
+    output.write_text("".join(json.dumps(row) + "\n" for row in landed))
+    tracked.update(export_keys(health_check_run_dir(tmp_path).summary["run"]["stats"]["timeouts"]))
+
+    assert {key: value for key, value in tracked.items() if key.startswith("health/timeouts/by_")} == {
+        "health/timeouts/by_evidence/typed": 0,
+        "health/timeouts/by_evidence/legacy": 0,
+        "health/timeouts/by_limit/_ng_failure_class=timeout_exceeded": 0,
+        "health/timeouts/by_limit/agent_timeout_seconds": 0,
+        "health/timeouts/by_enforcer/gym.environment_server": 0,
+    }
 
 
 # --- Placement: the section is written wherever a run's health is computed, and exported from there ----------

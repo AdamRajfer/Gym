@@ -13,7 +13,7 @@ from __future__ import annotations
 import os
 import warnings
 from collections import Counter, defaultdict
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from concurrent.futures import ProcessPoolExecutor
 from concurrent.futures.process import BrokenProcessPool
 from dataclasses import dataclass
@@ -667,24 +667,59 @@ def capture_dirs_for_health(global_config_dict: Any) -> list[Path]:
         return []
 
 
-def _with_captured_calls(row: dict[str, Any], capture_dirs: Sequence[Path]) -> dict[str, Any]:
-    """A failed rollout's row with its captured model calls, read where and as the collector captured them.
+def _with_captured_calls(rows: Iterable[dict[str, Any]], capture_dirs: Sequence[Path]) -> Iterator[dict[str, Any]]:
+    """Failed rollouts' rows, each with the model calls captured under its rollout id, read with the collector's
+    key and reader.
 
     Collection joins captures only into a rollout that produced a result, so a row that failed without one (an
-    episode cut by its deadline, say) has none, although the model server captured its calls under the same
-    rollout id. A row that carries its own capture is returned as it is, so no call counts twice. Without a
-    capture file the copy gets no calls, so its time stays unmeasured.
+    episode cut by its deadline, say) has none, although the model server captured its calls. Each capture dir is
+    listed once, never created. A row comes back as it is, its time unmeasured, when it carries its own capture
+    (so no call counts twice), when its capture is missing or partial (a write still claimed, a failed write, an
+    unreadable record), or when its identity or its capture cannot be read.
     """
-    if not capture_dirs or "ng_model_call_capture" in row:
-        return row
+    if not capture_dirs:
+        yield from rows
+        return
     # Lazy: the capture store pulls in the model-server stack, which health workers do not need.
-    from nemo_gym.observability.model_calls import merge_model_call_capture_into_record
+    from nemo_gym.base_responses_api_model import _PENDING_SUFFIX, CaptureStore
+    from nemo_gym.observability.model_calls import read_available_model_call_records
+    from nemo_gym.rollout_correlation import maybe_rollout_id_from_run_body
 
-    try:
-        return merge_model_call_capture_into_record(dict(row), list(capture_dirs))
-    except ValueError:
-        # An unusable rollout id names no capture; the record checks report the row itself.
-        return row
+    listings = []
+    for directory in capture_dirs:
+        try:
+            names = set(os.listdir(directory))
+        except OSError as exc:
+            warnings.warn(
+                f"Cannot list the model-call capture dir {directory} ({exc}); failed rollouts stay unmeasured.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            continue
+        # A claimed write is named `<rollout id>.<call token>.capture.pending`; the token has no dot.
+        pending = {
+            name.removesuffix(_PENDING_SUFFIX).rsplit(".", 1)[0] for name in names if name.endswith(_PENDING_SUFFIX)
+        }
+        listings.append((CaptureStore(directory, create=False), names, pending))
+    for row in rows:
+        calls = None
+        if "ng_model_call_capture" not in row:
+            try:
+                rollout_id = maybe_rollout_id_from_run_body(row)
+                for store, names, pending in listings:
+                    if rollout_id in pending or store.incomplete_path_for(rollout_id).name in names:
+                        break
+                    if store.path_for(rollout_id).name in names:
+                        records, unreadable = read_available_model_call_records(store, rollout_id)
+                        if not unreadable:
+                            calls = [
+                                record.model_dump(exclude={"request", "response", "request_raw", "response_raw"})
+                                for record in records
+                            ]
+                        break
+            except (OSError, TypeError, ValueError):
+                pass  # A malformed identity or an unreadable capture names no calls; the record checks report the row.
+        yield row if calls is None else {**row, "ng_model_call_capture": {"calls": calls}}
 
 
 def run_health_checks(
@@ -769,10 +804,15 @@ def run_health_checks(
     )
     # Every rollout's final record: its saved row, or the last failed attempt of one that never landed.
     timings = [digest.timing for digest in digests if digest.timing is not None]
-    timings += [
-        read_rollout_timing(_with_captured_calls(row, model_call_capture_dirs)) for row in failures.rows.values()
-    ]
-    summary["run"]["stats"]["timeouts"] = summarize_timeouts(timings).model_dump(mode="json")
+    timings += map(read_rollout_timing, _with_captured_calls(failures.rows.values(), model_call_capture_dirs))
+    # Every failed attempt in the sidecars, so a limit or enforcer that only an earlier attempt named is sent as 0.
+    attempts = (
+        read_rollout_timing(row)
+        for path in paths
+        if failures_path_for(path).is_file()
+        for row in _jsonl_rows(failures_path_for(path))
+    )
+    summary["run"]["stats"]["timeouts"] = summarize_timeouts(timings, attempts).model_dump(mode="json")
     run_findings, run_coverage = _run_excessive_failures(artifacts, limits, ignored)
     _judge_run(artifacts, run_findings, run_coverage)
     summary["run"]["issues"][_RUN_FAILURES_CHECK] = len(run_findings)
@@ -890,6 +930,16 @@ def health_check_run_dir(
         limits_source=limits_source,
         model_call_capture_dirs=[Path(model_call_capture_dir)] if model_call_capture_dir is not None else [],
     )
+    # The run dir does not record its capture dir, so a recheck without one cannot time a failed rollout.
+    timeouts, failed = result.summary["run"]["stats"]["timeouts"], result.summary["run"]["artifacts"]["failed"]
+    unsplit = timeouts["timed_out"] - timeouts["time_split"]["rollouts_with_captures"]
+    if model_call_capture_dir is None and failed and failed["total"] and unsplit:
+        warnings.warn(
+            "run.stats.timeouts.time_split times a rollout that failed without a row only from the run's model-call "
+            "captures: pass --model-call-capture-dir <the run's model_call_capture_dir>.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
     if json_output:
         print(orjson.dumps(result.summary).decode())
     else:

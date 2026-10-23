@@ -548,6 +548,27 @@ class TestServerUtils:
         finally:
             await client.close()
 
+    async def test_get_global_aiohttp_client_parses_an_explicit_parser_config(self, monkeypatch: MonkeyPatch) -> None:
+        """A caller that passes a parser config gets the limits it describes, not the defaults."""
+        monkeypatch.setattr(nemo_gym.global_config, "_GLOBAL_CONFIG_DICT", None)
+        monkeypatch.delenv(NEMO_GYM_CONFIG_DICT_ENV_VAR_NAME, raising=False)
+        monkeypatch.delenv(nemo_gym.server_utils.NEMO_GYM_FASTAPI_NUM_WORKERS, raising=False)
+        monkeypatch.setattr(nemo_gym.server_utils, "_GLOBAL_AIOHTTP_CLIENT", None)
+        monkeypatch.setattr(nemo_gym.server_utils, "_GLOBAL_AIOHTTP_CLIENT_CONFIG", None)
+        parser_config = nemo_gym.global_config.GlobalConfigDictParserConfig(
+            initial_global_config_dict=DictConfig(
+                {"global_aiohttp_connector_limit": 7, "global_aiohttp_connector_limit_per_host": 3}
+            ),
+            skip_load_from_cli=True,
+            skip_load_from_dotenv=True,
+        )
+
+        client = nemo_gym.server_utils.get_global_aiohttp_client(global_config_dict_parser_config=parser_config)
+        try:
+            assert (client.connector.limit, client.connector.limit_per_host) == (7, 3)
+        finally:
+            await client.close()
+
     def test_BaseServer_load_config_from_global_config(self, monkeypatch: MonkeyPatch) -> None:
         # Clear any lingering env vars.
         monkeypatch.setenv(NEMO_GYM_CONFIG_PATH_ENV_VAR_NAME, "my_server")

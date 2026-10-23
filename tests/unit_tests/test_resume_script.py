@@ -107,7 +107,14 @@ if [[ "$*" == *ElapsedRaw* ]]; then echo "${FAKE_ELAPSED:-}"; else echo "${FAKE_
 _FAKE_SBATCH = """#!/bin/bash
 echo "$*" >> "$FAKE_LOG_DIR/sbatch_calls"
 if [[ -n "${FAKE_SBATCH_FAILS:-}" ]]; then echo "sbatch: error: Socket timed out"; exit 1; fi
+# The queued follow-up waits on its dependency, as squeue would list it.
+echo "999 ${1#--dependency=}(unfulfilled)" >> "$FAKE_LOG_DIR/pending"
 echo "Submitted batch job 999"
+"""
+_FAKE_SQUEUE = """#!/bin/bash
+if [[ -n "${FAKE_SQUEUE_FAILS:-}" ]]; then echo "squeue: error: Unable to contact slurm controller"; exit 1; fi
+cat "$FAKE_LOG_DIR/pending" 2>/dev/null
+exit 0
 """
 
 
@@ -119,10 +126,16 @@ def _run_prologue(
     job_id: str = "200",
     prev_job_id: str = "100",
     sbatch_fails: bool = False,
+    squeue_fails: bool = False,
 ) -> subprocess.CompletedProcess:
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir(exist_ok=True)
-    for name, body in (("sacct", _FAKE_SACCT), ("sbatch", _FAKE_SBATCH), ("sleep", "#!/bin/bash\n")):
+    for name, body in (
+        ("sacct", _FAKE_SACCT),
+        ("sbatch", _FAKE_SBATCH),
+        ("squeue", _FAKE_SQUEUE),
+        ("sleep", "#!/bin/bash\n"),
+    ):
         tool = bin_dir / name
         tool.write_text(body)
         tool.chmod(0o755)
@@ -136,6 +149,7 @@ def _run_prologue(
         "FAKE_STATE": prev_state or "",
         "FAKE_ELAPSED": "60" if prev_state else "",
         **({"FAKE_SBATCH_FAILS": "1"} if sbatch_fails else {}),
+        **({"FAKE_SQUEUE_FAILS": "1"} if squeue_fails else {}),
     }
     return subprocess.run(args, cwd=tmp_path, env=env, capture_output=True, text=True)
 
@@ -190,6 +204,65 @@ def test_a_requeued_job_does_not_queue_a_second_follow_up(tmp_path, prev_state):
     assert _sbatch_calls(tmp_path) == [_sbatch_calls(tmp_path)[0]]
     assert "--dependency=afternotok:200" in _sbatch_calls(tmp_path)[0]
     assert "already queued" in requeued.stdout
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="bash not installed")
+@pytest.mark.parametrize("claim", ["file", "directory"])
+def test_a_claim_left_by_an_interrupted_submission_is_replaced(tmp_path, claim):
+    """The shell died between taking the claim and sbatch answering: no follow-up exists, so queue one."""
+    marker = tmp_path / ".gym_followup_queued.200"
+    marker.mkdir() if claim == "directory" else marker.touch()  # a directory is #4840's marker format
+
+    requeued = _run_prologue(tmp_path, ResumeConfig(), None)
+
+    assert "REACHED_WORK" in requeued.stdout
+    assert "submission interrupted" in requeued.stdout
+    assert len(_sbatch_calls(tmp_path)) == 1
+    assert "--dependency=afternotok:200" in _sbatch_calls(tmp_path)[0]
+    assert marker.read_text() == "999\n"
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="bash not installed")
+def test_the_claim_records_the_follow_up_and_a_requeue_finds_it_pending(tmp_path):
+    _run_prologue(tmp_path, ResumeConfig(), None)
+    requeued = _run_prologue(tmp_path, ResumeConfig(), None)
+
+    assert (tmp_path / ".gym_followup_queued.200").read_text() == "999\n"
+    assert "already queued: 999" in requeued.stdout
+    assert len(_sbatch_calls(tmp_path)) == 1
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="bash not installed")
+def test_an_empty_claim_with_its_follow_up_pending_queues_none(tmp_path):
+    """The shell died after sbatch queued the follow-up but before the claim recorded its id."""
+    (tmp_path / ".gym_followup_queued.200").touch()
+    (tmp_path / "pending").write_text("999 afternotok:200(unfulfilled)\n")
+
+    requeued = _run_prologue(tmp_path, ResumeConfig(), None)
+
+    assert "already queued: 999" in requeued.stdout
+    assert _sbatch_calls(tmp_path) == []
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="bash not installed")
+def test_a_follow_up_pending_on_another_job_does_not_count(tmp_path):
+    (tmp_path / ".gym_followup_queued.200").touch()
+    (tmp_path / "pending").write_text("998 afternotok:2000(unfulfilled)\n997 afterok:200(unfulfilled)\n")
+
+    _run_prologue(tmp_path, ResumeConfig(), None)
+
+    assert len(_sbatch_calls(tmp_path)) == 1
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="bash not installed")
+def test_a_claim_is_kept_when_squeue_fails(tmp_path):
+    (tmp_path / ".gym_followup_queued.200").touch()
+
+    requeued = _run_prologue(tmp_path, ResumeConfig(), None, squeue_fails=True)
+
+    assert "REACHED_WORK" in requeued.stdout
+    assert "squeue failed" in requeued.stdout
+    assert _sbatch_calls(tmp_path) == []
 
 
 @pytest.mark.skipif(shutil.which("bash") is None, reason="bash not installed")

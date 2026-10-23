@@ -325,14 +325,20 @@ def _unique_task_repeats(digests: list[RolloutDigest]) -> list[_TaskRepeat]:
     return repeats
 
 
-def _mark_duplicate_identities(digests: list[RolloutDigest], ignored_checks: frozenset[str]) -> None:
-    """Flag physical records that claim the same logical rollout identity."""
+def _mark_duplicate_identities(
+    digests: list[RolloutDigest], lines: list[_LineSlice], ignored_checks: frozenset[str]
+) -> None:
+    """Flag physical records of one input that claim the same logical rollout identity.
+
+    Each input numbers its rollouts on its own, as the run accounting counts them: runs merged from different
+    environment servers can reuse task indices.
+    """
     if "rollout_duplicate_identity" in ignored_checks:
         return
 
-    grouped: dict[tuple[int | str | None, int | str, int | str], list[RolloutDigest]] = defaultdict(list)
-    for digest in digests:
-        grouped[(digest.stage_index, digest.task_index, digest.rollout_index)].append(digest)
+    grouped: dict[tuple[int, int | str | None, int | str, int | str], list[RolloutDigest]] = defaultdict(list)
+    for digest, line in zip(digests, lines, strict=True):
+        grouped[(line.source_index, digest.stage_index, digest.task_index, digest.rollout_index)].append(digest)
 
     for copies in grouped.values():
         if len(copies) < 2:
@@ -696,7 +702,7 @@ def run_health_checks(
                 worker_results = [_worker(item) for item in worker_inputs]
 
     digests = worker_results
-    _mark_duplicate_identities(digests, ignored)
+    _mark_duplicate_identities(digests, lines, ignored)
     summary = _reduce(digests, ignored)
     artifacts = summary["run"]["artifacts"]
     artifacts.update(

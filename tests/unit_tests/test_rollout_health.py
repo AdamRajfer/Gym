@@ -1466,12 +1466,31 @@ TURN_CALL_REFERENCES = {
 @pytest.mark.parametrize("reference", TURN_CALL_REFERENCES.values(), ids=TURN_CALL_REFERENCES.keys())
 @pytest.mark.parametrize("overflow", CONTEXT_OVERFLOWS.values(), ids=CONTEXT_OVERFLOWS.keys())
 def test_an_empty_turn_from_a_context_overflow_is_not_hollow(tmp_path, overflow, reference):
-    """The empty turn is the model filling its context, so the rollout is not unhealthy."""
-    record = _record(0, 0, answer=None, refs=[reference], include_response_output=False)
-    overflow_call = _call(
-        **({"tokens_in": None, "tokens_out": 0, "response": {}, "model_ref": _POLICY_REF} | overflow)
+    """The model answered, then filled its context: the empty turn is not hollow, and the rollout is not
+    unhealthy."""
+    answered = _call(model_call_id="c0", response_id="r0", started_at=1.0, model_ref=_POLICY_REF)
+    record = _record(
+        0,
+        0,
+        answer=None,
+        refs=[{"model_call_id": "c0"}, reference],
+        include_response_output=False,
+        usage={"input_tokens": 3, "output_tokens": 2},
     )
-    [digest] = run_health_checks(_write_fixture(tmp_path, [(record, [overflow_call])]), workers=1).rollouts
+    overflow_call = _call(
+        **(
+            {
+                "call_index": 1,
+                "started_at": 2.0,
+                "tokens_in": None,
+                "tokens_out": 0,
+                "response": {},
+                "model_ref": _POLICY_REF,
+            }
+            | overflow
+        )
+    )
+    [digest] = run_health_checks(_write_fixture(tmp_path, [(record, [answered, overflow_call])]), workers=1).rollouts
 
     assert "agent_turn_hollow" not in {finding.check for finding in digest.findings}
     assert digest.verdict != "unhealthy"
@@ -1501,58 +1520,29 @@ def test_a_rollout_ending_on_a_context_overflow_is_not_flagged(tmp_path, overflo
     assert digest.model_call_errors == 1
 
 
-# The same refusals of a request whose own output budget was invalid (max_tokens=0, or a budget reaching the
-# model length): vLLM labels them apart from an overflow, so nothing excuses them.
-INVALID_OUTPUT_BUDGETS = {
-    name: {
-        **refusal,
-        "error_category": "invalid_output_token_parameter",
-        **({"local_response_reason": "invalid_output_token_parameter"} if "local_response_reason" in refusal else {}),
-        **({"response": {"error": {"code": None}}} if "response" in refusal else {}),
-    }
-    for name, refusal in CONTEXT_OVERFLOWS.items()
-}
-
-
-@pytest.mark.parametrize("rejection", INVALID_OUTPUT_BUDGETS.values(), ids=INVALID_OUTPUT_BUDGETS.keys())
-def test_a_rejected_output_budget_ends_a_rollout_on_a_failed_call(tmp_path, rejection):
-    """The request was invalid as sent, which says nothing of the context: it is a failed call like any other."""
-    succeeded = _call(model_call_id="first", started_at=1.0)
-    rejected = _call(
-        model_call_id="last", started_at=2.0, tokens_in=None, tokens_out=0, **{"response": {}, **rejection}
-    )
-    rollout_path = _write_fixture(tmp_path, [(_owned_attempts(succeeded, rejected), [succeeded, rejected])])
-
-    [digest] = run_health_checks(rollout_path, workers=1).rollouts
-
-    assert "rollout_ended_on_failed_model_call" in {finding.check for finding in digest.findings}
-    assert digest.ended_on_error is True
-    assert digest.model_call_errors == 1
-
-
-@pytest.mark.parametrize(
-    ("refusal", "hollow"),
-    [(CONTEXT_OVERFLOWS["answered_locally"], False), (INVALID_OUTPUT_BUDGETS["answered_locally"], True)],
-    ids=["context overflow", "invalid output budget"],
-)
-def test_only_a_context_overflow_excuses_an_empty_turn(tmp_path: Path, refusal: dict, hollow: bool) -> None:
-    refused = _call(tokens_in=None, tokens_out=0, response={}, model_ref=_POLICY_REF, **refusal)
-    record = _record(0, 0, answer=None, refs=[{"model_call_id": "c1"}], include_response_output=False)
-    [digest] = run_health_checks(_write_fixture(tmp_path, [(record, [refused])]), workers=1).rollouts
-
-    assert ("agent_turn_hollow" in {finding.check for finding in digest.findings}) is hollow
-
-
+@pytest.mark.parametrize("ordered", [True, False], ids=["ordered", "unordered"])
 @pytest.mark.parametrize("overflow", CONTEXT_OVERFLOWS.values(), ids=CONTEXT_OVERFLOWS.keys())
-def test_a_chain_of_only_context_overflows_is_not_flagged(tmp_path, overflow):
+def test_an_overflow_before_the_model_ever_answered_still_flags(tmp_path, overflow, ordered):
+    """With no answer first, the request never fit the deployment: a budget of 0 or one larger than the window,
+    or a prompt too long for it. That is a broken run, not the model filling its context."""
     calls = [
-        _call(call_index=index, model_call_id=None, response_id=None, tokens_out=0, **overflow) for index in range(2)
+        _call(
+            call_index=index,
+            model_call_id=None,
+            response_id=None,
+            tokens_out=0,
+            **({"started_at": float(index)} if ordered else {}),
+            **overflow,
+        )
+        for index in range(2)
     ]
     rollout_path = _write_fixture(tmp_path, [(_unreferenced_failure_record([]), calls)])
 
-    [digest] = run_health_checks(rollout_path, workers=1).rollouts
+    result = run_health_checks(rollout_path, workers=1)
+    [digest] = result.rollouts
 
-    assert "rollout_ended_on_failed_model_call" not in {finding.check for finding in digest.findings}
+    assert "rollout_ended_on_failed_model_call" in {finding.check for finding in digest.findings}
+    assert result.summary["run"]["stats"]["model_call_errors"]["ended_on_error"] == 1
 
 
 @pytest.mark.parametrize("failure", FAILED_ATTEMPTS.values(), ids=FAILED_ATTEMPTS.keys())
@@ -1568,15 +1558,35 @@ def test_a_failure_after_a_context_overflow_still_flags(tmp_path, failure):
 
 
 @pytest.mark.parametrize("failure", FAILED_ATTEMPTS.values(), ids=FAILED_ATTEMPTS.keys())
-def test_a_context_overflow_after_failed_calls_is_not_flagged(tmp_path, failure):
-    """Every call failed, but in time order the rollout ended on the model's own overflow."""
+def test_a_context_overflow_after_only_failed_calls_still_flags(tmp_path, failure):
+    """Every call failed, so the model never answered: the overflow says the request never fit."""
     failed = _call(model_call_id="first", started_at=1.0, tokens_in=None, tokens_out=None, **failure)
     overflow = _call(model_call_id="last", started_at=2.0, tokens_out=0, **CONTEXT_OVERFLOWS["propagated"])
     rollout_path = _write_fixture(tmp_path, [(_owned_attempts(failed, overflow), [failed, overflow])])
 
     [digest] = run_health_checks(rollout_path, workers=1).rollouts
 
-    assert "rollout_ended_on_failed_model_call" not in {finding.check for finding in digest.findings}
+    assert "rollout_ended_on_failed_model_call" in {finding.check for finding in digest.findings}
+
+
+def test_another_models_answer_does_not_excuse_an_overflow(tmp_path):
+    """Judged per model: a judge's answer says nothing of whether the policy's request fit."""
+    judge = _call(
+        model_call_id="judge", started_at=1.0, model_ref={"type": "responses_api_models", "name": "judge_model"}
+    )
+    overflow = _call(
+        model_call_id="last",
+        started_at=2.0,
+        tokens_in=None,
+        tokens_out=0,
+        model_ref=_POLICY_REF,
+        **CONTEXT_OVERFLOWS["propagated"],
+    )
+    rollout_path = _write_fixture(tmp_path, [(_owned_attempts(judge, overflow), [judge, overflow])])
+
+    [digest] = run_health_checks(rollout_path, workers=1).rollouts
+
+    assert "rollout_ended_on_failed_model_call" in {finding.check for finding in digest.findings}
 
 
 def test_an_unordered_chain_of_an_overflow_and_a_transport_failure_still_flags(tmp_path: Path) -> None:
@@ -1603,7 +1613,13 @@ def test_an_empty_retry_after_a_context_overflow_in_the_same_turn_is_still_hollo
         **CONTEXT_OVERFLOWS["propagated"],
     )
     retry = _call(
-        model_call_id="retry", response_id="r-retry", call_index=1, started_at=2.0, tokens_out=1, response={}
+        model_call_id="retry",
+        response_id="r-retry",
+        call_index=1,
+        started_at=2.0,
+        tokens_out=1,
+        response={},
+        model_ref=_POLICY_REF,
     )
     record = _record(
         0,

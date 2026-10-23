@@ -673,9 +673,11 @@ def _chain_ended_on_failure(chain: Sequence[dict[str, Any]]) -> bool:
     recovered rollout unhealthy.
 
     A last call the upstream rejected because the context was full is the
-    model's own end, scored like any other answer, so it is not a failure here.
-    An unordered chain of only failures ended on one of them, so it is flagged
-    unless every one was such an overflow.
+    model's own end, scored like any other answer, once the model has answered
+    in this rollout. Before any answer the request never fit the deployment (a
+    prompt or output budget too large for it), which is a failure like any
+    other. An unordered chain of only failures has no answer and ended on one of
+    them, so it is flagged.
     """
     if not chain:
         return False
@@ -684,8 +686,9 @@ def _chain_ended_on_failure(chain: Sequence[dict[str, Any]]) -> bool:
         return False
     if all(call.get("started_at") is not None for call in chain):
         last = sorted(chain, key=lambda call: (call.get("started_at") or 0.0, call.get("call_index") or 0))[-1]
-        return _is_failed(last) and not _is_context_overflow_rejection(last)
-    return len(failed) == len(chain) and not all(_is_context_overflow_rejection(call) for call in chain)
+        answered = any(_is_successful(call) for call in chain)
+        return _is_failed(last) and not (answered and _is_context_overflow_rejection(last))
+    return len(failed) == len(chain)
 
 
 def _ended_on_failed_call(calls: Sequence[dict[str, Any]]) -> bool:
@@ -706,8 +709,8 @@ def _rollout_ended_on_failed_model_call(trajectory: dict[str, Any], subject: dic
     the chain's last call counts, so a failure the client retried successfully
     stays healthy; the signal is that the rollout ENDED on a failure, which is
     what makes its reward indistinguishable from a genuine zero. A last call
-    the upstream rejected as a context-length overflow is not flagged: that
-    zero is the model's own result.
+    the upstream rejected as a context-length overflow is not flagged once the
+    model has answered in the rollout: that zero is the model's own result.
     """
     findings = []
     for key, chain in _model_chains(_normalized_trajectory_calls(trajectory)).items():

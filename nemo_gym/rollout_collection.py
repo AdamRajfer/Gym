@@ -3928,6 +3928,7 @@ Aggregate metrics: {aggregate_metrics_fpath}{coverage}""")
                     workers=config.health_check_workers,
                     ignored_checks=config.health_check_ignored_checks,
                     limits=config.run_health_limits,
+                    model_call_capture_dirs=capture_dirs,
                 )
             except Exception:
                 logger.exception(

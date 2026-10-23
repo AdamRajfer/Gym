@@ -656,6 +656,37 @@ def _write_reports(summary: dict[str, Any], digests: list[RolloutDigest], output
     return summary_path, verdicts_path
 
 
+def capture_dirs_for_health(global_config_dict: Any) -> list[Path]:
+    """The run's model-call capture directories for ``run_health_checks``; none when capture is off or misconfigured,
+    so a capture setting never stops the health check."""
+    from nemo_gym.observability.model_calls import model_call_capture_dirs_from_config
+
+    try:
+        return model_call_capture_dirs_from_config(global_config_dict)
+    except ValueError:
+        return []
+
+
+def _with_captured_calls(row: dict[str, Any], capture_dirs: Sequence[Path]) -> dict[str, Any]:
+    """A failed rollout's row with its captured model calls, read where and as the collector captured them.
+
+    Collection joins captures only into a rollout that produced a result, so a row that failed without one (an
+    episode cut by its deadline, say) has none, although the model server captured its calls under the same
+    rollout id. A row that carries its own capture is returned as it is, so no call counts twice. Without a
+    capture file the copy gets no calls, so its time stays unmeasured.
+    """
+    if not capture_dirs or "ng_model_call_capture" in row:
+        return row
+    # Lazy: the capture store pulls in the model-server stack, which health workers do not need.
+    from nemo_gym.observability.model_calls import merge_model_call_capture_into_record
+
+    try:
+        return merge_model_call_capture_into_record(dict(row), list(capture_dirs))
+    except ValueError:
+        # An unusable rollout id names no capture; the record checks report the row itself.
+        return row
+
+
 def run_health_checks(
     rollout_paths: Path | Sequence[Path],
     *,
@@ -664,8 +695,13 @@ def run_health_checks(
     ignored_checks: Sequence[str] = (),
     limits: RunHealthLimits = RunHealthLimits(),
     limits_source: LimitsSource | Mapping[str, LimitsSource] = "config",
+    model_call_capture_dirs: Sequence[Path] = (),
 ) -> HealthCheckResult:
-    """Run the RFC's map/group/reduce pipeline and write both reports."""
+    """Run the RFC's map/group/reduce pipeline and write both reports.
+
+    ``model_call_capture_dirs`` are the run's model-call capture directories. A failed rollout's row carries no
+    capture, so its timing in ``run.stats.timeouts`` is read from these instead.
+    """
     ignored = frozenset(normalize_ignored_checks(ignored_checks))
     paths = [rollout_paths] if isinstance(rollout_paths, Path) else list(rollout_paths)
     if not paths:
@@ -733,7 +769,9 @@ def run_health_checks(
     )
     # Every rollout's final record: its saved row, or the last failed attempt of one that never landed.
     timings = [digest.timing for digest in digests if digest.timing is not None]
-    timings += [read_rollout_timing(row) for row in failures.rows.values()]
+    timings += [
+        read_rollout_timing(_with_captured_calls(row, model_call_capture_dirs)) for row in failures.rows.values()
+    ]
     summary["run"]["stats"]["timeouts"] = summarize_timeouts(timings).model_dump(mode="json")
     run_findings, run_coverage = _run_excessive_failures(artifacts, limits, ignored)
     _judge_run(artifacts, run_findings, run_coverage)
@@ -830,10 +868,14 @@ def health_check_run_dir(
     ignored_checks: Sequence[str] = (),
     limits: RunHealthLimits | None = None,
     json_output: bool = False,
+    model_call_capture_dir: str | Path | None = None,
 ) -> HealthCheckResult:
     """Recheck a run directory. The run's own persisted limits judge it, so the verdict of the same artifacts
     does not change. Each limit set explicitly on ``limits`` overrides only that persisted limit and is recorded
-    as an override; set to ``None`` it removes the limit. A limit not set keeps its persisted value."""
+    as an override; set to ``None`` it removes the limit. A limit not set keeps its persisted value.
+
+    ``model_call_capture_dir`` is the run's ``model_call_capture_dir``; with it, failed rollouts' captured calls
+    count in the timeouts section's time split."""
     path = Path(run_dir)
     rollout_path = _resolve_rollout_path(path, rollout_file)
     overrides = {name: getattr(limits, name) for name in limits.model_fields_set} if limits is not None else {}
@@ -846,6 +888,7 @@ def health_check_run_dir(
         ignored_checks=ignored_checks,
         limits=limits,
         limits_source=limits_source,
+        model_call_capture_dirs=[Path(model_call_capture_dir)] if model_call_capture_dir is not None else [],
     )
     if json_output:
         print(orjson.dumps(result.summary).decode())

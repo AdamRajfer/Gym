@@ -21,8 +21,14 @@ import orjson
 import pytest
 
 import nemo_gym.exporters
+from nemo_gym.base_responses_api_model import CaptureStore
 from nemo_gym.cli.eval import _health_check_collected_rollouts
-from nemo_gym.global_config import AGENT_REF_KEY_NAME, ROLLOUT_INDEX_KEY_NAME, TASK_INDEX_KEY_NAME
+from nemo_gym.global_config import (
+    AGENT_REF_KEY_NAME,
+    ATTEMPT_INDEX_KEY_NAME,
+    ROLLOUT_INDEX_KEY_NAME,
+    TASK_INDEX_KEY_NAME,
+)
 from nemo_gym.health.timeouts import (
     ELAPSED_S_KEY,
     LEGACY_TIMEOUT_SIGNALS,
@@ -262,6 +268,88 @@ def test_a_malformed_failure_row_still_gets_a_health_report(tmp_path: Path) -> N
     timeouts = health_check_run_dir(tmp_path).summary["run"]["stats"]["timeouts"]
 
     assert (timeouts["rollouts"], timeouts["failed_without_signal"]) == (2, 1)
+
+
+def exchange(start: float, end: float, *, model: str = "policy_model") -> dict:
+    """One model exchange as the model server's capture middleware records it."""
+    return {
+        "dialect": "chat",
+        "model_ref": {"type": "responses_api_models", "name": model},
+        "started_at": T0 + start,
+        "completed_at": T0 + end,
+        "latency_ms": (end - start) * 1000,
+        "status_code": 200,
+        "request": {},
+        "response": {},
+    }
+
+
+def deadline_failure(task: int, *, attempt: int = 0, elapsed: float = 100.0, **fields) -> dict:
+    """A rollout the environment server's episode deadline cut: its last attempt's failure row, with no capture."""
+    return {
+        TASK_INDEX_KEY_NAME: task,
+        ROLLOUT_INDEX_KEY_NAME: 0,
+        **({ATTEMPT_INDEX_KEY_NAME: attempt} if attempt else {}),
+        NG_FAILURE_CLASS_KEY: "environment_server_failed",
+        "_ng_failure_message": "Episode timed out",
+        ELAPSED_S_KEY: elapsed,
+        **fields,
+    }
+
+
+class TestCapturesOfFailedRollouts:
+    """A rollout that failed without a result has no capture on its row; the capture store holds its calls."""
+
+    @staticmethod
+    def timeouts(tmp_path: Path, failures: list[dict], captures: dict[str, list[dict]], *, with_dir: bool = True):
+        output = tmp_path / "rollouts.jsonl"
+        output.write_text("")
+        failures_path_for(output).write_text("".join(json.dumps(row) + "\n" for row in failures))
+        capture_dir = tmp_path / "model-calls"
+        store = CaptureStore(capture_dir)
+        for rollout_id, exchanges in captures.items():
+            for recorded in exchanges:
+                store.record(rollout_id, recorded)
+        result = health_check_run_dir(tmp_path, model_call_capture_dir=capture_dir if with_dir else None)
+        return result.summary["run"]["stats"]["timeouts"]
+
+    def test_a_failure_row_takes_its_split_from_the_capture_file(self, tmp_path: Path) -> None:
+        captures = {"0-0": [exchange(0, 40), exchange(50, 70), exchange(60, 80, model="judge_model")]}
+
+        timeouts = self.timeouts(tmp_path, [deadline_failure(0)], captures)
+
+        split = timeouts["time_split"]
+        assert (timeouts["timed_out"], split["rollouts_with_captures"]) == (1, 1)
+        assert (split["policy_model"], split["other_model"]) == (0.6, 0.2)
+        assert split["policy_calls_per_rollout"]["p50"] == 2
+        # The failure row records no tool calls, so tool time and the untracked share stay unknown.
+        assert (split["tool"], split["untracked"]) == (None, None)
+
+    def test_the_last_attempt_reads_its_own_capture(self, tmp_path: Path) -> None:
+        failures = [deadline_failure(0, elapsed=90.0), deadline_failure(0, attempt=1)]
+        captures = {"0-0": [exchange(0, 90)], "0-0-a1": [exchange(0, 30)]}
+
+        split = self.timeouts(tmp_path, failures, captures)["time_split"]
+
+        assert (split["rollouts_with_captures"], split["policy_model"]) == (1, 0.3)
+
+    def test_a_row_with_its_own_capture_is_not_counted_twice(self, tmp_path: Path) -> None:
+        row = deadline_failure(0, ng_model_call_capture={"calls": [model_call(0, 10)]})
+
+        split = self.timeouts(tmp_path, [row], {"0-0": [exchange(0, 90)]})["time_split"]
+
+        assert (split["rollouts_with_captures"], split["policy_model"]) == (1, 0.1)
+
+    def test_a_rollout_without_a_capture_file_stays_unmeasured(self, tmp_path: Path) -> None:
+        timeouts = self.timeouts(tmp_path, [deadline_failure(0), deadline_failure(1)], {"1-0": [exchange(0, 50)]})
+
+        assert (timeouts["timed_out"], timeouts["time_split"]["rollouts_with_captures"]) == (2, 1)
+        assert timeouts["time_split"]["policy_model"] == 0.5
+
+    def test_without_the_capture_dir_the_split_is_not_measured(self, tmp_path: Path) -> None:
+        timeouts = self.timeouts(tmp_path, [deadline_failure(0)], {"0-0": [exchange(0, 40)]}, with_dir=False)
+
+        assert timeouts["time_split"]["rollouts_with_captures"] == 0
 
 
 def test_export_keys_are_flat_and_leave_out_unknowns() -> None:

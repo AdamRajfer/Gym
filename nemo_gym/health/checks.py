@@ -340,17 +340,6 @@ def _is_failed_attempt(call: dict[str, Any]) -> bool:
     )
 
 
-def _call_reference_keys(call: dict[str, Any]) -> set[str]:
-    """Every ``_call_ref_key`` that a turn can use to point at this call: its call id, or its model and response id."""
-    keys = set()
-    if call.get("model_call_id"):
-        keys.add(f"call:{call['model_call_id']}")
-    model_ref = call.get("model_ref")
-    if isinstance(model_ref, dict) and call.get("response_id"):
-        keys.add(f"response:{model_ref.get('type')}:{model_ref.get('name')}:{call['response_id']}")
-    return keys
-
-
 def _call_identity(call: dict[str, Any]) -> str | None:
     if call.get("model_call_id"):
         return f"call:{call['model_call_id']}"
@@ -459,6 +448,10 @@ def _bind_policy_call_views(
             matched_calls=tuple(matched_calls),
             missing_references=tuple(missing_references),
             duplicated_references=tuple(duplicated_references),
+            resolutions={
+                _call_reference_signature(raw_reference): tuple(resolved[_call_reference_signature(raw_reference)])
+                for _, raw_reference in reference_items
+            },
         )
 
     return build_bindings(turn_reference_items), build_bindings(owned_reference_items)
@@ -528,15 +521,9 @@ def _rollout_missing_agent_turns(trajectory: dict[str, Any], subject: dict[str, 
 def _agent_turn_hollow(
     trajectory: dict[str, Any], bindings: _CallBindings, subject: dict[str, int | str]
 ) -> list[Finding]:
-    # An empty turn whose own model call the upstream rejected for a full context is the model filling its
+    # An empty turn that ended on its own model call being rejected for a full context is the model filling its
     # context, as in `rollout_ended_on_failed_model_call`. The calls are optional evidence here: without
     # captured calls, every empty turn is still flagged.
-    overflow_calls = {
-        key
-        for call in bindings.matched_calls
-        if _is_context_overflow_rejection(call)
-        for key in _call_reference_keys(call)
-    }
     return [
         Finding(
             check="agent_turn_hollow",
@@ -544,9 +531,33 @@ def _agent_turn_hollow(
             locator=step.locator,
             detail={"reason": "agent turn has no message or tool calls"},
         )
-        for step in _agent_steps(trajectory)
-        if not step.has_message and not step.has_tool_calls and not overflow_calls.intersection(step.model_call_refs)
+        for step, turn in zip(_agent_steps(trajectory), trajectory.get("turns") or [], strict=True)
+        if not step.has_message and not step.has_tool_calls and not _turn_ended_on_context_overflow(turn, bindings)
     ]
+
+
+def _turn_ended_on_context_overflow(turn: dict[str, Any], bindings: _CallBindings) -> bool:
+    """Whether a turn's own model calls end on a context-overflow rejection.
+
+    Each of the turn's references must resolve to exactly one call: a call that another turn's reference
+    resolved says nothing about this turn. Of the turn's calls, the last in time decides, as in
+    `_chain_ended_on_failure`, so an overflow followed by an empty retry is still hollow. When the calls
+    cannot be ordered, every one must be an overflow.
+    """
+    calls = []
+    for raw_reference in turn.get("model_calls") or []:
+        if not isinstance(raw_reference, dict) or _call_ref_key(raw_reference) is None:
+            continue
+        matches = bindings.resolutions.get(_call_reference_signature(raw_reference), ())
+        if len(matches) != 1:
+            return False
+        calls.append(matches[0])
+    if not calls:
+        return False
+    if all(call.get("started_at") is not None for call in calls):
+        last = sorted(calls, key=lambda call: (call.get("started_at") or 0.0, call.get("call_index") or 0))[-1]
+        return _is_context_overflow_rejection(last)
+    return all(_is_context_overflow_rejection(call) for call in calls)
 
 
 def _model_call_zero_completion_tokens(bindings: _CallBindings, subject: dict[str, int | str]) -> list[Finding]:

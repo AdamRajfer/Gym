@@ -1549,6 +1549,79 @@ def test_an_unordered_chain_of_an_overflow_and_a_transport_failure_still_flags(t
     assert "rollout_ended_on_failed_model_call" in {finding.check for finding in digest.findings}
 
 
+def test_an_empty_retry_after_a_context_overflow_in_the_same_turn_is_still_hollow(tmp_path: Path) -> None:
+    """Only the turn's last call can excuse it: a successful empty retry after an overflow is hollow."""
+    overflow = _call(
+        model_call_id="overflow",
+        response_id="r-overflow",
+        started_at=1.0,
+        tokens_in=None,
+        tokens_out=0,
+        model_ref=_POLICY_REF,
+        **CONTEXT_OVERFLOWS["propagated"],
+    )
+    retry = _call(
+        model_call_id="retry", response_id="r-retry", call_index=1, started_at=2.0, tokens_out=1, response={}
+    )
+    record = _record(
+        0,
+        0,
+        answer=None,
+        refs=[{"model_call_id": "overflow"}, {"model_call_id": "retry"}],
+        include_response_output=False,
+        usage={"input_tokens": 3, "output_tokens": 1},
+    )
+    [digest] = run_health_checks(_write_fixture(tmp_path, [(record, [overflow, retry])]), workers=1).rollouts
+
+    checks = {finding.check for finding in digest.findings}
+    assert "agent_turn_hollow" in checks
+    assert "rollout_ended_on_failed_model_call" not in checks
+    assert digest.verdict == "unhealthy"
+
+
+@pytest.mark.parametrize("failure", FAILED_ATTEMPTS.values(), ids=FAILED_ATTEMPTS.keys())
+def test_an_empty_turn_ending_on_a_context_overflow_after_a_failed_call_is_not_hollow(tmp_path, failure):
+    failed = _call(
+        model_call_id="failed", response_id="r-failed", started_at=1.0, tokens_in=None, tokens_out=None, **failure
+    )
+    overflow = _call(
+        model_call_id="overflow",
+        response_id="r-overflow",
+        call_index=1,
+        started_at=2.0,
+        tokens_in=None,
+        tokens_out=0,
+        model_ref=_POLICY_REF,
+        **CONTEXT_OVERFLOWS["propagated"],
+    )
+    record = _record(
+        0,
+        0,
+        answer=None,
+        refs=[{"model_call_id": "failed"}, {"model_call_id": "overflow"}],
+        include_response_output=False,
+    )
+    [digest] = run_health_checks(_write_fixture(tmp_path, [(record, [failed, overflow])]), workers=1).rollouts
+
+    assert "agent_turn_hollow" not in {finding.check for finding in digest.findings}
+
+
+def test_an_empty_turn_whose_own_reference_does_not_resolve_is_still_hollow(tmp_path: Path) -> None:
+    """Turn 2 names the overflow call with a stale response id, so the call that turn 1 resolved excuses only turn 1."""
+    overflow = _call(
+        tokens_in=None, tokens_out=0, response={}, model_ref=_POLICY_REF, **CONTEXT_OVERFLOWS["answered_locally"]
+    )
+    record = _record(0, 0, answer=None, refs=[{"model_call_id": "c1"}], include_response_output=False)
+    stale_turn = dict(record["ng_trajectory"]["turns"][0])
+    stale_turn.update(turn_no=2, timestamp=2.0, model_calls=[{"model_call_id": "c1", "response_id": "stale"}])
+    record["ng_trajectory"]["turns"].append(stale_turn)
+    [digest] = run_health_checks(_write_fixture(tmp_path, [(record, [overflow])]), workers=1).rollouts
+
+    hollow = [finding.locator for finding in digest.findings if finding.check == "agent_turn_hollow"]
+    assert hollow == [{"turn": 2}]
+    assert "trajectory_capture_mismatch" in {finding.check for finding in digest.findings}
+
+
 def test_a_400_without_the_overflow_category_still_flags(tmp_path: Path) -> None:
     """The overflow is read from the recorded category, never inferred from a 400 alone."""
     succeeded = _call(model_call_id="first", started_at=1.0)

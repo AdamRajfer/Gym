@@ -46,6 +46,7 @@ from nemo_gym.exporters import (
 from nemo_gym.exporters.base import BaseExporter
 from nemo_gym.exporters.mlflow import MLflowExporter, _flatten_config, _sanitize_key
 from nemo_gym.exporters.wandb import WandbExporter
+from nemo_gym.rollout_collection import NG_FAILURE_CLASS_KEY
 from nemo_gym.secret_utils import recursively_hide_secrets
 
 
@@ -822,24 +823,35 @@ def _rollout(task: int) -> dict[str, Any]:
     return {"_ng_task_index": task, "_ng_rollout_index": 0, "reward": 1.0}
 
 
+def _failed_attempt(task: int) -> dict[str, Any]:
+    return {"_ng_task_index": task, "_ng_rollout_index": 0, NG_FAILURE_CLASS_KEY: "agent_run_error"}
+
+
 class TestMLflowReopenAgainstARealStore:
     """The real MLflow client: `log_table` appends to an existing table, and a deleted run cannot be reopened."""
 
-    def test_a_resumed_run_logs_each_rollout_once(self, mlflow_store: DictConfig) -> None:
+    def test_a_resumed_run_logs_each_landed_rollout_once(self, mlflow_store: DictConfig) -> None:
         first = MLflowExporter(mlflow_store)
         first.setup()
-        first.export_rollouts([_rollout(0), _rollout(1)])
+        first.export_rollouts([_rollout(0), _rollout(1), _failed_attempt(2)])
         first.teardown()
 
-        # A resumed job is handed every rollout of its output, the earlier ones too.
+        # A resumed job is handed every rollout that landed in its output, the earlier ones too, and its own
+        # attempts: task 2 lands after its failed attempt, and task 3 fails.
         second = MLflowExporter(mlflow_store)
         second.setup()
-        second.export_rollouts([_rollout(0), _rollout(1), _rollout(2)])
+        second.export_rollouts([_rollout(0), _rollout(1), _rollout(2), _failed_attempt(3)])
         table = orjson.loads(Path(second.client.download_artifacts(second.run_id, "rollouts.json")).read_bytes())
         second.teardown()
 
-        tasks = sorted(orjson.loads(row[table["columns"].index("Rollout")])["_ng_task_index"] for row in table["data"])
-        assert tasks == [0, 1, 2]
+        rows = [orjson.loads(row[table["columns"].index("Rollout")]) for row in table["data"]]
+        assert [(row["_ng_task_index"], NG_FAILURE_CLASS_KEY in row) for row in rows] == [
+            (0, False),
+            (1, False),
+            (2, True),
+            (2, False),
+            (3, True),
+        ]
 
     def test_a_fresh_run_into_the_same_output_starts_a_new_run(self, mlflow_store: DictConfig) -> None:
         first = MLflowExporter(mlflow_store)

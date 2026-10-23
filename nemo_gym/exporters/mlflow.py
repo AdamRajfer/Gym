@@ -243,10 +243,11 @@ class MLflowExporter(BaseExporter):
     def _log_rollouts(self, rollouts: list[dict[str, Any]]) -> None:
         client, run_id = self._active()
         if self.reopened:
-            # A resumed run is handed every rollout of its output, and `log_table` appends to the table an earlier
-            # job logged: log only the rollouts that table does not hold yet.
-            logged = self._logged_rollout_keys(client, run_id)
-            rollouts = [rollout for rollout in rollouts if _rollout_key(rollout) not in logged]
+            # A resumed run is handed every rollout that landed in its output, and `log_table` appends to the table
+            # an earlier job logged: skip the landed rollouts that table holds. A failed attempt in the table does
+            # not count, so a rollout that lands on resume is logged next to it.
+            landed = self._landed_rollout_keys(client, run_id)
+            rollouts = [rollout for rollout in rollouts if not (_landed(rollout) and _rollout_key(rollout) in landed)]
             if not rollouts:
                 return
         # One JSON blob per row, matching the W&B rollouts table: rollouts have no stable column
@@ -254,7 +255,7 @@ class MLflowExporter(BaseExporter):
         rows = [orjson.dumps(rollout).decode() for rollout in rollouts]
         client.log_table(run_id, data={"Rollout": rows}, artifact_file=self.ROLLOUTS_ARTIFACT_FILE)
 
-    def _logged_rollout_keys(self, client: MlflowClient, run_id: str) -> set[tuple[Any, Any]]:
+    def _landed_rollout_keys(self, client: MlflowClient, run_id: str) -> set[tuple[Any, Any]]:
         # Read from this run, as `log_table` does when it appends: `load_table` searches the fluent API's global
         # tracking URI, not this client's.
         if self.ROLLOUTS_ARTIFACT_FILE not in {artifact.path for artifact in client.list_artifacts(run_id)}:
@@ -264,8 +265,17 @@ class MLflowExporter(BaseExporter):
                 Path(client.download_artifacts(run_id, self.ROLLOUTS_ARTIFACT_FILE, tmpdir)).read_text()
             )
         column = table["columns"].index("Rollout")
-        return {_rollout_key(orjson.loads(row[column])) for row in table["data"]}
+        rollouts = (orjson.loads(row[column]) for row in table["data"])
+        return {_rollout_key(rollout) for rollout in rollouts if _landed(rollout)}
 
 
 def _rollout_key(rollout: dict[str, Any]) -> tuple[Any, Any]:
     return rollout.get(TASK_INDEX_KEY_NAME), rollout.get(ROLLOUT_INDEX_KEY_NAME)
+
+
+def _landed(rollout: dict[str, Any]) -> bool:
+    """Whether the rollout landed in the output: a failed attempt carries its failure class."""
+    # Imported here: rollout collection imports the exporters.
+    from nemo_gym.rollout_collection import NG_FAILURE_CLASS_KEY
+
+    return rollout.get(NG_FAILURE_CLASS_KEY) is None

@@ -115,13 +115,15 @@ _gym_queue_followup=1
 if ! _gym_claim_followup; then
     _gym_queue_followup=0
     # squeue's %E lists the dependencies, e.g. "afternotok:123(unfulfilled)", and %Z the job's working directory.
-    # The follow-up runs in this job dir (--chdir), so a dependent job of another run does not count.
+    # The follow-up runs in this job dir (--chdir), so a dependent job of another run does not count. %Z is the
+    # --chdir path as given, while $PWD in the job can be the resolved one, so the two are compared with -ef
+    # (same file), never as strings.
     if ! _pending=$(squeue --me --noheader --states=PENDING --format='%i|%E|%Z' 2>&1); then
         # Unknown is not none: a second follow-up would run the job dir twice, so keep the claim.
         echo "WARNING: squeue failed ($_pending); keeping the follow-up claim of job $SLURM_JOB_ID. Not queueing another."
     elif _followup=$(
             while IFS='|' read -r _id _deps _cwd; do
-                [[ "$_cwd" == "$OUTPUT_DIR" ]] || continue
+                [[ -n "$_cwd" && "$_cwd" -ef "$OUTPUT_DIR" ]] || continue
                 if grep -qE "(^|[ ,])afternotok:$SLURM_JOB_ID([(,]|$)" <<< "$_deps"; then
                     echo "$_id"
                     break

@@ -372,3 +372,37 @@ def test_a_follow_up_pending_in_this_job_dir_queues_none(tmp_path, claim):
     assert "REACHED_WORK" in requeued.stdout
     assert "already queued: 999" in requeued.stdout
     assert _sbatch_calls(tmp_path) == []
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="bash not installed")
+def test_a_follow_up_listed_through_a_symlinked_job_dir_still_counts(tmp_path):
+    """squeue reports the --chdir path as given, which can be a symlink, while $PWD in the job is the resolved
+    path: the same directory must match, or every requeue would queue another follow-up."""
+    job_dir = tmp_path / "job"
+    job_dir.mkdir()
+    link = tmp_path / "link"
+    link.symlink_to(job_dir, target_is_directory=True)
+    (job_dir / ".gym_followup_queued.200").touch()
+    (job_dir / "pending").write_text(f"999|afternotok:200(unfulfilled)|{link}\n")
+
+    requeued = _run_prologue(job_dir, ResumeConfig(), None)
+
+    assert "REACHED_WORK" in requeued.stdout
+    assert "already queued: 999" in requeued.stdout
+    assert _sbatch_calls(job_dir) == []
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="bash not installed")
+def test_a_symlink_to_another_dir_does_not_count(tmp_path):
+    job_dir = tmp_path / "job"
+    other = tmp_path / "other"
+    job_dir.mkdir()
+    other.mkdir()
+    link = tmp_path / "link"
+    link.symlink_to(other, target_is_directory=True)
+    (job_dir / ".gym_followup_queued.200").touch()
+    (job_dir / "pending").write_text(f"998|afternotok:200(unfulfilled)|{link}\n")
+
+    _run_prologue(job_dir, ResumeConfig(), None)
+
+    assert len(_sbatch_calls(job_dir)) == 1

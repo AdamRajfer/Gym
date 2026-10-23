@@ -430,6 +430,12 @@ class ResumeConfig(_StrictModel):
     max_walltime: str | None = None
 
 
+_COMMAND_AND_RUN = (
+    "sets both `command` and `run`, but `run` only configures `gym eval run`, which `command` replaces. "
+    "Fold those settings into the command, or drop it."
+)
+
+
 class BenchmarkRunConfig(_StrictModel):
     # Hydra overrides forwarded to `gym eval prepare`. Flattened to +key=value tokens.
     prepare: dict[str, Any] = {}
@@ -445,12 +451,11 @@ class BenchmarkRunConfig(_StrictModel):
     command: str | None = None
 
     @model_validator(mode="after")
-    def _validate_command(self) -> "BenchmarkRunConfig":
-        if self.command is not None and self.run:
-            raise ValueError(
-                "A benchmark sets both `command` and `run`, but `run` only configures `gym eval run`, which "
-                "`command` replaces. Fold those settings into the command, or drop it."
-            )
+    def _validate_command(self, info: ValidationInfo) -> "BenchmarkRunConfig":
+        # A saved config holds the policy keys driver.policy_model wrote into a command's run at submit, which
+        # the command reads as NEMO_GYM_POLICY_*. SubmitConfig checks a saved command, where the policy is known.
+        if self.command is not None and self.run and not (info.context and info.context.get(SAVED_CONFIG)):
+            raise ValueError(f"A benchmark {_COMMAND_AND_RUN}")
         if self.command is not None and self.resume_config is not None:
             raise ValueError(
                 "A benchmark sets both `command` and `resumable`, but a resumed job only passes "
@@ -708,6 +713,18 @@ class SubmitConfig(_StrictModel):
 
         self._validate_pd_services(compute)
 
+        # A saved command may keep only the keys the policy block below derived at submit, from a model service.
+        saved_config = bool(info.context and info.context.get(SAVED_CONFIG))
+        policy_service = self.services.get(self.driver.policy_model or "")
+        derived_policy_keys = (
+            {"policy_base_url", "policy_model_name", "policy_api_key"}
+            if saved_config and isinstance(policy_service, BaseModelServiceConfig)
+            else set()
+        )
+        for bench_name, benchmark in self.driver.benchmarks.items():
+            if benchmark.command is not None and benchmark.run.keys() - derived_policy_keys:
+                raise ValueError(f"Benchmark '{bench_name}' {_COMMAND_AND_RUN}")
+
         if self.driver.policy_model is not None:
             if self.driver.policy_model not in self.services:
                 raise ValueError(
@@ -727,7 +744,6 @@ class SubmitConfig(_StrictModel):
                     "policy_api_key": "dummy",  # pragma: allowlist secret
                 }
                 # A saved config holds the keys this block wrote at submit; only a value that differs conflicts.
-                saved_config = bool(info.context and info.context.get(SAVED_CONFIG))
                 for bench_name, benchmark in self.driver.benchmarks.items():
                     conflicts = [
                         k

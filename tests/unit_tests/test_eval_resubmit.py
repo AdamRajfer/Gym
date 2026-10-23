@@ -556,6 +556,61 @@ def test_policy_keys_written_by_hand_still_conflict_with_the_policy_model(tmp_pa
         SubmitConfig.model_validate(raw)
 
 
+# --- A command benchmark reads the policy from its run keys, as NEMO_GYM_POLICY_* -----------------------------
+
+_DERIVED_POLICY_RUN = {
+    "policy_base_url": "http://localhost:8000/v1",
+    "policy_model_name": "org/model",
+    "policy_api_key": "dummy",  # pragma: allowlist secret
+}
+
+
+def _command_policy_config(tmp_path: Path, run: dict | None = None) -> dict:
+    raw = _policy_config(tmp_path, {})
+    raw["driver"]["benchmarks"]["gsm8k"] = {"command": "true", **({"run": run} if run else {})}
+    return raw
+
+
+def test_a_saved_command_benchmark_with_a_policy_model_loads_back_and_resubmits(
+    tmp_path: Path, slurm_bin: Path
+) -> None:
+    config = SubmitConfig.model_validate(_command_policy_config(tmp_path))
+    job_dir = _staged_run(tmp_path, config=config)
+
+    reloaded = _saved_config(job_dir)
+
+    assert reloaded.driver.benchmarks["gsm8k"].command == "true"
+    assert reloaded.driver.benchmarks["gsm8k"].run == config.driver.benchmarks["gsm8k"].run == _DERIVED_POLICY_RUN
+    assert reloaded.driver.benchmarks == config.driver.benchmarks
+    assert resubmit(*_handle(job_dir)).job_id == "4242"
+
+
+@pytest.mark.parametrize(
+    ("run", "message"),
+    [
+        ({**_DERIVED_POLICY_RUN, "policy_model_name": "another/model"}, r"already sets \['policy_model_name'\]"),
+        ({**_DERIVED_POLICY_RUN, "split": "test"}, "sets both `command` and `run`"),
+    ],
+    ids=["differing_policy_value", "extra_run_key"],
+)
+def test_a_saved_command_with_other_run_settings_is_still_refused(tmp_path: Path, run: dict, message: str) -> None:
+    with pytest.raises(ValueError, match=message):
+        SubmitConfig.model_validate(_command_policy_config(tmp_path, run), context={SAVED_CONFIG: True})
+
+
+def test_a_saved_command_without_a_policy_model_still_refuses_run(tmp_path: Path) -> None:
+    raw = _command_policy_config(tmp_path, dict(_DERIVED_POLICY_RUN))
+    raw["driver"]["policy_model"] = None
+
+    with pytest.raises(ValueError, match="sets both `command` and `run`"):
+        SubmitConfig.model_validate(raw, context={SAVED_CONFIG: True})
+
+
+def test_a_hand_written_command_with_run_is_still_refused(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="sets both `command` and `run`"):
+        SubmitConfig.model_validate(_command_policy_config(tmp_path, dict(_DERIVED_POLICY_RUN)))
+
+
 def test_resubmit_without_auth_updates_the_collector_and_can_restore_remote_export(
     tmp_path: Path, slurm_bin: Path, ssh_like_shell: None, monkeypatch: pytest.MonkeyPatch, caplog
 ) -> None:

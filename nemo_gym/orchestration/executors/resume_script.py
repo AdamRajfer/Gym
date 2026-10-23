@@ -118,7 +118,8 @@ if ! _gym_claim_followup; then
     # The follow-up runs in this job dir (--chdir), so a dependent job of another run does not count. %Z is the
     # --chdir path as given, while $PWD in the job can be the resolved one, so the two are compared with -ef
     # (same file), never as strings.
-    if ! _pending=$(squeue --me --noheader --states=PENDING --format='%i|%E|%Z' 2>&1); then
+    # --all: without it squeue does not list jobs, ours included, in a hidden partition.
+    if ! _pending=$(squeue --me --all --noheader --states=PENDING --format='%i|%E|%Z' 2>&1); then
         # Unknown is not none: a second follow-up would run the job dir twice, so keep the claim.
         echo "WARNING: squeue failed ($_pending); keeping the follow-up claim of job $SLURM_JOB_ID. Not queueing another."
     elif _followup=$(
@@ -146,9 +147,9 @@ if [[ $_gym_queue_followup == 1 ]]; then
             echo "Auto-resume follow-up queued: $_next_id (afternotok:$SLURM_JOB_ID)"
         fi
     else
-        # Release the claim so a requeue of this job can try again.
-        rm -f -- "$_guard_marker"
-        echo "WARNING: Failed to submit auto-resume follow-up. Chain will NOT continue on failure."
+        # Keep the claim: sbatch can fail after the job was created (a lost reply). A requeue of this job asks
+        # squeue, and queues the follow-up only if none is pending.
+        echo "WARNING: Failed to submit auto-resume follow-up. Chain will NOT continue on failure unless this job is requeued."
     fi
 fi
 """

@@ -108,13 +108,18 @@ if [[ "$*" == *ElapsedRaw* ]]; then echo "${FAKE_ELAPSED:-}"; else echo "${FAKE_
 _FAKE_SBATCH = """#!/bin/bash
 echo "$*" >> "$FAKE_LOG_DIR/sbatch_calls"
 if [[ -n "${FAKE_SBATCH_FAILS:-}" ]]; then echo "sbatch: error: Socket timed out"; exit 1; fi
-# The queued follow-up waits on its dependency in this job dir, as squeue would list it.
-echo "999|${1#--dependency=}(unfulfilled)|$PWD" >> "$FAKE_LOG_DIR/pending"
+# The queued follow-up waits on its dependency in this job dir, as squeue would list it. In a hidden partition
+# squeue lists it only with --all.
+_pending="$FAKE_LOG_DIR/pending${FAKE_HIDDEN_PARTITION:+_hidden}"
+echo "999|${1#--dependency=}(unfulfilled)|$PWD" >> "$_pending"
+# A lost reply: the job exists, but sbatch reports a failure.
+if [[ -n "${FAKE_SBATCH_LOSES_REPLY:-}" ]]; then echo "sbatch: error: Socket timed out on send/recv operation"; exit 1; fi
 echo "Submitted batch job 999"
 """
 _FAKE_SQUEUE = """#!/bin/bash
 if [[ -n "${FAKE_SQUEUE_FAILS:-}" ]]; then echo "squeue: error: Unable to contact slurm controller"; exit 1; fi
 cat "$FAKE_LOG_DIR/pending" 2>/dev/null
+[[ " $* " == *" --all "* ]] && cat "$FAKE_LOG_DIR/pending_hidden" 2>/dev/null
 exit 0
 """
 
@@ -128,6 +133,8 @@ def _run_prologue(
     prev_job_id: str = "100",
     sbatch_fails: bool = False,
     squeue_fails: bool = False,
+    hidden_partition: bool = False,
+    sbatch_loses_reply: bool = False,
 ) -> subprocess.CompletedProcess:
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir(exist_ok=True)
@@ -151,6 +158,8 @@ def _run_prologue(
         "FAKE_ELAPSED": "60" if prev_state else "",
         **({"FAKE_SBATCH_FAILS": "1"} if sbatch_fails else {}),
         **({"FAKE_SQUEUE_FAILS": "1"} if squeue_fails else {}),
+        **({"FAKE_HIDDEN_PARTITION": "1"} if hidden_partition else {}),
+        **({"FAKE_SBATCH_LOSES_REPLY": "1"} if sbatch_loses_reply else {}),
     }
     return subprocess.run(args, cwd=tmp_path, env=env, capture_output=True, text=True)
 
@@ -406,3 +415,24 @@ def test_a_symlink_to_another_dir_does_not_count(tmp_path):
     _run_prologue(job_dir, ResumeConfig(), None)
 
     assert len(_sbatch_calls(job_dir)) == 1
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="bash not installed")
+def test_a_follow_up_pending_in_a_hidden_partition_is_found(tmp_path):
+    """squeue lists jobs in a hidden partition, ours included, only with --all."""
+    _run_prologue(tmp_path, ResumeConfig(), None, hidden_partition=True)
+    requeued = _run_prologue(tmp_path, ResumeConfig(), None, hidden_partition=True)
+
+    assert "already queued: 999" in requeued.stdout
+    assert len(_sbatch_calls(tmp_path)) == 1
+
+
+@pytest.mark.skipif(shutil.which("bash") is None, reason="bash not installed")
+def test_a_follow_up_whose_sbatch_reply_was_lost_is_not_queued_again(tmp_path):
+    """sbatch failed after creating the job: the claim stays, and the requeue finds the job pending."""
+    failed = _run_prologue(tmp_path, ResumeConfig(), None, sbatch_loses_reply=True)
+    requeued = _run_prologue(tmp_path, ResumeConfig(), None)
+
+    assert "Failed to submit auto-resume follow-up" in failed.stdout
+    assert "already queued: 999" in requeued.stdout
+    assert len(_sbatch_calls(tmp_path)) == 1

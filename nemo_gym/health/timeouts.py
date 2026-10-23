@@ -127,6 +127,7 @@ class RolloutTiming:
     """What one rollout contributes to the section, read from its final record.
 
     A busy time is None when the rollout does not measure it: a call without timing, or no tool timing.
+    ``active_s`` is how long a call of any kind ran, so a stretch in which two kinds overlap counts once.
     """
 
     failed: bool
@@ -138,6 +139,7 @@ class RolloutTiming:
     policy_s: Optional[float]
     other_model_s: Optional[float]
     tool_s: Optional[float]
+    active_s: Optional[float]
     policy_calls: int
     policy_tokens_per_s: tuple[float, ...]
 
@@ -156,49 +158,69 @@ class _Span:
 
 
 def read_rollout_timing(row: Mapping[str, Any]) -> RolloutTiming:
-    """Everything the section needs from one rollout's final record."""
-    trajectory = row.get("ng_trajectory") or {}
-    model_calls = (row.get("ng_model_call_capture") or {}).get("calls") or []
+    """Everything the section needs from one rollout's final record.
+
+    A malformed record never raises: a value of the wrong type reads as not measured, and the record checks
+    report the record itself.
+    """
+    row = _mapping(row)
+    trajectory = _mapping(row.get("ng_trajectory"))
+    model_calls = _objects(_mapping(row.get("ng_model_call_capture")).get("calls"))
     policy_calls = [call for call in model_calls if _is_policy_call(call)]
     other_calls = [call for call in model_calls if not _is_policy_call(call)]
-    events, invalid_events = _timeout_events(row, trajectory, model_calls)
+    events, invalid_events = _timeout_events(row)
     speeds = (_tokens_per_s(call) for call in policy_calls)
+    tool_spans = _tool_spans(trajectory)
     return RolloutTiming(
         failed=row.get("_ng_failure_class") is not None,
         timed_out=_timed_out(row, events),
         event_ids=tuple(event.event_id for event in events),
         invalid_events=invalid_events,
-        elapsed_s=row.get(ELAPSED_S_KEY),
+        elapsed_s=_number(row.get(ELAPSED_S_KEY)),
         has_model_calls=bool(model_calls),
         policy_s=_busy_seconds([_model_call_span(call) for call in policy_calls]),
         other_model_s=_busy_seconds([_model_call_span(call) for call in other_calls]),
-        tool_s=_tool_seconds(trajectory),
+        tool_s=None if tool_spans is None else _busy_seconds(tool_spans),
+        active_s=None if tool_spans is None else _busy_seconds([*map(_model_call_span, model_calls), *tool_spans]),
         policy_calls=len(policy_calls),
         policy_tokens_per_s=tuple(speed for speed in speeds if speed is not None),
     )
 
 
-def _timeout_events(
-    row: Mapping[str, Any], trajectory: Mapping[str, Any], model_calls: list[Mapping[str, Any]]
-) -> tuple[list[TimeoutEvent], int]:
-    """The valid events on the row and its operation records, once per ``event_id``, and how many entries
-    were not valid events."""
-    records = [
-        row,
-        *(trajectory.get("invocations") or []),
-        *(trajectory.get("tool_calls") or []),
-        *model_calls,
-    ]
+def _mapping(value: Any) -> Mapping[str, Any]:
+    """A JSON object, or an empty one in place of any other value."""
+    return value if isinstance(value, Mapping) else {}
+
+
+def _objects(value: Any) -> list[Mapping[str, Any]]:
+    """The objects in a JSON list. Any other value reads as an empty list, and an item that is not an object
+    is skipped."""
+    return [item for item in value if isinstance(item, Mapping)] if isinstance(value, list) else []
+
+
+def _number(value: Any) -> Optional[float]:
+    """A JSON number, or None in place of any other value. A boolean is not a number here."""
+    return value if isinstance(value, (int, float)) and not isinstance(value, bool) else None
+
+
+def _timeout_events(row: Mapping[str, Any]) -> tuple[list[TimeoutEvent], int]:
+    """The valid events in the row's ``timeouts`` list, once per ``event_id``, and how many entries were not
+    valid events. Only the row carries events: the trajectory's operation records have no field for them, and
+    collection drops a trajectory that adds one."""
+    raw_events = row.get("timeouts")
+    if not raw_events:
+        return [], 0
+    if not isinstance(raw_events, list):
+        return [], 1
     events: dict[str, TimeoutEvent] = {}
     invalid = 0
-    for record in records:
-        for raw_event in record.get("timeouts") or []:
-            try:
-                event = TimeoutEvent.model_validate(raw_event)
-            except ValidationError:
-                invalid += 1
-            else:
-                events.setdefault(event.event_id, event)
+    for raw_event in raw_events:
+        try:
+            event = TimeoutEvent.model_validate(raw_event)
+        except ValidationError:
+            invalid += 1
+        else:
+            events.setdefault(event.event_id, event)
     return list(events.values()), invalid
 
 
@@ -210,7 +232,7 @@ def _timed_out(row: Mapping[str, Any], events: list[TimeoutEvent]) -> Optional[T
     for signal in LEGACY_TIMEOUT_SIGNALS:
         if signal.matches(row):
             return TimedOut("legacy", signal.name, None)
-    if (row.get("termination") or {}).get("reason") == TERMINATION_TIMEOUT:
+    if _mapping(row.get("termination")).get("reason") == TERMINATION_TIMEOUT:
         return TimedOut("legacy", "termination.reason=timeout", None)
     return None
 
@@ -218,46 +240,47 @@ def _timed_out(row: Mapping[str, Any], events: list[TimeoutEvent]) -> Optional[T
 def _is_policy_call(call: Mapping[str, Any]) -> bool:
     model_ref = call.get("model_ref")
     # Captures made before `model_ref` existed held only policy calls.
-    return model_ref is None or model_ref.get("name") == POLICY_MODEL_SERVER
+    return model_ref is None or _mapping(model_ref).get("name") == POLICY_MODEL_SERVER
 
 
 def _model_call_span(call: Mapping[str, Any]) -> _Span:
-    latency_ms = call.get("latency_total_ms")
+    latency_ms = _number(call.get("latency_total_ms"))
     return _Span(
-        start=call.get("started_at"),
-        end=call.get("completed_at"),
+        start=_number(call.get("started_at")),
+        end=_number(call.get("completed_at")),
         duration_s=latency_ms / 1000 if latency_ms is not None else None,
     )
 
 
 def _tokens_per_s(call: Mapping[str, Any]) -> Optional[float]:
     """End-to-end output speed of one call, so time in the server queue and in prefill counts too."""
-    tokens, latency_ms = call.get("tokens_out"), call.get("latency_total_ms")
+    tokens, latency_ms = _number(call.get("tokens_out")), _number(call.get("latency_total_ms"))
     if not tokens or not latency_ms:
         return None
     return tokens / (latency_ms / 1000)
 
 
-def _tool_seconds(trajectory: Mapping[str, Any]) -> Optional[float]:
-    """Time spent in tool calls, or None when the trajectory does not measure it.
+def _tool_spans(trajectory: Mapping[str, Any]) -> Optional[list[_Span]]:
+    """When the tool calls ran, or None when the trajectory does not measure it.
 
-    An empty ``tool_calls`` list is a measured zero. A missing list, a ``tool_timing_unavailable`` gap or a
-    tool call without timing leaves the time unknown.
+    An empty ``tool_calls`` list is a measured zero. A missing or malformed list or a ``tool_timing_unavailable``
+    gap leaves the time unknown, and so does a tool call without timing (see ``_busy_seconds``).
     """
     tool_calls = trajectory.get("tool_calls")
-    if tool_calls is None:
+    if not isinstance(tool_calls, list) or not all(isinstance(call, Mapping) for call in tool_calls):
         return None
-    if any(gap.get("code") == "tool_timing_unavailable" for gap in trajectory.get("gaps") or []):
+    if any(gap.get("code") == "tool_timing_unavailable" for gap in _objects(trajectory.get("gaps"))):
         return None
-    spans = [
-        _Span(
-            start=call.get("started_at"),
-            end=call.get("completed_at"),
-            duration_s=call["duration_ms"] / 1000 if call.get("duration_ms") is not None else None,
-        )
-        for call in tool_calls
-    ]
-    return _busy_seconds(spans)
+    return [_tool_call_span(call) for call in tool_calls]
+
+
+def _tool_call_span(call: Mapping[str, Any]) -> _Span:
+    duration_ms = _number(call.get("duration_ms"))
+    return _Span(
+        start=_number(call.get("started_at")),
+        end=_number(call.get("completed_at")),
+        duration_s=duration_ms / 1000 if duration_ms is not None else None,
+    )
 
 
 def _busy_seconds(spans: list[_Span]) -> Optional[float]:
@@ -285,7 +308,8 @@ class TimeSplit(BaseModel):
     """How the elapsed time of the timed-out rollouts with captured model calls divides.
 
     A share is that kind's busy time over the rollouts' summed elapsed time, or None when one of the
-    rollouts does not measure it. ``untracked`` is the time that the measured kinds leave.
+    rollouts does not measure it. The kinds can overlap, as when a tool calls the policy model, so
+    ``untracked`` is the share in which no measured call ran, not one minus the shares.
     """
 
     rollouts_with_captures: int = 0
@@ -341,13 +365,13 @@ def _time_split(timed_out: list[RolloutTiming]) -> TimeSplit:
     policy = _share([t.policy_s for t in measured], measured)
     other_model = _share([t.other_model_s for t in measured], measured)
     tool = _share([t.tool_s for t in measured], measured)
-    shares = (policy, other_model, tool)
+    active = _share([t.active_s for t in measured], measured)
     return TimeSplit(
         rollouts_with_captures=len(measured),
         policy_model=policy,
         other_model=other_model,
         tool=tool,
-        untracked=None if None in shares else round(max(0.0, 1 - sum(shares)), 4),
+        untracked=None if active is None else round(max(0.0, 1 - active), 4),
         policy_output_tokens_per_s=_percentiles(
             [speed for t in measured for speed in t.policy_tokens_per_s], p50=50, p5=5
         ),

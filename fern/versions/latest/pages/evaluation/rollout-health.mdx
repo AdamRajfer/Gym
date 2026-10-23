@@ -294,15 +294,16 @@ as a number of calls.
 
 `run.stats.timeouts` counts the rollouts that ran out of time. It reads each rollout's final record: its row in the
 rollout file, or the last failure row of a rollout that never landed. `gym eval health-check` recomputes it from the
-same files. It is a report only and changes no score, verdict or row.
+same files. After `gym eval aggregate` merges shards, recheck the shards: the merged file holds their rows but not
+their failure rows. It is a report only and changes no score, verdict or row.
 
 A rollout counts as timed out on one of two kinds of evidence:
 
-1. `typed`: a timeout record on the row or on an operation record it carries (`ng_trajectory` invocations and tool
-   calls, captured model calls), in a `timeouts` list. The component that enforces a limit attaches it. Each record
-   has `event_id`, `limit`, `enforcer`, `evidence` (`internal` or `external`), `configured_s`, `elapsed_s` and
-   `fired_at`. A record copied onto several operations counts once by its `event_id`. An entry that is not a valid
-   record is not evidence and is counted in `invalid_events`. A typed record wins over a legacy signal.
+1. `typed`: a timeout record in the row's `timeouts` list. The component that enforces a limit attaches it to the
+   row; the operation records in `ng_trajectory` have no field for it. Each record has `event_id`, `limit`,
+   `enforcer`, `evidence` (`internal` or `external`), `configured_s`, `elapsed_s` and `fired_at`. A record listed
+   twice counts once by its `event_id`. An entry that is not a valid record is not evidence and is counted in
+   `invalid_events`. A typed record wins over a legacy signal.
 2. `legacy`: a field that a Gym component sets today when its own deadline fires. `by_limit` names it:
 
    | Signal | Set by |
@@ -344,9 +345,10 @@ How long a rollout took never makes it count as timed out. A failed rollout with
 `elapsed_s` is the `/run` wall clock that `gym eval run` stamps on each row as `_ng_elapsed_s`. `time_split` shows
 where the time of the timed-out rollouts went. It covers the timed-out rollouts that have both that stamp and captured
 model calls. Each share is the time spent in one kind of call over their summed elapsed time: policy-model calls,
-other models' calls (a judge or a user simulator) and tool calls. `untracked` is the rest, such as setup, verification
-or a call still running at the deadline. Overlapping calls count once, and a rollout's busy time is capped at its
-elapsed time. A share is null when one of those rollouts does not measure that kind of time: a model call without
+other models' calls (a judge or a user simulator) and tool calls. `untracked` is the time in which none of these calls
+ran, such as setup, verification or a call still running at the deadline. Overlapping calls count once, also across
+kinds for `untracked`, so the shares can add up to more than the rest when, for example, a tool calls the policy
+model. A rollout's busy time is capped at its elapsed time. A share is null when one of those rollouts does not measure that kind of time: a model call without
 timing, or a trajectory without tool timing. `policy_output_tokens_per_s` is end to end, so it includes queue and
 prefill time.
 

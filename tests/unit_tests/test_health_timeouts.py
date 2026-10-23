@@ -31,6 +31,7 @@ from nemo_gym.health.timeouts import (
     summarize_timeouts,
 )
 from nemo_gym.health.types import QUALITY_SUMMARY_FILENAME, RunHealthLimits
+from nemo_gym.path_utils import failures_path_for
 from nemo_gym.reward_profile import compute_aggregate_metrics
 from nemo_gym.rollout_collection import (
     NG_FAILURE_CLASS_KEY,
@@ -99,10 +100,14 @@ class TestEvidence:
 
         assert section(row)["by_limit"] == {"agent_timeout_seconds": 1}
 
-    def test_an_event_copied_onto_an_operation_record_counts_once(self) -> None:
-        row = {"timeouts": [event("e1")], "ng_trajectory": {"invocations": [{"timeouts": [event("e1")]}]}}
+    def test_an_event_listed_twice_counts_once(self) -> None:
+        assert section({"timeouts": [event("e1"), event("e1")]})["events"] == 1
 
-        assert section(row)["events"] == 1
+    def test_only_the_row_carries_events(self) -> None:
+        """Collection drops a trajectory whose operation records carry `timeouts`, so they are not read there."""
+        trajectory = {"invocations": [{"timeouts": [event("e1")]}], "tool_calls": [{"timeouts": [event("e2")]}]}
+
+        assert section({"ng_trajectory": trajectory})["timed_out"] == 0
 
     def test_an_invalid_event_is_counted_but_is_not_evidence(self) -> None:
         row = {"timeouts": [{"event_id": "e1"}]}  # No enforcer: not a valid report.
@@ -148,6 +153,14 @@ class TestTimeSplit:
         split = section(row)["time_split"]
 
         assert (split["policy_model"], split["other_model"], split["tool"], split["untracked"]) == (0.4, 0.1, 0.1, 0.4)
+
+    def test_untracked_is_the_time_in_which_no_call_ran(self) -> None:
+        """A tool that runs the policy model overlaps it; the stretch the two share is not counted twice."""
+        row = timed_out_row(elapsed=100.0, calls=[model_call(0, 40)], tools=[tool_call(0, 40)])
+
+        split = section(row)["time_split"]
+
+        assert (split["policy_model"], split["tool"], split["untracked"]) == (0.4, 0.4, 0.6)
 
     def test_overlapping_calls_count_once(self) -> None:
         row = timed_out_row(elapsed=100.0, calls=[model_call(0, 30), model_call(10, 40)], tools=[])
@@ -201,6 +214,54 @@ def test_an_empty_run_has_an_empty_section() -> None:
     result = section()
 
     assert (result["rollouts"], result["timed_out"], result["elapsed_s"]) == (0, 0, {"p50": None, "p95": None})
+
+
+# --- A malformed record never stops the health report ---------------------------------------------------------
+
+_MALFORMED = {
+    "trajectory_invocations_not_a_list": {"ng_trajectory": {"invocations": 7}},
+    "tool_call_not_an_object": {"ng_trajectory": {"tool_calls": [7]}},
+    "trajectory_not_an_object": {"ng_trajectory": "x"},
+    "capture_calls_not_a_list": {"ng_model_call_capture": {"calls": 7}},
+    "capture_not_an_object": {"ng_model_call_capture": [1]},
+    "model_ref_not_an_object": {"ng_model_call_capture": {"calls": [{"model_ref": "policy_model"}]}},
+    "timeouts_not_a_list": {"timeouts": 7},
+    "termination_not_an_object": {"termination": "timeout"},
+    "timing_not_a_number": {
+        ELAPSED_S_KEY: "12",
+        "ng_model_call_capture": {"calls": [{"started_at": "0", "completed_at": 1.0, "latency_total_ms": "5"}]},
+    },
+}
+
+
+@pytest.mark.parametrize("malformed", _MALFORMED.values(), ids=_MALFORMED.keys())
+def test_a_malformed_row_still_gets_a_health_report(tmp_path: Path, malformed: dict) -> None:
+    rows = [
+        {TASK_INDEX_KEY_NAME: 0, ROLLOUT_INDEX_KEY_NAME: 0, "reward": 1.0},
+        {TASK_INDEX_KEY_NAME: 1, ROLLOUT_INDEX_KEY_NAME: 0, "reward": 0.0, **malformed},
+    ]
+    (tmp_path / "rollouts.jsonl").write_text("".join(json.dumps(row) + "\n" for row in rows))
+
+    timeouts = health_check_run_dir(tmp_path).summary["run"]["stats"]["timeouts"]
+
+    assert timeouts["rollouts"] == 2
+    assert (tmp_path / QUALITY_SUMMARY_FILENAME).is_file()
+
+
+def test_a_malformed_failure_row_still_gets_a_health_report(tmp_path: Path) -> None:
+    output = tmp_path / "rollouts.jsonl"
+    output.write_text(json.dumps({TASK_INDEX_KEY_NAME: 0, ROLLOUT_INDEX_KEY_NAME: 0, "reward": 1.0}) + "\n")
+    failure = {
+        TASK_INDEX_KEY_NAME: 1,
+        ROLLOUT_INDEX_KEY_NAME: 0,
+        NG_FAILURE_CLASS_KEY: "agent_run_error",
+        "ng_model_call_capture": {"calls": 7},
+    }
+    failures_path_for(output).write_text(json.dumps(failure) + "\n")
+
+    timeouts = health_check_run_dir(tmp_path).summary["run"]["stats"]["timeouts"]
+
+    assert (timeouts["rollouts"], timeouts["failed_without_signal"]) == (2, 1)
 
 
 def test_export_keys_are_flat_and_leave_out_unknowns() -> None:

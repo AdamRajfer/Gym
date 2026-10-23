@@ -17,6 +17,8 @@
 from pathlib import Path
 
 import pytest
+from omegaconf import OmegaConf
+from omegaconf.errors import OmegaConfBaseException
 
 from nemo_gym.orchestration.api import SubmitConfig
 from nemo_gym.orchestration.executors.kubernetes_script import build_job_manifest
@@ -157,3 +159,58 @@ def test_an_empty_inherited_template_does_not_break_rendering(tmp_path, config_p
     overlay.write_text("empty_defaults: {}\nresponses_create_params:\n  _inherit_from: empty_defaults\n")
 
     assert expected in _slurm_script(_config([config_path, str(overlay)]))
+
+
+@pytest.mark.parametrize(
+    ("base_server", "target_entrypoint", "expected"),
+    [
+        # The target overrides an inherited non-Ray entrypoint with the Ray one, and the reverse.
+        ("no_ray", "../uses_ray/app.py", _RAY_INSTALL),
+        ("uses_ray", "../no_ray/app.py", _PLAIN_INSTALL),
+        # The target keeps the inherited Ray entrypoint.
+        ("uses_ray", None, _RAY_INSTALL),
+    ],
+)
+def test_inheritance_decides_the_entrypoint_as_at_runtime(
+    tmp_path, monkeypatch, base_server, target_entrypoint, expected
+):
+    # Runtime applies `_inherit_from` and drops the source before it lists servers.
+    monkeypatch.chdir(tmp_path)
+    _write_server(tmp_path, "uses_ray", ray_enabled=True)
+    _write_server(tmp_path, "no_ray", ray_enabled=False)
+    target = "s:\n  _inherit_from: base\n"
+    if target_entrypoint:
+        target += f"  resources_servers:\n    {base_server}:\n      entrypoint: {target_entrypoint}\n"
+    config_path = tmp_path / "bench.yaml"
+    config_path.write_text(
+        f"base:\n  resources_servers:\n    {base_server}:\n      entrypoint: app.py\n      domain: other\n" + target
+    )
+
+    assert expected in _slurm_script(_config([str(config_path)]))
+
+
+@pytest.mark.parametrize("position", ["before", "after"])
+@pytest.mark.parametrize(
+    ("config_path", "expected"),
+    [("benchmarks/wmt24pp/config.yaml", _RAY_INSTALL), ("benchmarks/gpqa/config.yaml", _PLAIN_INSTALL)],
+)
+def test_a_top_level_value_set_only_in_the_job_does_not_hide_a_ray_server(
+    tmp_path, monkeypatch, position, config_path, expected
+):
+    monkeypatch.delenv("ONLY_IN_THE_JOB", raising=False)
+    overlay = tmp_path / "overlay.yaml"
+    overlay.write_text("job_only: ${oc.env:ONLY_IN_THE_JOB}\n")
+    config_paths = [str(overlay), config_path] if position == "before" else [config_path, str(overlay)]
+
+    assert expected in _slurm_script(_config(config_paths))
+
+
+def test_the_server_listing_skips_an_unresolved_top_level_value_only_when_asked(monkeypatch):
+    from nemo_gym.cli.env import _configured_servers
+
+    monkeypatch.delenv("ONLY_IN_THE_JOB", raising=False)
+    config = OmegaConf.create({"job_only": "${oc.env:ONLY_IN_THE_JOB}"})
+
+    with pytest.raises(OmegaConfBaseException):
+        list(_configured_servers(config))
+    assert list(_configured_servers(config, skip_unresolved_roots=True)) == []

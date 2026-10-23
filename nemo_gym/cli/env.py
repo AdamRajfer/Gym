@@ -33,6 +33,7 @@ import rich
 import uvicorn
 from devtools import pprint
 from omegaconf import DictConfig, ListConfig, OmegaConf
+from omegaconf.errors import OmegaConfBaseException
 from pydantic import Field
 from rich.table import Table
 from tqdm.auto import tqdm
@@ -370,13 +371,24 @@ class _ConfiguredServer(NamedTuple):
     dir_path: Path
 
 
-def _configured_servers(global_config_dict: DictConfig) -> Iterator[_ConfiguredServer]:
-    """Yield each server instance in the config that has an entrypoint to launch."""
+def _configured_servers(
+    global_config_dict: DictConfig, *, skip_unresolved_roots: bool = False
+) -> Iterator[_ConfiguredServer]:
+    """Yield each server instance in the config that has an entrypoint to launch.
+
+    With ``skip_unresolved_roots``, a top-level value that cannot be resolved yet is skipped instead of raising:
+    a check at submit time cannot resolve values that exist only inside the job.
+    """
     top_level_paths = [k for k in global_config_dict.keys() if k not in NEMO_GYM_RESERVED_TOP_LEVEL_KEYS]
 
     # TODO there is a better way to resolve this that uses nemo_gym/global_config.py::ServerInstanceConfig
     for top_level_path in top_level_paths:
-        server_config_dict = global_config_dict[top_level_path]
+        try:
+            server_config_dict = global_config_dict[top_level_path]
+        except OmegaConfBaseException:
+            if not skip_unresolved_roots:
+                raise
+            continue
         if not isinstance(server_config_dict, DictConfig):
             continue
 

@@ -15,9 +15,10 @@
 
 import logging
 import shlex
+from copy import deepcopy
 from typing import Any
 
-from omegaconf import OmegaConf
+from omegaconf import DictConfig, OmegaConf
 from omegaconf.errors import OmegaConfBaseException
 
 from nemo_gym.config_types import ConfigError
@@ -47,13 +48,32 @@ def ray_extra(run: dict[str, Any]) -> tuple[str, ...]:
             # dotted `+key.path=value` (see flatten_run_args). Values stay unresolved.
             for path, value in _run_override_paths(run):
                 OmegaConf.update(merged, path, value, force_add=True)
-            merged = OmegaConf.to_container(merged, resolve=False)
-            servers = list(_configured_servers(OmegaConf.create(_without_empty_mappings(merged))))
+            merged = OmegaConf.to_container(_with_inheritance_applied(merged), resolve=False)
+            servers = list(
+                _configured_servers(OmegaConf.create(_without_empty_mappings(merged)), skip_unresolved_roots=True)
+            )
     except (ConfigError, OmegaConfBaseException) as e:
         logger.warning("Could not load the benchmark configs to check whether it needs Ray: %s", e)
         return ()
     uses_ray = any(entrypoint_ray_enabled(s.dir_path / s.entrypoint_fpath) is True for s in servers)
     return ("ray",) if uses_ray else ()
+
+
+def _with_inheritance_applied(config: DictConfig) -> DictConfig:
+    """`config` after `_inherit_from`, `_copy` and `_delete_key`, as runtime applies them before it lists servers.
+
+    A server can take its entrypoint from what it inherits, and runtime drops the source it moved. If a value that
+    exists only inside the job stops this step, the configs are judged as written, as before.
+    """
+    from nemo_gym.global_config import GlobalConfigDictParser
+
+    applied = deepcopy(config)
+    try:
+        GlobalConfigDictParser()._recursively_swap_keys(applied)
+    except Exception as e:  # Best effort: detection must never fail a submit that rendered before.
+        logger.warning("Could not apply config inheritance to check whether the run needs Ray: %s", e)
+        return config
+    return applied
 
 
 def _run_override_paths(run: dict[str, Any], prefix: str = "") -> list[tuple[str, Any]]:

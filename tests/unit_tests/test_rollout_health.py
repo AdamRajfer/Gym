@@ -1622,6 +1622,22 @@ def test_an_empty_turn_whose_own_reference_does_not_resolve_is_still_hollow(tmp_
     assert "trajectory_capture_mismatch" in {finding.check for finding in digest.findings}
 
 
+def test_an_ambiguous_response_reference_is_not_excused_but_an_exact_call_reference_is(tmp_path: Path) -> None:
+    """Two overflow calls share one model and response id: the call-id reference resolves, the response-id one
+    matches both calls and excuses nothing."""
+    shared = {"response_id": "shared", "tokens_in": None, "tokens_out": 0, "response": {}, "model_ref": _POLICY_REF}
+    first = _call(model_call_id="c1", **shared, **CONTEXT_OVERFLOWS["answered_locally"])
+    second = _call(model_call_id="c2", call_index=1, **shared, **CONTEXT_OVERFLOWS["answered_locally"])
+    record = _record(0, 0, answer=None, refs=[{"model_call_id": "c1"}], include_response_output=False)
+    ambiguous_turn = dict(record["ng_trajectory"]["turns"][0])
+    ambiguous_turn.update(turn_no=2, timestamp=2.0, model_calls=[{"model_ref": _POLICY_REF, "response_id": "shared"}])
+    record["ng_trajectory"]["turns"].append(ambiguous_turn)
+    [digest] = run_health_checks(_write_fixture(tmp_path, [(record, [first, second])]), workers=1).rollouts
+
+    hollow = [finding.locator for finding in digest.findings if finding.check == "agent_turn_hollow"]
+    assert hollow == [{"turn": 2}]
+
+
 def test_a_400_without_the_overflow_category_still_flags(tmp_path: Path) -> None:
     """The overflow is read from the recorded category, never inferred from a 400 alone."""
     succeeded = _call(model_call_id="first", started_at=1.0)

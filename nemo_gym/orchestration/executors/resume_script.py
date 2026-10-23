@@ -107,8 +107,8 @@ rm -f "$_incomplete_file"
 echo "$SLURM_JOB_ID" >> "$OUTPUT_DIR/{job_chain_name}"
 # A requeued job keeps its job id and runs this script again. One follow-up per job id: the marker is a
 # claim on it, taken with an O_EXCL create (bash noclobber, not mkdir: uutils coreutils 0.10.0's mkdir tells
-# concurrent callers that both succeeded), and it holds the follow-up's job id once sbatch answers. A claim
-# with no follow-up pending on this job was left by a shell that died before sbatch answered; replace it.
+# concurrent callers that both succeeded). A claim with no follow-up pending on this job was left by a shell
+# that died before sbatch answered, or by an sbatch that failed; replace it.
 _guard_marker="$OUTPUT_DIR/.gym_followup_queued.$SLURM_JOB_ID"
 _gym_claim_followup() {{ (set -C; : > "$_guard_marker") 2>/dev/null; }}
 _gym_queue_followup=1
@@ -121,7 +121,7 @@ if ! _gym_claim_followup; then
     # --all: without it squeue does not list jobs, ours included, in a hidden partition.
     if ! _pending=$(squeue --me --all --noheader --states=PENDING --format='%i|%E|%Z' 2>&1); then
         # Unknown is not none: a second follow-up would run the job dir twice, so keep the claim.
-        echo "WARNING: squeue failed ($_pending); keeping the follow-up claim of job $SLURM_JOB_ID. Not queueing another."
+        echo "WARNING: squeue failed ($_pending); cannot tell whether job $SLURM_JOB_ID has a follow-up, so none is queued."
     elif _followup=$(
             while IFS='|' read -r _id _deps _cwd; do
                 [[ -n "$_cwd" && "$_cwd" -ef "$OUTPUT_DIR" ]] || continue
@@ -133,7 +133,7 @@ if ! _gym_claim_followup; then
         ) && [[ -n "$_followup" ]]; then
         echo "Auto-resume follow-up for job $SLURM_JOB_ID is already queued: $_followup (requeued job). Not queueing another."
     else
-        echo "Follow-up claim of job $SLURM_JOB_ID has no pending follow-up (submission interrupted). Queueing one."
+        echo "Follow-up claim of job $SLURM_JOB_ID has no pending follow-up (submission interrupted or failed). Queueing one."
         rm -rf -- "$_guard_marker"
         _gym_claim_followup && _gym_queue_followup=1
     fi
@@ -149,7 +149,7 @@ if [[ $_gym_queue_followup == 1 ]]; then
     else
         # Keep the claim: sbatch can fail after the job was created (a lost reply). A requeue of this job asks
         # squeue, and queues the follow-up only if none is pending.
-        echo "WARNING: Failed to submit auto-resume follow-up. Chain will NOT continue on failure unless this job is requeued."
+        echo "WARNING: Failed to submit auto-resume follow-up. The chain may not continue on failure; a requeue of this job queues one if squeue shows none pending."
     fi
 fi
 """

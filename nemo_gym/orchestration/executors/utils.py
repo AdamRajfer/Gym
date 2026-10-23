@@ -69,7 +69,7 @@ def _with_inheritance_applied(config: DictConfig) -> DictConfig:
 
     applied = deepcopy(config)
     try:
-        GlobalConfigDictParser()._recursively_swap_keys(applied)
+        GlobalConfigDictParser()._recursively_swap_keys(applied, resolve_list_items=False)
     except Exception as e:  # Best effort: detection must never fail a submit that rendered before.
         logger.warning("Could not apply config inheritance to check whether the run needs Ray: %s", e)
         return config

@@ -214,3 +214,86 @@ def test_the_server_listing_skips_an_unresolved_top_level_value_only_when_asked(
     with pytest.raises(OmegaConfBaseException):
         list(_configured_servers(config))
     assert list(_configured_servers(config, skip_unresolved_roots=True)) == []
+
+
+@pytest.mark.parametrize(
+    ("base_server", "target_entrypoint", "expected"),
+    [
+        ("no_ray", "../uses_ray/app.py", _RAY_INSTALL),
+        ("uses_ray", "../no_ray/app.py", _PLAIN_INSTALL),
+        ("uses_ray", None, _RAY_INSTALL),
+    ],
+)
+def test_an_unresolved_list_value_does_not_undo_inheritance(
+    tmp_path, monkeypatch, base_server, target_entrypoint, expected
+):
+    # The inheritance step reads list items without resolving them, so a job-only list value cannot stop it.
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("ONLY_IN_THE_JOB", raising=False)
+    _write_server(tmp_path, "uses_ray", ray_enabled=True)
+    _write_server(tmp_path, "no_ray", ray_enabled=False)
+    target = "s:\n  _inherit_from: base\n"
+    if target_entrypoint:
+        target += f"  resources_servers:\n    {base_server}:\n      entrypoint: {target_entrypoint}\n"
+    config_path = tmp_path / "bench.yaml"
+    config_path.write_text(
+        f"base:\n  resources_servers:\n    {base_server}:\n      entrypoint: app.py\n      domain: other\n"
+        + target
+        + 'job_only: ["${oc.env:ONLY_IN_THE_JOB}"]\n'
+    )
+
+    assert expected in _slurm_script(_config([str(config_path)]))
+
+
+def test_the_detection_swap_still_applies_directives_inside_lists(monkeypatch):
+    from nemo_gym.global_config import GlobalConfigDictParser
+
+    monkeypatch.delenv("ONLY_IN_THE_JOB", raising=False)
+    config = OmegaConf.create(
+        {
+            "defaults": {"value": 1},
+            "holders": [{"cfg": {"_copy": "defaults"}}, "${oc.env:ONLY_IN_THE_JOB}"],
+        }
+    )
+
+    GlobalConfigDictParser()._recursively_swap_keys(config, resolve_list_items=False)
+
+    assert config.holders[0].cfg.value == 1
+    assert config.defaults.value == 1
+
+
+@pytest.mark.parametrize("position", ["before", "after"])
+@pytest.mark.parametrize(
+    ("config_path", "expected"),
+    [("benchmarks/wmt24pp/config.yaml", _RAY_INSTALL), ("benchmarks/gpqa/config.yaml", _PLAIN_INSTALL)],
+)
+def test_an_unresolved_entrypoint_does_not_hide_another_ray_server(
+    tmp_path, monkeypatch, position, config_path, expected
+):
+    monkeypatch.delenv("PLAIN_ENTRYPOINT", raising=False)
+    overlay = tmp_path / "overlay.yaml"
+    overlay.write_text(
+        "plain:\n  resources_servers:\n    mcqa:\n      entrypoint: ${oc.env:PLAIN_ENTRYPOINT}\n      domain: knowledge\n"
+    )
+    config_paths = [str(overlay), config_path] if position == "before" else [config_path, str(overlay)]
+
+    assert expected in _slurm_script(_config(config_paths))
+
+
+def test_the_server_listing_skips_an_unresolved_branch_only_when_asked(monkeypatch):
+    from nemo_gym.cli.env import _configured_servers
+
+    monkeypatch.delenv("PLAIN_ENTRYPOINT", raising=False)
+    config = OmegaConf.create(
+        {
+            "plain": {"resources_servers": {"mcqa": {"entrypoint": "${oc.env:PLAIN_ENTRYPOINT}"}}},
+            "other": {"resources_servers": {"mcqa": {"entrypoint": "app.py"}}},
+        }
+    )
+
+    with pytest.raises(OmegaConfBaseException):
+        list(_configured_servers(config))
+    assert [server.top_level_path for server in _configured_servers(config, skip_unresolved_roots=True)] == ["other"]
+
+    monkeypatch.setenv("PLAIN_ENTRYPOINT", "app.py")
+    assert [server.top_level_path for server in _configured_servers(config)] == ["plain", "other"]

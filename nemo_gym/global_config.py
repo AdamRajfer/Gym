@@ -1250,7 +1250,12 @@ For example, on the command line:
 {override_examples}"""
         )
 
-    def _recursively_swap_keys(self, dict_config: DictConfig) -> None:
+    def _recursively_swap_keys(self, dict_config: DictConfig, *, resolve_list_items: bool = True) -> None:
+        """Apply `_inherit_from`, `_copy` and `_delete_key` in place.
+
+        ``resolve_list_items=False`` reads list items as raw nodes, so a static check at submit time can apply the
+        directives without resolving a list value that exists only inside the job.
+        """
         frozen_dict_config = deepcopy(dict_config)
         original_agents = {agent.name for agent in self._agent_instances(frozen_dict_config)}
         destinations: dict[str, list[str]] = defaultdict(list)
@@ -1266,7 +1271,9 @@ For example, on the command line:
                 destinations[source].append(name)
 
         with open_dict(dict_config):
-            self._recursively_swap_keys_helper(dict_config, dict_config, frozen_dict_config)
+            self._recursively_swap_keys_helper(
+                dict_config, dict_config, frozen_dict_config, resolve_list_items=resolve_list_items
+            )
             final_agents = {agent.name for agent in self._agent_instances(dict_config)}
             destinations = {
                 source: [target for target in targets if target in final_agents]
@@ -1324,7 +1331,12 @@ For example, on the command line:
                         )
 
     def _recursively_swap_keys_helper(
-        self, dict_config: DictConfig, original_dict_config: DictConfig, frozen_dict_config: DictConfig
+        self,
+        dict_config: DictConfig,
+        original_dict_config: DictConfig,
+        frozen_dict_config: DictConfig,
+        *,
+        resolve_list_items: bool = True,
     ) -> None:
         # items_ex(resolve=False) yields raw values: directive strings like "${inherit_from:...}"
         # come back unresolved (so the swap detection below still matches), and a missing ('???')
@@ -1345,16 +1357,22 @@ For example, on the command line:
                 keys_to_delete -= existing_keys
 
             if isinstance(v, (DictConfig, dict)):
-                self._recursively_swap_keys_helper(v, original_dict_config, frozen_dict_config)
+                self._recursively_swap_keys_helper(
+                    v, original_dict_config, frozen_dict_config, resolve_list_items=resolve_list_items
+                )
             elif isinstance(v, (ListConfig, list)):
                 # Iterate without resolving so a missing ('???') element doesn't raise mid-swap (it's
                 # a scalar, so it's skipped here and reported later by raise_on_missing_values).
                 for i in range(len(v)):
                     if isinstance(v, ListConfig) and OmegaConf.is_missing(v, i):
                         continue
-                    inner_v = v[i]
+                    # A raw node, unresolved, when the caller asked for that: a container item is still a
+                    # DictConfig to recurse into, and a scalar item is never resolved.
+                    inner_v = v._get_node(i) if isinstance(v, ListConfig) and not resolve_list_items else v[i]
                     if isinstance(inner_v, (DictConfig, dict)):
-                        self._recursively_swap_keys_helper(inner_v, original_dict_config, frozen_dict_config)
+                        self._recursively_swap_keys_helper(
+                            inner_v, original_dict_config, frozen_dict_config, resolve_list_items=resolve_list_items
+                        )
 
             # e.g. ${inherit_from:grpo.num_prompts_per_step}
             is_swap_str = isinstance(v, str) and v.startswith("${inherit_from:")

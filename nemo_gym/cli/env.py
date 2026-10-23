@@ -376,8 +376,9 @@ def _configured_servers(
 ) -> Iterator[_ConfiguredServer]:
     """Yield each server instance in the config that has an entrypoint to launch.
 
-    With ``skip_unresolved_roots``, a top-level value that cannot be resolved yet is skipped instead of raising:
-    a check at submit time cannot resolve values that exist only inside the job.
+    With ``skip_unresolved_roots``, a top-level value or server branch that cannot be resolved yet, such as an
+    entrypoint set from the job's environment, is skipped instead of raising: a check at submit time cannot resolve
+    values that exist only inside the job.
     """
     top_level_paths = [k for k in global_config_dict.keys() if k not in NEMO_GYM_RESERVED_TOP_LEVEL_KEYS]
 
@@ -385,27 +386,27 @@ def _configured_servers(
     for top_level_path in top_level_paths:
         try:
             server_config_dict = global_config_dict[top_level_path]
+            if not isinstance(server_config_dict, DictConfig):
+                continue
+
+            first_key = list(server_config_dict)[0]
+            server_config_dict = server_config_dict[first_key]
+            if not isinstance(server_config_dict, DictConfig):
+                continue
+            second_key = list(server_config_dict)[0]
+            server_config_dict = server_config_dict[second_key]
+            if not isinstance(server_config_dict, DictConfig):
+                continue
+
+            if "entrypoint" not in server_config_dict:
+                continue
+
+            # TODO: This currently only handles relative entrypoints. Later on we can resolve the absolute path.
+            entrypoint_fpath = Path(server_config_dict.entrypoint)
         except OmegaConfBaseException:
             if not skip_unresolved_roots:
                 raise
             continue
-        if not isinstance(server_config_dict, DictConfig):
-            continue
-
-        first_key = list(server_config_dict)[0]
-        server_config_dict = server_config_dict[first_key]
-        if not isinstance(server_config_dict, DictConfig):
-            continue
-        second_key = list(server_config_dict)[0]
-        server_config_dict = server_config_dict[second_key]
-        if not isinstance(server_config_dict, DictConfig):
-            continue
-
-        if "entrypoint" not in server_config_dict:
-            continue
-
-        # TODO: This currently only handles relative entrypoints. Later on we can resolve the absolute path.
-        entrypoint_fpath = Path(server_config_dict.entrypoint)
         assert not entrypoint_fpath.is_absolute()
 
         # Resolve cwd-first (a local server), else the install location for built-ins.

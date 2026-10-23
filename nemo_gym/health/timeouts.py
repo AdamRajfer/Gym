@@ -19,8 +19,8 @@ The section is a report. It changes no row, reward, score or health verdict, and
 
 A rollout counts as timed out on one of two kinds of evidence:
 
-- ``typed``: a :class:`TimeoutEvent` that the component enforcing a limit attached to the operation it
-  bounds.
+- ``typed``: a :class:`TimeoutEvent` in the row's ``timeouts`` list, added by the component that enforces
+  the limit. The operation records in ``ng_trajectory`` have no field for it, so the event goes on the row.
 - ``legacy``: a field that a Gym component writes today when its own deadline fires. Each one is listed in
   :data:`LEGACY_TIMEOUT_SIGNALS` together with the component that writes it.
 
@@ -56,9 +56,9 @@ Evidence = Literal["typed", "legacy"]
 
 
 class TimeoutEvent(BaseModel):
-    """One confirmed firing of one time limit, attached to the record of the operation it bounds.
+    """One confirmed firing of one time limit, in the ``timeouts`` list of the rollout's row.
 
-    A copy of the event on another record keeps its ``event_id``, so one firing counts once.
+    An event listed twice keeps its ``event_id``, so one firing counts once.
     """
 
     model_config = ConfigDict(extra="forbid")

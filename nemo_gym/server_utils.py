@@ -370,8 +370,9 @@ def get_global_aiohttp_client(
     if _GLOBAL_AIOHTTP_CLIENT is not None:
         return _GLOBAL_AIOHTTP_CLIENT
 
-    # Only consult the config: a process Gym did not launch (a Ray task worker) has none, and parsing its
-    # argv as Gym CLI overrides would exit the process. Such a process gets the default client limits.
+    # Read only a config this process already has, cached or injected through NEMO_GYM_CONFIG_DICT; never parse
+    # its argv here, which in a Ray task worker exits the process. A process with neither gets the default client
+    # limits: env.yaml and +global_aiohttp_* do not reach it. An explicit parser config or class still parses.
     global_config_dict = maybe_get_global_config_dict()
     if global_config_dict is None and (
         global_config_dict_parser_config is not None or global_config_dict_parser_cls is not GlobalConfigDictParser

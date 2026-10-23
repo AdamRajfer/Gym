@@ -1501,6 +1501,48 @@ def test_a_rollout_ending_on_a_context_overflow_is_not_flagged(tmp_path, overflo
     assert digest.model_call_errors == 1
 
 
+# The same refusals of a request whose own output budget was invalid (max_tokens=0, or a budget reaching the
+# model length): vLLM labels them apart from an overflow, so nothing excuses them.
+INVALID_OUTPUT_BUDGETS = {
+    name: {
+        **refusal,
+        "error_category": "invalid_output_token_parameter",
+        **({"local_response_reason": "invalid_output_token_parameter"} if "local_response_reason" in refusal else {}),
+        **({"response": {"error": {"code": None}}} if "response" in refusal else {}),
+    }
+    for name, refusal in CONTEXT_OVERFLOWS.items()
+}
+
+
+@pytest.mark.parametrize("rejection", INVALID_OUTPUT_BUDGETS.values(), ids=INVALID_OUTPUT_BUDGETS.keys())
+def test_a_rejected_output_budget_ends_a_rollout_on_a_failed_call(tmp_path, rejection):
+    """The request was invalid as sent, which says nothing of the context: it is a failed call like any other."""
+    succeeded = _call(model_call_id="first", started_at=1.0)
+    rejected = _call(
+        model_call_id="last", started_at=2.0, tokens_in=None, tokens_out=0, **{"response": {}, **rejection}
+    )
+    rollout_path = _write_fixture(tmp_path, [(_owned_attempts(succeeded, rejected), [succeeded, rejected])])
+
+    [digest] = run_health_checks(rollout_path, workers=1).rollouts
+
+    assert "rollout_ended_on_failed_model_call" in {finding.check for finding in digest.findings}
+    assert digest.ended_on_error is True
+    assert digest.model_call_errors == 1
+
+
+@pytest.mark.parametrize(
+    ("refusal", "hollow"),
+    [(CONTEXT_OVERFLOWS["answered_locally"], False), (INVALID_OUTPUT_BUDGETS["answered_locally"], True)],
+    ids=["context overflow", "invalid output budget"],
+)
+def test_only_a_context_overflow_excuses_an_empty_turn(tmp_path: Path, refusal: dict, hollow: bool) -> None:
+    refused = _call(tokens_in=None, tokens_out=0, response={}, model_ref=_POLICY_REF, **refusal)
+    record = _record(0, 0, answer=None, refs=[{"model_call_id": "c1"}], include_response_output=False)
+    [digest] = run_health_checks(_write_fixture(tmp_path, [(record, [refused])]), workers=1).rollouts
+
+    assert ("agent_turn_hollow" in {finding.check for finding in digest.findings}) is hollow
+
+
 @pytest.mark.parametrize("overflow", CONTEXT_OVERFLOWS.values(), ids=CONTEXT_OVERFLOWS.keys())
 def test_a_chain_of_only_context_overflows_is_not_flagged(tmp_path, overflow):
     calls = [

@@ -5138,6 +5138,86 @@ async def test_backend_context_overflow_handling(
     unused_method.assert_not_awaited()
 
 
+_WINDOW_REFUSAL = (
+    "This model's maximum context length is 32768 tokens. However, you requested {budget} output tokens and your "
+    "prompt contains {prompt} input tokens, for a total of {total} tokens. Please reduce the length of the input "
+    "prompt or the number of requested output tokens."
+)
+
+
+@mark.parametrize("propagate", [False, True], ids=["finish-reason-length", "propagate-error"])
+@mark.parametrize("use_completions_api", [False, True], ids=["chat-completions", "completions"])
+@mark.parametrize(
+    ("budget", "error_message", "category"),
+    [
+        # The request's own budget is invalid: no prompt fits beside it, whatever the engine names.
+        ({"max_tokens": 0}, "max_tokens must be at least 1, got 0.", "invalid_output_token_parameter"),
+        (
+            {"max_completion_tokens": 40000},
+            "max_completion_tokens=40000 cannot be greater than max_model_len (32768).",
+            "invalid_output_token_parameter",
+        ),
+        (
+            {"max_tokens": 33000},
+            _WINDOW_REFUSAL.format(budget=33000, prompt=10, total=33010),
+            "invalid_output_token_parameter",
+        ),
+        # The prompt filled the window beside a valid budget, or left the engine's default budget below 1.
+        (
+            {"max_tokens": 256},
+            _WINDOW_REFUSAL.format(budget=256, prompt=32818, total=33074),
+            "context_length_exceeded",
+        ),
+        ({}, "max_tokens must be at least 1, got -6677.", "context_length_exceeded"),
+    ],
+    ids=["zero-budget", "budget-above-model-length", "budget-reaches-window", "prompt-fills-window", "default-budget"],
+)
+async def test_a_length_refusal_is_labelled_by_its_cause(
+    monkeypatch: MonkeyPatch,
+    propagate: bool,
+    use_completions_api: bool,
+    budget: dict,
+    error_message: str,
+    category: str,
+) -> None:
+    """Only a full window is labelled a context overflow; the request's own invalid budget is labelled apart. The
+    refusal is propagated or answered locally all the same."""
+    monkeypatch.setattr(nemo_gym.server_utils, "get_global_config_dict", MagicMock(return_value={}))
+    model = _make_completions_backend_model() if use_completions_api else TestApp()._setup_server(monkeypatch)
+    model.config.propagate_context_overflow_errors = propagate
+    error = ClientResponseError(MagicMock(), (), status=400, message="backend request failed")
+    error.response_content = json.dumps(
+        {"error": {"message": error_message, "type": "BadRequestError", "param": None, "code": 400}}
+    ).encode()
+    client = MagicMock(spec=NeMoGymAsyncOpenAI)
+    client.create_chat_completion = AsyncMock(side_effect=error)
+    client.create_completion = AsyncMock(side_effect=error)
+    model._clients = [client]
+    request = MagicMock()
+    request.session = {SESSION_ID_KEY: "length-refusal-test"}
+    request.headers = {}
+    body = NeMoGymChatCompletionCreateParamsNonStreaming(
+        messages=[NeMoGymChatCompletionUserMessageParam(role="user", content="hello")], **budget
+    )
+
+    if propagate:
+        with raises(ClientResponseError):
+            await model.chat_completions(request, body)
+    else:
+        result = await model.chat_completions(request, body)
+        assert result.choices[0].finish_reason == "length"
+
+    execution = request.state.nemo_gym_model_execution
+    assert execution["error_category"] == category
+    assert execution["local_response_reason"] == (None if propagate else category)
+    # The budget the label was read from is the one the engine was sent.
+    sent = (client.create_completion if use_completions_api else client.create_chat_completion).await_args.kwargs
+    sent_budget = next(
+        (sent[key] for key in ("max_tokens", "max_completion_tokens") if sent.get(key) is not None), None
+    )
+    assert sent_budget == next(iter(budget.values()), None)
+
+
 class TestCompletionsBackendRawRender:
     def test_single_user_message_string_content(self) -> None:
         model = _make_completions_backend_model()

@@ -930,7 +930,7 @@ gym eval submit --config submit.yaml --resolve-only --json
 
 ### `gym eval aggregate`
 
-Merge sharded rollout results into a single rollouts file with aggregate metrics. Reads every JSONL file matching `--input-glob`, recomputes aggregate metrics over the global union of records, and writes a `<output stem>_aggregate_metrics.json` next to the merged rollouts. It also lists the shards in `<output stem>_sources.json`, which `gym eval health-check` reads for a merged `rollouts.jsonl`. The output may be a shard only when it is the only one, and then nothing is listed. Use this to combine shards produced by `gym eval run --no-serve --disable-aggregation`.
+Merge sharded rollout results into a single rollouts file with aggregate metrics. Reads every JSONL file matching `--input-glob`, recomputes aggregate metrics over the global union of records, and writes a `<output stem>_aggregate_metrics.json` next to the merged rollouts. It also lists the shards in `<output stem>_sources.json`, which `gym eval health-check` reads for a merged `rollouts.jsonl`. The output may be a shard only when it is the only one, reached through its own directory rather than a file link from elsewhere, and then nothing is listed. Use this to combine shards produced by `gym eval run --no-serve --disable-aggregation`.
 
 | Option | Description |
 | --- | --- |

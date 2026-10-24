@@ -4677,7 +4677,8 @@ class RolloutAggregationConfig(RunHealthConfig, BaseNeMoGymCLIConfig):
         description=(
             "Concatenate the matched shard JSONLs into output_jsonl_fpath alongside the metrics file, and list "
             "them in '<stem>_sources.json', which `gym eval health-check` reads for a merged 'rollouts.jsonl'. "
-            "output_jsonl_fpath may be a shard only when it is the only one, and then nothing is listed."
+            "output_jsonl_fpath may be a shard only when it is the only one, reached through its own directory (not a "
+            "file link from elsewhere), and then nothing is listed."
         ),
     )
     count_failure_classes_as_zero: List[str] = Field(
@@ -4730,6 +4731,11 @@ def loads_jsonl_line(raw, fpath, line_no: int):
         raise ConfigError(f"Malformed JSON in '{fpath}' at line {line_no}: {e}") from e
 
 
+def _sidecar_location(fpath: Path) -> Path:
+    """Where a rollouts file's sidecars are found: its directory resolved, its own name kept."""
+    return fpath.parent.resolve() / fpath.name
+
+
 def _expand_input_glob(input_glob: str) -> List[str]:
     """Expand a glob-or-comma-separated-globs string into a sorted, deduplicated list of paths.
 
@@ -4754,11 +4760,20 @@ class RolloutAggregationHelper(BaseModel):
         if not input_paths:
             raise ConfigPathNotFoundError(f"No shards matched input_glob={config.input_glob!r}")
         output_fpath = Path(config.output_jsonl_fpath)
-        in_place = output_fpath.resolve() in {Path(path).resolve() for path in input_paths}
-        if config.merge_shards and in_place and len(input_paths) > 1:
+        merged_file = output_fpath.resolve()
+        aliases = [Path(path) for path in input_paths if Path(path).resolve() == merged_file]
+        in_place = bool(aliases)
+        # A file's sidecars sit beside the name it is reached by, so only a shard reached through the output's own
+        # directory is merged onto itself; a file link from elsewhere would leave its sidecars behind.
+        if (
+            config.merge_shards
+            and in_place
+            and (len(input_paths) > 1 or _sidecar_location(aliases[0]) != _sidecar_location(output_fpath))
+        ):
             raise ConfigError(
-                f"output_jsonl_fpath={config.output_jsonl_fpath!r} is one of the shards input_glob matched, and "
-                "merging would replace it. Merge into another path, or set merge_shards=false."
+                f"output_jsonl_fpath={config.output_jsonl_fpath!r} is one of the shards input_glob matched, or a "
+                "link to one whose sidecars lie elsewhere, and merging would replace it. Merge into another path, "
+                "or set merge_shards=false."
             )
         print(f"Aggregating {len(input_paths)} shard(s):")
         for p in input_paths:

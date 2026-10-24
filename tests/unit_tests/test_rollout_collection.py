@@ -8748,6 +8748,90 @@ class TestRolloutAggregationHelper:
 
         assert {path: path.read_bytes() for path in tmp_path.rglob("*") if path.is_file()} == files
 
+    @pytest.mark.parametrize("link", ["the output links to the shard", "the shard links to the output"])
+    async def test_a_sole_shard_reached_through_a_file_link_is_refused(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, empty_global_config: MagicMock, link: str
+    ) -> None:
+        """The shard's sidecars sit beside its own name: merging through the link would check the rows without them."""
+        run_a, _ = self._landed_and_failed_runs(tmp_path, same_indices=False)
+        merged_dir = tmp_path / "merged"
+        merged_dir.mkdir()
+        if link == "the output links to the shard":
+            (merged_dir / "rollouts.jsonl").symlink_to(run_a)
+            shard = run_a
+        else:
+            (merged_dir / "rollouts.jsonl").write_bytes(run_a.read_bytes())
+            shard = tmp_path / "linked" / "rollouts.jsonl"
+            shard.parent.mkdir()
+            shard.symlink_to(merged_dir / "rollouts.jsonl")
+            for sidecar in (_failures_path_for(run_a), materialized_path_for(run_a)):
+                (shard.parent / sidecar.name).write_bytes(sidecar.read_bytes())
+        files = {path: path.read_bytes() for path in tmp_path.rglob("*") if path.is_file()}
+
+        with pytest.raises(ConfigError, match="one of the shards"):
+            await self._merge(monkeypatch, merged_dir, shard)
+
+        assert {path: path.read_bytes() for path in tmp_path.rglob("*") if path.is_file()} == files
+
+    async def test_a_run_reached_through_a_directory_link_is_merged_onto_itself(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, empty_global_config: MagicMock
+    ) -> None:
+        """Through a linked directory the shard's name leads to the same sidecars: the in-place repair applies."""
+        run_a, _ = self._landed_and_failed_runs(tmp_path, same_indices=False)
+        linked_dir = tmp_path / "linked"
+        linked_dir.symlink_to(run_a.parent, target_is_directory=True)
+
+        aggregated = orjson.loads((await self._merge(monkeypatch, run_a.parent, linked_dir / run_a.name)).read_bytes())
+
+        assert not aggregation_sources_path_for(run_a).exists()
+        assert self._accounting(health_check_run_dir(run_a.parent).summary["run"]) == self._accounting(
+            aggregated["run"]
+        )
+        assert aggregated["run"]["artifacts"]["expected"] == 1
+
+    async def test_the_cli_check_after_a_resume_checks_the_listed_shards(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, empty_global_config: MagicMock
+    ) -> None:
+        """`gym eval run` checks its output after collection: an aggregated output keeps its shards' accounting."""
+        from types import SimpleNamespace
+
+        from nemo_gym.cli.eval import _health_check_collected_rollouts
+        from nemo_gym.rollout_health import RunHealthLimits
+
+        run_a, run_b = self._landed_and_failed_runs(tmp_path, same_indices=False)
+        merged_dir = tmp_path / "merged"
+        aggregated = orjson.loads((await self._merge(monkeypatch, merged_dir, run_a, run_b)).read_bytes())["run"]
+        config = SimpleNamespace(
+            health_check_workers=1, health_check_ignored_checks=[], run_health_limits=RunHealthLimits()
+        )
+
+        _health_check_collected_rollouts(merged_dir / "rollouts.jsonl", config)
+
+        checked = orjson.loads((merged_dir / "quality_summary.json").read_bytes())["run"]
+        assert checked["artifacts"]["expected"] == aggregated["artifacts"]["expected"] == 2
+        assert checked["artifacts"]["failed"] == aggregated["artifacts"]["failed"]
+
+    async def test_a_stopped_run_keeps_the_aggregation_summary_of_an_output_it_wrote_nothing_into(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, empty_global_config: MagicMock
+    ) -> None:
+        """The stop fast path accounts the output alone; with the shard list still there, the run added no row."""
+        from types import SimpleNamespace
+
+        import nemo_gym.cli.eval as cli_eval
+        from nemo_gym.rollout_health import RunHealthLimits
+
+        run_a, run_b = self._landed_and_failed_runs(tmp_path, same_indices=False)
+        merged_dir = tmp_path / "merged"
+        summary = (await self._merge(monkeypatch, merged_dir, run_a, run_b)).read_bytes()
+        config = SimpleNamespace(
+            health_check_workers=1, health_check_ignored_checks=[], run_health_limits=RunHealthLimits()
+        )
+        monkeypatch.setattr(cli_eval, "_terminated", True)
+
+        cli_eval._health_check_collected_rollouts(merged_dir / "rollouts.jsonl", config, {(0, 0)})
+
+        assert (merged_dir / "quality_summary.json").read_bytes() == summary
+
     async def test_a_run_merged_onto_itself_is_rechecked_alone(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, empty_global_config: MagicMock
     ) -> None:

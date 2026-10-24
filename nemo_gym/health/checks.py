@@ -476,19 +476,34 @@ def _call_locator(call: dict[str, Any], fallback: int) -> dict[str, int | str]:
     return {"call_id": str(call.get("model_call_id") or call.get("response_id") or fallback)}
 
 
-def _response_has_content(response: Any) -> bool:
+def _response_has_usable_output(response: Any) -> bool:
+    """Whether a saved response holds something the agent can act on: answer text, a refusal or a tool call, in the
+    Responses, Chat Completions or Messages shape. Reasoning alone, a summary of it included, is not usable."""
     if not isinstance(response, dict):
         return False
-    if _nonempty(response.get("output_text")) or _nonempty(response.get("content")):
+    if _nonempty(response.get("output_text")):
         return True
-    output = response.get("output")
-    choices = response.get("choices")
-    chat_content = any(
-        _nonempty(choice.get("text")) or _nonempty((choice.get("message") or {}).get("content"))
-        for choice in choices or []
-        if isinstance(choice, dict)
-    )
-    return _nonempty(output) or chat_content
+    for item in response.get("output") or []:
+        if not isinstance(item, dict) or item.get("type") == "reasoning":
+            continue
+        # Any other output item is a tool call of some kind.
+        if item.get("type") != "message" or _nonempty(item.get("content")):
+            return True
+    content = response.get("content")
+    if isinstance(content, str):
+        return bool(content.strip())
+    for block in content if isinstance(content, list) else []:
+        if isinstance(block, dict) and (
+            block.get("type") == "tool_use" or (block.get("type") == "text" and _nonempty(block.get("text")))
+        ):
+            return True
+    for choice in response.get("choices") or []:
+        if not isinstance(choice, dict):
+            continue
+        message = choice.get("message") if isinstance(choice.get("message"), dict) else {}
+        if _nonempty(choice.get("text")) or _nonempty(message.get("content")) or message.get("tool_calls"):
+            return True
+    return False
 
 
 def _usage_tokens(usage: Any) -> tuple[int | None, int | None]:
@@ -812,7 +827,7 @@ def _model_call_runaway_generation(bindings: _CallBindings, subject: dict[str, i
         for position, call in enumerate(bindings.matched_calls)
         if not _is_context_overflow_rejection(call)
         and call.get("finish_reason") in _LENGTH_LIMIT_FINISH_REASONS
-        and not _response_has_content(call.get("response"))
+        and not _response_has_usable_output(call.get("response"))
     ]
 
 

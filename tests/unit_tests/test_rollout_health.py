@@ -1082,8 +1082,8 @@ def test_zero_token_call_is_flagged_and_nonempty_length_response_is_exempt(tmp_p
     checks = {finding.check for finding in result.rollouts[0].findings}
     assert "model_call_zero_completion_tokens" in checks
     assert "model_call_runaway_generation" not in checks
-    assert health_checks._response_has_content("malformed") is False
-    assert health_checks._response_has_content({"content": "visible"}) is True
+    assert health_checks._response_has_usable_output("malformed") is False
+    assert health_checks._response_has_usable_output({"content": "visible"}) is True
 
 
 @pytest.mark.parametrize(
@@ -1140,6 +1140,60 @@ def test_current_capture_length_limit_reasons_trigger_runaway_generation(
 
     assert call["finish_reason"] == expected_reason
     assert finding.detail == {"finish_reason": expected_reason}
+
+
+_REASONING_ONLY = {
+    "responses": {"output": [{"type": "reasoning", "summary": [{"type": "summary_text", "text": "partial"}]}]},
+    "chat": {"choices": [{"message": {"content": "", "reasoning_content": "partial"}}]},
+    "messages": {"content": [{"type": "thinking", "thinking": "partial"}]},
+}
+_ACTIONABLE = {
+    "responses_function_call": {
+        "output": [
+            {"type": "reasoning", "summary": [{"type": "summary_text", "text": "partial"}]},
+            {"type": "function_call", "call_id": "t1", "name": "run", "arguments": "{}"},
+        ]
+    },
+    "responses_answer": {"output": [{"type": "message", "content": [{"type": "output_text", "text": "cut off"}]}]},
+    "chat_tool_call": {"choices": [{"message": {"content": "", "tool_calls": [{"id": "t1", "type": "function"}]}}]},
+    "messages_tool_use": {"content": [{"type": "thinking", "thinking": "partial"}, {"type": "tool_use", "id": "t1"}]},
+}
+
+
+@pytest.mark.parametrize(
+    ("response", "flagged"),
+    [
+        *((response, True) for response in _REASONING_ONLY.values()),
+        *((response, False) for response in _ACTIONABLE.values()),
+    ],
+    ids=[*_REASONING_ONLY, *_ACTIONABLE],
+)
+def test_a_length_limited_call_with_only_reasoning_is_a_runaway_generation(
+    tmp_path: Path, response: dict, flagged: bool
+) -> None:
+    """Reasoning gives the agent nothing to act on; an answer or a tool call does. A later call's recovery does not
+    erase the clipped one."""
+    clipped = _call(
+        model_call_id="clipped", response_id="r-clipped", started_at=1.0, finish_reason="length", response=response
+    )
+    recovered = _call(
+        model_call_id="recovered",
+        response_id="r-recovered",
+        started_at=2.0,
+        response={"output": [{"type": "message", "content": [{"type": "output_text", "text": "done"}]}]},
+    )
+    record = _record(
+        0,
+        0,
+        refs=[{"model_call_id": "clipped"}, {"model_call_id": "recovered"}],
+        usage={"input_tokens": 6, "output_tokens": 4},
+    )
+    rollout_path = _write_fixture(tmp_path, [(record, [clipped, recovered])])
+
+    [digest] = run_health_checks(rollout_path, workers=1).rollouts
+
+    flagged_calls = [f.locator["call_id"] for f in digest.findings if f.check == "model_call_runaway_generation"]
+    assert flagged_calls == (["clipped"] if flagged else [])
 
 
 def test_runaway_generation_is_unobserved_without_a_saved_response(tmp_path: Path) -> None:

@@ -1747,6 +1747,24 @@ def test_a_session_tells_apart_conversations_that_open_alike(tmp_path, harness_s
     assert result.summary["run"]["stats"]["model_call_errors"]["ended_on_error"] == int(flagged)
 
 
+def test_an_empty_overflow_turn_stays_hollow_when_no_other_check_accounts_for_it(tmp_path: Path) -> None:
+    """Without timestamps, an overflow beside another conversation's answer cannot be ordered, so
+    `rollout_ended_on_failed_model_call` says nothing: the empty turn is then the only finding left."""
+    answered = _call(model_call_id="aux", model_ref=_POLICY_REF, request={"input": "another conversation"})
+    overflow = _call(
+        model_ref=_POLICY_REF, tokens_in=None, tokens_out=0, response={}, **CONTEXT_OVERFLOWS["answered_locally"]
+    )
+    record = _record(0, 0, answer=None, include_response_output=False)
+    rollout_path = _write_fixture(tmp_path, [(record, [answered, overflow])])
+
+    [digest] = run_health_checks(rollout_path, workers=1).rollouts
+
+    checks = {finding.check for finding in digest.findings}
+    assert "agent_turn_hollow" in checks
+    assert "rollout_ended_on_failed_model_call" not in checks
+    assert digest.verdict == "unhealthy"
+
+
 def test_an_unordered_chain_of_an_overflow_and_a_transport_failure_still_flags(tmp_path: Path) -> None:
     calls = [
         _call(call_index=0, model_call_id=None, response_id=None, tokens_out=0, **CONTEXT_OVERFLOWS["propagated"]),

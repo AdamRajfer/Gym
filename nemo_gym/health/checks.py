@@ -546,10 +546,11 @@ def _agent_turn_hollow(
     trajectory: dict[str, Any], bindings: _CallBindings, subject: dict[str, int | str]
 ) -> list[Finding]:
     # An empty turn that ended on its own model call being rejected for a full context is the model filling its
-    # context. Unlike `rollout_ended_on_failed_model_call`, this needs no earlier answer: that check flags a request
-    # that never fit, so the exemption is not applied when an incomplete capture leaves that check unobserved. The
-    # calls are optional evidence here: without captured calls, every empty turn is still flagged.
+    # context, when another check accounts for that overflow (`_turn_ended_on_context_overflow`). The exemption is not
+    # applied when an incomplete capture leaves those checks unobserved. The calls are optional evidence here: without
+    # captured calls, every empty turn is still flagged.
     incomplete = _trajectory_has_any_gap(trajectory, _INCOMPLETE_MODEL_CALL_GAPS)
+    chains = _model_chains(_normalized_trajectory_calls(trajectory))
     return [
         Finding(
             check="agent_turn_hollow",
@@ -560,17 +561,23 @@ def _agent_turn_hollow(
         for step, turn in zip(_agent_steps(trajectory), trajectory.get("turns") or [], strict=True)
         if not step.has_message
         and not step.has_tool_calls
-        and (incomplete or not _turn_ended_on_context_overflow(turn, bindings))
+        and (incomplete or not _turn_ended_on_context_overflow(turn, bindings, chains))
     ]
 
 
-def _turn_ended_on_context_overflow(turn: dict[str, Any], bindings: _CallBindings) -> bool:
-    """Whether a turn's own model calls end on a context-overflow rejection.
+def _turn_ended_on_context_overflow(
+    turn: dict[str, Any], bindings: _CallBindings, chains: dict[Any, list[dict[str, Any]]]
+) -> bool:
+    """Whether a turn's own model calls end on a context-overflow rejection that another check accounts for.
 
     Each of the turn's references must resolve to exactly one call: a call that another turn's reference
     resolved says nothing about this turn. Of the turn's calls, the last in time decides, as in
     `_chain_ended_on_failure`, so an overflow followed by an empty retry is still hollow. When the calls
     cannot be ordered, every one must be an overflow.
+
+    Each such overflow must be accounted for: by a success of the same model in the same conversation, or by
+    `rollout_ended_on_failed_model_call` flagging that model's chain. An unordered chain that mixes in another
+    conversation's success is flagged by neither, so its empty turn stays hollow.
     """
     calls = []
     for raw_reference in turn.get("model_calls") or []:
@@ -582,10 +589,18 @@ def _turn_ended_on_context_overflow(turn: dict[str, Any], bindings: _CallBinding
         calls.append(matches[0])
     if not calls:
         return False
+    ends = calls
     if all(call.get("started_at") is not None for call in calls):
-        last = sorted(calls, key=lambda call: (call.get("started_at") or 0.0, call.get("call_index") or 0))[-1]
-        return _is_context_overflow_rejection(last)
-    return all(_is_context_overflow_rejection(call) for call in calls)
+        ends = sorted(calls, key=lambda call: (call.get("started_at") or 0.0, call.get("call_index") or 0))[-1:]
+    for end in ends:
+        if not _is_context_overflow_rejection(end):
+            return False
+        ref = end.get("model_ref")
+        chain = chains.get((ref.get("type"), ref.get("name")) if isinstance(ref, dict) else None, [])
+        answered = any(_is_successful(call) and _same_conversation(call, end) for call in chain)
+        if not answered and not _chain_ended_on_failure(chain):
+            return False
+    return True
 
 
 def _model_call_zero_completion_tokens(bindings: _CallBindings, subject: dict[str, int | str]) -> list[Finding]:

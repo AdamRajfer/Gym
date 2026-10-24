@@ -186,14 +186,16 @@ def read_rollout_timing(row: Mapping[str, Any]) -> RolloutTiming:
     """Everything the section needs from one rollout's final record.
 
     A malformed record never raises: a value of the wrong type reads as not measured, and the record checks
-    report the record itself. A capture read only in part does not measure the model time, so its calls are left
-    out.
+    report the record itself. A capture read only in part, or with a call record that is not an object, does not
+    measure the model time, so its calls are left out.
     """
     row = _mapping(row)
     trajectory = _mapping(row.get("ng_trajectory"))
     capture = _mapping(row.get("ng_model_call_capture"))
     partial = not _PARTIAL_CAPTURE_GAPS.isdisjoint(_gap_codes(capture.get("gaps")))
-    model_calls = [] if partial else _objects(capture.get("calls"))
+    calls = capture.get("calls")
+    whole = isinstance(calls, list) and all(isinstance(call, Mapping) for call in calls)
+    model_calls = list(calls) if whole and not partial else []
     policy_calls = [call for call in model_calls if _is_policy_call(call)]
     other_calls = [call for call in model_calls if not _is_policy_call(call)]
     events, invalid_events = _timeout_events(row)

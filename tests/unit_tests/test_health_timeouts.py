@@ -288,6 +288,20 @@ class TestTimeSplit:
 
         assert (split["policy_model"], split["tool"], split["untracked"]) == expected
 
+    @pytest.mark.parametrize("entry", [7, None], ids=["number", "null"])
+    def test_a_capture_with_an_unreadable_call_is_not_split(self, entry) -> None:
+        """Its other calls are not the whole capture, so neither the busy time nor the rest is known."""
+        peer = timed_out_row(calls=[model_call(0, 40)], tools=[])
+        row = timed_out_row(calls=[model_call(0, 40), entry], tools=[])
+
+        alone, beside = section(row), section(row, peer)
+
+        assert (alone["timed_out"], alone["time_split"]["rollouts_with_captures"]) == (1, 0)
+        assert (alone["time_split"]["policy_model"], alone["time_split"]["untracked"]) == (None, None)
+        assert set(alone["time_split"]["policy_output_tokens_per_s"].values()) == {None}
+        assert set(alone["time_split"]["policy_calls_per_rollout"].values()) == {None}
+        assert beside["time_split"] == section(peer)["time_split"]
+
     @pytest.mark.parametrize(
         "code",
         ["model_call_capture_records_unreadable", "model_call_capture_pending", "model_call_capture_incomplete"],
@@ -564,6 +578,30 @@ def test_an_agent_that_could_not_read_its_transcript_leaves_tool_time_unknown() 
 
     split = section(result)["time_split"]
     assert (split["policy_model"], split["tool"], split["untracked"]) == (0.4, None, None)
+
+
+@pytest.mark.parametrize(
+    ("transcript", "expected"),
+    [
+        ("not json", (0.4, None, None)),
+        (
+            json.dumps(
+                {"type": "event_msg", "payload": {"type": "token_count", "info": {"total_token_usage": {"x": "7"}}}}
+            ),
+            (0.4, 0.0, 0.6),
+        ),
+    ],
+    ids=["unreadable-record", "unreadable-usage"],
+)
+def test_a_codex_record_it_could_not_read_leaves_tool_time_unknown(transcript: str, expected: tuple) -> None:
+    """An unreadable record may have been a tool call; a token usage record it could not read was not."""
+    observations = parse_codex_observations(transcript, "0-0", returncode=-9, timed_out=True)
+    result = timed_out_row(calls=[model_call(0, 40)], ng_agent_observations=observations.model_dump(mode="json"))
+
+    _attach_trajectory_record({TASK_INDEX_KEY_NAME: 0, ROLLOUT_INDEX_KEY_NAME: 0}, result)
+
+    split = section(result)["time_split"]
+    assert (split["policy_model"], split["tool"], split["untracked"]) == expected
 
 
 def test_an_openclaw_rollout_without_its_transcript_leaves_tool_time_unknown() -> None:

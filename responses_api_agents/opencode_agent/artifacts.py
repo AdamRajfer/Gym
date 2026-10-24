@@ -162,6 +162,8 @@ def _parse_opencode_session(
         part = _load_json(row["data"])
         if not part:
             gaps.append(ObservationGap(code="agent_artifact_record_unparseable"))
+            # The part may have been a tool call, so the tool history read is not complete.
+            gaps.append(ObservationGap(code="tool_timing_unavailable", detail=row["id"]))
             continue
         ptype = part.get("type")
         message_id = row["message_id"]

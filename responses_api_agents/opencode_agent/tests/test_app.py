@@ -415,6 +415,24 @@ class TestParseOpencodeSession:
         assert root.conversation[0].content[0].text == "kept"
         assert any(gap.code == "agent_artifact_record_unowned" and gap.detail == "m0" for gap in bundle.gaps)
 
+    def test_an_unreadable_part_leaves_tool_timing_unknown(self, tmp_path) -> None:
+        """The part may have been a tool call, so the tool history read is not complete."""
+        import sqlite3
+
+        db = _session_db(tmp_path, [("assistant", [{"type": "text", "text": "kept"}, {"type": "text", "text": "x"}])])
+        con = sqlite3.connect(db)
+        con.execute("update part set data = 'not json' where id = 'p1'")
+        con.commit()
+        con.close()
+
+        bundle = _parse_opencode_session(db, "fallback")
+
+        assert _invocations(bundle)[0].conversation[0].content[0].text == "kept"
+        assert [(gap.code, gap.detail) for gap in bundle.gaps if gap.code != "tool_outcome_unavailable"] == [
+            ("agent_artifact_record_unparseable", None),
+            ("tool_timing_unavailable", "p1"),
+        ]
+
     def test_reports_invalid_timing_and_unresolved_tree_edges(self, tmp_path) -> None:
         db = _session_db(
             tmp_path,

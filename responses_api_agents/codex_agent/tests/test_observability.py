@@ -54,17 +54,28 @@ def test_missing_codex_session_record_is_explicit_and_preserves_failed_invocatio
 
 
 @pytest.mark.parametrize(
-    "record",
-    [None, [], "unexpected", {"type": "response_item", "payload": {}}, {"type": "event_msg", "payload": ["invalid"]}],
+    ("record", "tool_timing_known"),
+    [
+        (None, False),
+        ([], False),
+        ("unexpected", False),
+        ({"type": "response_item", "payload": {}}, False),
+        ({"type": "event_msg", "payload": ["invalid"]}, True),
+    ],
 )
-def test_malformed_native_record_reports_gap_without_losing_invocation(tmp_path: Path, record: object) -> None:
+def test_malformed_native_record_reports_gap_without_losing_invocation(
+    tmp_path: Path, record: object, tool_timing_known: bool
+) -> None:
+    """A record that is not a native event may have been a tool call, so the tool timing is unknown too."""
     folder = tmp_path / "sessions"
     folder.mkdir()
     (folder / "episode.jsonl").write_text(json.dumps(record) + "\n")
     bundle = read_codex_observations(tmp_path, "invocation", returncode=1, timed_out=False)
     assert bundle.records[0].invocation_id == "invocation"
     assert bundle.records[0].status == "failed"
-    assert [gap.code for gap in bundle.gaps] == ["agent_artifact_record_unparseable"]
+    assert [gap.code for gap in bundle.gaps] == ["agent_artifact_record_unparseable"] + (
+        [] if tool_timing_known else ["tool_timing_unavailable"]
+    )
 
 
 def test_multiple_native_session_files_preserve_record_boundaries(tmp_path: Path) -> None:
@@ -143,7 +154,16 @@ def test_unrecognized_transcript_record_reports_gap() -> None:
         returncode=1,
         timed_out=False,
     )
-    assert [gap.code for gap in bundle.gaps] == ["agent_artifact_record_unparseable"]
+    assert [gap.code for gap in bundle.gaps] == ["agent_artifact_record_unparseable", "tool_timing_unavailable"]
+
+
+def test_unreadable_records_report_the_tool_timing_gap_once() -> None:
+    bundle = parse_codex_observations("not json\nnot json either", "invocation", returncode=1, timed_out=False)
+    assert [gap.code for gap in bundle.gaps] == [
+        "agent_artifact_record_unparseable",
+        "agent_artifact_record_unparseable",
+        "tool_timing_unavailable",
+    ]
 
 
 @pytest.mark.parametrize("success", [True, False, None])

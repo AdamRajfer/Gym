@@ -55,8 +55,16 @@ def _diagnostic(subphase, exception_type):
     "exception_type",
     ["VerifierTimeoutError", "RewardFileNotFoundError", "RewardFileEmptyError", "VerifierOutputParseError"],
 )
-@pytest.mark.parametrize("agent_exit", [None, "AgentTimeoutError", "NonZeroAgentExitCodeError"])
-def test_a_verifier_outcome_terminal_bench_never_retries_scores_zero(tmp_path, exception_type, agent_exit):
+@pytest.mark.parametrize(
+    "agent_exit,reason",
+    [
+        (None, "completed"),
+        ("AgentTimeoutError", "timeout"),
+        ("NonZeroAgentExitCodeError", "nonzero_exit"),
+        (None, "cancelled"),
+    ],
+)
+def test_a_verifier_outcome_terminal_bench_never_retries_scores_zero(tmp_path, exception_type, agent_exit, reason):
     """Terminal-Bench counts these as 0 without a retry, so the task stays in the pass-rate denominator. An agent
     exit recorded first does not hide the verifier's outcome."""
     first = agent_exit or exception_type
@@ -65,7 +73,7 @@ def test_a_verifier_outcome_terminal_bench_never_retries_scores_zero(tmp_path, e
     verified = _verified(
         tmp_path,
         {"exception_info": {"exception_type": first}},
-        AgentTermination(reason="timeout" if agent_exit else "completed"),
+        AgentTermination(reason=reason),
         diagnostics,
     )
 
@@ -73,6 +81,41 @@ def test_a_verifier_outcome_terminal_bench_never_retries_scores_zero(tmp_path, e
     assert (verified["failure_kind"], verified["failure_reason"]) == ("verifier_error", exception_type)
     assert verified["infrastructure_error"] is None
     assert "_ng_failure_class" not in verified and "_ng_failure_type" not in verified
+
+
+@pytest.mark.parametrize(
+    "exception_type",
+    ["VerifierTimeoutError", "RewardFileNotFoundError", "RewardFileEmptyError", "VerifierOutputParseError"],
+)
+def test_an_agent_infrastructure_failure_stays_one_whatever_its_verifier_did(tmp_path, exception_type):
+    """Harbor decides a retry from the trial's first exception, here the agent's infrastructure failure."""
+    verified = _verified(
+        tmp_path,
+        {"exception_info": {"exception_type": "AgentInfrastructureError"}},
+        AgentTermination(reason="infrastructure_error", detail="model provider unavailable"),
+        [_diagnostic(None, "AgentInfrastructureError"), _diagnostic("verifier_execution", exception_type)],
+    )
+
+    assert verified["_ng_failure_class"] == "infrastructure_error"
+    assert verified["_ng_failure_type"] == "AgentInfrastructureError"
+    assert verified["infrastructure_error"] == "AgentInfrastructureError"
+    assert verified["failure_kind"] is None
+
+
+@pytest.mark.parametrize("exception_type", ["TimeoutError", "RuntimeError"])
+def test_a_verifier_that_failed_on_infrastructure_is_not_scored(tmp_path, exception_type):
+    """What run_verifier raises when a provider call times out within its budget (TimeoutError) or the sandbox
+    reports no command outcome (RuntimeError)."""
+    verified = _verified(
+        tmp_path,
+        {"exception_info": {"exception_type": exception_type}},
+        AgentTermination(reason="completed"),
+        [_diagnostic("verifier_execution", exception_type)],
+    )
+
+    assert verified["_ng_failure_class"] == "infrastructure_error"
+    assert verified["_ng_failure_type"] == exception_type
+    assert verified["failure_kind"] is None
 
 
 def test_a_verifier_that_did_not_start_stays_an_infrastructure_failure(tmp_path):

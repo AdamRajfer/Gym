@@ -319,7 +319,10 @@ class TerminalBench4ResourcesServer(SimpleResourcesServer):
         failure_type = None
         verifier_failure = None
         if not completed:
-            verifier_failure = _scored_verifier_failure(session.diagnostics)
+            # An agent infrastructure failure stays retryable whatever its verifier did next: Harbor decides a retry
+            # from the trial's first exception, which is the agent's.
+            if session.termination.reason != "infrastructure_error":
+                verifier_failure = _scored_verifier_failure(session.diagnostics)
             if verifier_failure is None:
                 failure = (result.get("exception_info") or {}).get("exception_type", "MissingOfficialReward")
                 failure_type = failure

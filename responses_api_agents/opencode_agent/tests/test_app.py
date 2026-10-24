@@ -415,6 +415,36 @@ class TestParseOpencodeSession:
         assert root.conversation[0].content[0].text == "kept"
         assert any(gap.code == "agent_artifact_record_unowned" and gap.detail == "m0" for gap in bundle.gaps)
 
+    @pytest.mark.parametrize(
+        "message_data",
+        ["not json", json.dumps({"time": {"created": 0, "completed": 1}}), "owner-missing"],
+        ids=["unreadable-message", "message-without-role", "no-session"],
+    )
+    def test_a_tool_part_left_out_for_its_message_leaves_tool_timing_unknown(self, tmp_path, message_data) -> None:
+        """Its tool is known but cannot be placed, so the tool history read is not complete."""
+        import sqlite3
+
+        part = {
+            "type": "tool",
+            "callID": "c1",
+            "tool": "bash",
+            "state": {"status": "completed", "time": {"start": 1000040000, "end": 1000050000}},
+        }
+        db = _session_db(tmp_path, [("assistant", [part])])
+        con = sqlite3.connect(db)
+        if message_data == "owner-missing":
+            con.execute("update message set session_id = NULL where id = 'm0'")
+            con.execute("update part set session_id = NULL where id = 'p0'")
+        else:
+            con.execute("update message set data = ? where id = 'm0'", (message_data,))
+        con.commit()
+        con.close()
+
+        bundle = _parse_opencode_session(db, "fallback")
+
+        assert _tool_calls(bundle) == []
+        assert ("tool_timing_unavailable", "p0") in [(gap.code, gap.detail) for gap in bundle.gaps]
+
     @pytest.mark.parametrize("call_id", ["absent", None, ""], ids=["absent", "null", "empty"])
     def test_a_tool_part_without_a_call_id_leaves_tool_timing_unknown(self, tmp_path, call_id) -> None:
         """The tool ran but has no observation to time, so the tool history read is not complete."""

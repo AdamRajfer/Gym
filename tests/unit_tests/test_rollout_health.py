@@ -1594,9 +1594,16 @@ def test_a_budget_larger_than_the_window_still_flags_after_an_answer(tmp_path, i
     result = run_health_checks(rollout_path, workers=1)
     [digest] = result.rollouts
 
-    assert "rollout_ended_on_failed_model_call" in {finding.check for finding in digest.findings}
+    checks = {finding.check for finding in digest.findings}
+    assert "rollout_ended_on_failed_model_call" in checks
     assert result.summary["run"]["stats"]["model_call_errors"]["ended_on_error"] == 1
     assert digest.model_call_errors == 1
+    # The engine generated nothing, so the token checks have nothing to read, as for an overflow.
+    assert not checks & {
+        "model_call_zero_completion_tokens",
+        "model_call_missing_token_counts",
+        "model_call_runaway_generation",
+    }
 
 
 @pytest.mark.parametrize("ordered", [True, False], ids=["ordered", "unordered"])

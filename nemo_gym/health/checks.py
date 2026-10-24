@@ -317,6 +317,21 @@ def _is_successful(call: dict[str, Any]) -> bool:
     return not _is_failed(call) and (status is None or (isinstance(status, int) and 200 <= status < 400))
 
 
+# The categories vllm_model records for an upstream refusal on length: the conversation outgrew the window, or the
+# request's own output budget exceeds all of it.
+_LENGTH_REFUSAL_CATEGORIES = frozenset({"context_length_exceeded", "invalid_output_token_parameter"})
+
+
+def _is_length_refusal(call: dict[str, Any]) -> bool:
+    """An upstream refusal on length, of either kind: the engine generated nothing, so the token checks have nothing
+    to read. Only an overflow (`_is_context_overflow_rejection`) can be the model's own end."""
+    return (
+        call.get("upstream_attempted") is True
+        and call.get("upstream_status_code") == 400
+        and not _LENGTH_REFUSAL_CATEGORIES.isdisjoint({call.get("local_response_reason"), call.get("error_category")})
+    )
+
+
 def _is_context_overflow_rejection(call: dict[str, Any]) -> bool:
     """Exclude only explicit upstream context rejections, never inferred empty generations."""
     return (
@@ -612,7 +627,7 @@ def _model_call_zero_completion_tokens(bindings: _CallBindings, subject: dict[st
             detail={"completion_tokens": 0},
         )
         for position, call in enumerate(bindings.matched_calls)
-        if not _is_context_overflow_rejection(call) and not _is_failed_attempt(call) and call.get("tokens_out") == 0
+        if not _is_length_refusal(call) and not _is_failed_attempt(call) and call.get("tokens_out") == 0
     ]
 
 
@@ -631,7 +646,7 @@ def _model_call_missing_token_counts(bindings: _CallBindings, subject: dict[str,
             },
         )
         for position, call in enumerate(bindings.matched_calls)
-        if not _is_context_overflow_rejection(call)
+        if not _is_length_refusal(call)
         and not _is_failed_attempt(call)
         and (call.get("tokens_in") is None or call.get("tokens_out") is None)
     ]
@@ -840,7 +855,7 @@ def _model_call_runaway_generation(bindings: _CallBindings, subject: dict[str, i
             detail={"finish_reason": call.get("finish_reason")},
         )
         for position, call in enumerate(bindings.matched_calls)
-        if not _is_context_overflow_rejection(call)
+        if not _is_length_refusal(call)
         and call.get("finish_reason") in _LENGTH_LIMIT_FINISH_REASONS
         and not _response_has_usable_output(call.get("response"))
     ]

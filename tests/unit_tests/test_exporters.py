@@ -369,11 +369,22 @@ class TestWandbExporter:
         init.assert_called_once_with(project="proj", name="run", dir=str(Path("/tmp/results") / "wandb"))
         assert wandb_module.environ["WANDB_API_KEY"] == "secret-key"  # pragma: allowlist secret
 
+    @pytest.mark.parametrize(
+        "resumes",
+        [
+            {"resume_from_cache": True},
+            {"resubmit": True, "resume_from_cache": None},
+            {"resubmit": True, "resume_from_cache": False},
+        ],
+        ids=["resume", "resubmit without the cache flag", "resubmit with the cache flag off"],
+    )
     def test_a_resumed_run_resumes_the_wandb_run_recorded_next_to_its_output(
-        self, monkeypatch: MonkeyPatch, wandb_config: DictConfig, tmp_path
+        self, monkeypatch: MonkeyPatch, wandb_config: DictConfig, tmp_path, resumes: dict
     ) -> None:
+        """A resubmit continues its output, so it continues the tracking run too."""
         wandb_config["output_jsonl_fpath"] = str(tmp_path / "rollouts.jsonl")
-        wandb_config["resume_from_cache"] = True
+        for key, value in resumes.items():
+            wandb_config[key] = value
         init = MagicMock(return_value=MagicMock(id="run-1"))
         monkeypatch.setattr(wandb_module.wandb, "init", init)
         monkeypatch.delenv("WANDB_API_KEY", raising=False)
@@ -830,11 +841,23 @@ def _failed_attempt(task: int) -> dict[str, Any]:
 class TestMLflowReopenAgainstARealStore:
     """The real MLflow client: `log_table` appends to an existing table, and a deleted run cannot be reopened."""
 
-    def test_a_resumed_run_logs_each_landed_rollout_once(self, mlflow_store: DictConfig) -> None:
+    @pytest.mark.parametrize(
+        "resumes",
+        [
+            {"resume_from_cache": True},
+            {"resubmit": True, "resume_from_cache": None},
+            {"resubmit": True, "resume_from_cache": False},
+        ],
+        ids=["resume", "resubmit without the cache flag", "resubmit with the cache flag off"],
+    )
+    def test_a_resumed_run_logs_each_landed_rollout_once(self, mlflow_store: DictConfig, resumes: dict) -> None:
         first = MLflowExporter(mlflow_store)
         first.setup()
+        first_run = first.run_id
         first.export_rollouts([_rollout(0), _rollout(1), _failed_attempt(2)])
         first.teardown()
+        for key, value in resumes.items():
+            mlflow_store[key] = value
 
         # A resumed job is handed every rollout that landed in its output, the earlier ones too, and its own
         # attempts: task 2 lands after its failed attempt, and task 3 fails.
@@ -842,7 +865,10 @@ class TestMLflowReopenAgainstARealStore:
         second.setup()
         second.export_rollouts([_rollout(0), _rollout(1), _rollout(2), _failed_attempt(3)])
         table = orjson.loads(Path(second.client.download_artifacts(second.run_id, "rollouts.json")).read_bytes())
+        second_run = second.run_id
         second.teardown()
+
+        assert second_run == first_run
 
         rows = [orjson.loads(row[table["columns"].index("Rollout")]) for row in table["data"]]
         assert [(row["_ng_task_index"], NG_FAILURE_CLASS_KEY in row) for row in rows] == [

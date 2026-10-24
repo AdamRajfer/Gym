@@ -22,13 +22,14 @@ from nemo_gym.base_resources_server import (
     SimpleResourcesServer,
 )
 from nemo_gym.failure_kinds import VERIFIER_ERROR
+from nemo_gym.rollout_collection import NG_TERMINAL_KEY
 from nemo_gym.rollout_correlation import rollout_context
 from nemo_gym.server_utils import (
     SESSION_ID_KEY,
     is_nemo_gym_fastapi_entrypoint,
 )
 from resources_servers.terminal_bench_4 import lifecycle
-from resources_servers.terminal_bench_4.environment import EnvironmentConfig
+from resources_servers.terminal_bench_4.environment import EnvironmentConfig, ExecLimitConfigurationError
 from resources_servers.terminal_bench_4.lifecycle import NATIVE_VERSION, Session
 from resources_servers.terminal_bench_4.models import (
     AgentTermination,
@@ -105,6 +106,9 @@ class TerminalBench4ResourcesServer(SimpleResourcesServer):
         ):
             if unknown := sorted(set(keys) - names):
                 raise ValueError(f"environment.{setting} names tasks that {manifest_path.name} lacks: {unknown}")
+        # Overrides are known before any task loads; package budgets are checked when each task loads.
+        for name, timeout_sec in environment.verifier_timeout_overrides.items():
+            environment.require_exec_limit_covers(name, timeout_sec)
         self._sessions: dict[str, Session] = {}
         self._by_identity: dict[str, str] = {}
         self._slots = asyncio.Semaphore(self.config.max_concurrent_sessions)
@@ -351,6 +355,8 @@ class TerminalBench4ResourcesServer(SimpleResourcesServer):
             },
             **({"_ng_failure_class": "infrastructure_error"} if failure else {}),
             **({"_ng_failure_type": failure_type} if failure_type else {}),
+            # A retry would fail the same way: only a configuration change can fix it.
+            **({NG_TERMINAL_KEY: True} if failure_type == ExecLimitConfigurationError.__name__ else {}),
         )
 
     def _session(self, request, session_id):

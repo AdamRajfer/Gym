@@ -1884,6 +1884,8 @@ def write_rollouts(all_results: Sequence[Mapping[str, Any]], output_fpath: str |
             os.chmod(temp_path, prior_mode)
         os.replace(temp_path, output_fpath)
         temp_path = None
+        # The rows written here are this run's, not the merged ones an aggregation's shard list names.
+        aggregation_sources_path_for(output_fpath).unlink(missing_ok=True)
     finally:
         if temp_path is not None:
             temp_path.unlink(missing_ok=True)
@@ -2051,6 +2053,9 @@ def _prune_downstream_files(output_fpath: str | Path, restart_stage: int) -> Non
                 out.flush()
                 os.fsync(out.fileno())
         _atomic_filter_jsonl(path, keep)
+        if dropped:
+            # The rows left are not the merged ones an aggregation's shard list names.
+            aggregation_sources_path_for(output_fpath).unlink(missing_ok=True)
 
 
 def load_persisted_rows(output_fpath: str | Path) -> Dict[int, List[Dict[str, Any]]]:
@@ -2274,8 +2279,9 @@ def route_stage_rows(output_fpath: str | Path, rows: Sequence[Mapping[str, Any]]
     output_fpath = Path(output_fpath)
     output_fpath.parent.mkdir(parents=True, exist_ok=True)
     failures_fpath = failures_path_for(output_fpath)
-    # The rows this run writes are not the merged ones an aggregation's shard list names.
-    aggregation_sources_path_for(output_fpath).unlink(missing_ok=True)
+    if any(not row.get(NG_NO_PERSIST_KEY) for row in rows):
+        # The rows this run writes are not the merged ones an aggregation's shard list names.
+        aggregation_sources_path_for(output_fpath).unlink(missing_ok=True)
     with output_fpath.open("ab") as main_handle, failures_fpath.open("ab") as fail_handle:
         for row in rows:
             if row.get(NG_NO_PERSIST_KEY):

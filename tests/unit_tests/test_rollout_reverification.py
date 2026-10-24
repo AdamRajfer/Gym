@@ -3218,32 +3218,36 @@ class TestRunFromConfigJudgeFailedOnly:
         task0 = next(r for r in rows if r[TASK_INDEX_KEY_NAME] == 0)
         assert task0["reward"] == 1.0  # the seeded success, not a fresh re-verification
 
-    @pytest.mark.parametrize("inputs", [True, False], ids=["writes", "stops before writing"])
+    @pytest.mark.parametrize("case", ["writes", "stops before writing", "nothing left"])
     async def test_drops_the_shard_list_of_its_output_once_it_writes(
-        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, inputs: bool
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, case: str
     ) -> None:
-        """A resume that fails before writing leaves the merged rows, and the shards listed for them, as they were."""
+        """A resume that fails before writing, or has nothing left to write, leaves the merged rows, and the shards
+        listed for them, as they were."""
         out = tmp_path / "recovered.jsonl"
-        self._write(out, [self._success(0)])
+        recovered = [{**self._success(1), "reward": 0.9}] if case == "nothing left" else []
+        self._write(out, [self._success(0), *recovered])
         self._setup_fixture(
             tmp_path,
             materialized=[self._mat(t) for t in range(2)],
             successes=[self._success(0)],
             failures=[self._failure(1)],
         )
-        if not inputs:
+        if case == "stops before writing":
             (tmp_path / "inputs.jsonl").unlink()
         aggregation_sources_path_for(out).write_text("{}")
-        self._patch(monkeypatch, [])
+        dispatched: list = []
+        self._patch(monkeypatch, dispatched)
 
         run = RolloutReverificationHelper().run_from_config(self._make_config(tmp_path, resume_from_cache=True))
-        if inputs:
-            await run
-        else:
+        if case == "stops before writing":
             with pytest.raises(FileNotFoundError):
                 await run
+        else:
+            await run
 
-        assert aggregation_sources_path_for(out).exists() is not inputs
+        assert len(dispatched) == (1 if case == "writes" else 0)
+        assert aggregation_sources_path_for(out).exists() is (case != "writes")
 
     async def test_resume_does_not_reseed_and_reverifies_only_still_failing(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path

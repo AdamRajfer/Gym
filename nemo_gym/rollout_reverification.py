@@ -1039,13 +1039,11 @@ class RolloutReverificationHelper(BaseModel):
         pcts_to_print = [20, 40, 60, 80, 90, 95, 98, 99, 100]
         run_labels = rollout_run_labels(payloads_to_reverify)
         counts_left = Counter(run_labels.get(rollout_run_key(r)) for r in payloads_to_reverify)
-        # The rows this run adds are not the merged ones an aggregation's shard list names. The list goes here, where
-        # the run starts writing, so a run that stops before then leaves it as it was.
-        aggregation_sources_path_for(output_fpaths.output).unlink(missing_ok=True)
         results_file = output_fpaths.output.open("ab")
         failures_file = output_fpaths.failures.open("ab")
         failure_counts: Counter = Counter()
         completed = 0  # number of rows re-verified this run (for progress reporting)
+        sources_dropped = False
         try:
             for future in _run_verification_payloads(payloads_to_reverify, semaphore=semaphore):
                 row, result = await future
@@ -1069,6 +1067,12 @@ class RolloutReverificationHelper(BaseModel):
 
                 serialized = orjson.dumps(result)
 
+                # ATIF writes kill-shaped diagnostics to its sidecar too.
+                if not sources_dropped and (not no_persist or config.input_format == "atif"):
+                    # The rows this run adds are not the merged ones an aggregation's shard list names. The list goes with the
+                    # first row the run writes, so a run that writes none leaves it as it was.
+                    aggregation_sources_path_for(output_fpaths.output).unlink(missing_ok=True)
+                    sources_dropped = True
                 if no_persist and config.input_format != "atif":
                     # kill_shaped: don't write anywhere. Set-difference on resume
                     # naturally re-dispatches; per-task timeout bounds wallclock.

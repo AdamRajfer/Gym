@@ -58,6 +58,7 @@ from resources_servers.gdpval.multistage_orchestrator import (
     _is_retryable_failure,
     _partial_stage_outcome,
     _prepare_resume,
+    _prune_downstream_files,
     _require_final_stage_rows,
     aggregate_metrics_path_for,
     append_journal_record,
@@ -3427,12 +3428,36 @@ class TestPrepareResume:
         aggregation_sources_path_for(out).write_text("{}")
 
         _prepare_resume(self._cfg(resume_from_cache), out, journal, fp)
-        # A fresh run sets the list aside with the rows it names; a resumed one keeps it until it writes.
+        # A fresh run sets the list aside with the rows it names; a resumed one keeps it until it writes a row.
         assert aggregation_sources_path_for(out).exists() is resume_from_cache
         row = {"stage_index": 0, TASK_INDEX_KEY_NAME: 0, ROLLOUT_INDEX_KEY_NAME: 0, "task_id": "t0"}
-        route_stage_rows(out, [{**row, NG_ENVIRONMENT_SERVER_KEY: "gdpval_environment_server"}])
+        row[NG_ENVIRONMENT_SERVER_KEY] = "gdpval_environment_server"
+        route_stage_rows(out, [{**row, NG_NO_PERSIST_KEY: True}])
+        assert aggregation_sources_path_for(out).exists() is resume_from_cache
+        route_stage_rows(out, [row])
 
         assert not aggregation_sources_path_for(out).exists()
+
+    def test_a_rewrite_of_the_output_drops_its_shard_list(self, tmp_path: Path) -> None:
+        out = tmp_path / "rollouts.jsonl"
+        row = {"stage_index": 0, TASK_INDEX_KEY_NAME: 0, ROLLOUT_INDEX_KEY_NAME: 0, "task_id": "t0"}
+        out.write_text(json.dumps(row) + "\n")
+        aggregation_sources_path_for(out).write_text("{}")
+
+        write_rollouts([row], out)
+
+        assert not aggregation_sources_path_for(out).exists()
+
+    @pytest.mark.parametrize("prunes", [True, False], ids=["prunes a row", "prunes nothing"])
+    def test_pruning_rows_drops_the_shard_list(self, tmp_path: Path, prunes: bool) -> None:
+        out = tmp_path / "rollouts.jsonl"
+        rows = [{"stage_index": stage, TASK_INDEX_KEY_NAME: 0, ROLLOUT_INDEX_KEY_NAME: 0} for stage in (0, 1)]
+        out.write_text("".join(json.dumps(row) + "\n" for row in (rows if prunes else rows[:1])))
+        aggregation_sources_path_for(out).write_text("{}")
+
+        _prune_downstream_files(out, restart_stage=0)
+
+        assert aggregation_sources_path_for(out).exists() is not prunes
 
     def test_resume_disabled_clears_existing_and_empties_state(self, tmp_path: Path) -> None:
         out = tmp_path / "rollouts.jsonl"

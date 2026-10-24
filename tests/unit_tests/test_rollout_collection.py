@@ -8571,19 +8571,13 @@ class TestRolloutAggregationHelper:
         assert not aggregation_sources_path_for(merged_dir / "rollouts.jsonl").exists()
 
     @pytest.mark.parametrize(
-        "resume,stops",
-        [(False, False), (True, False), (True, True)],
-        ids=["fresh run", "resumed run", "resumed run that stops before writing"],
+        "case", ["fresh run", "resumed run", "resumed run that stops before writing", "resumed run with nothing left"]
     )
     async def test_a_run_that_writes_to_a_merged_output_drops_its_shard_list(
-        self,
-        tmp_path: Path,
-        monkeypatch: pytest.MonkeyPatch,
-        empty_global_config: MagicMock,
-        resume: bool,
-        stops: bool,
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, empty_global_config: MagicMock, case: str
     ) -> None:
-        """The run's rows, sidecar and inventory are the ones beside the output now, not the listed shards."""
+        """The run's rows, sidecar and inventory are the ones beside the output now, not the listed shards. A run that
+        writes no row leaves the merged rows, and the shards listed for them, as they were."""
 
         class Helper(RolloutCollectionHelper):
             def _run_examples_with_metadata(self, examples, *args, **kwargs):
@@ -8604,27 +8598,50 @@ class TestRolloutAggregationHelper:
             input_jsonl_fpath=str(tmp_path / "input.jsonl"), output_jsonl_fpath=str(output), disable_aggregation=True
         )
         await Helper().run_from_config(RolloutCollectionConfig(**config, resume_from_cache=False))
-        # An aggregation into the run's output leaves the run's first rollout there, and its shard list.
+        # An aggregation into the run's output leaves rollouts of the run there, and its shard list.
+        landed = [orjson.loads(line) for line in output.read_bytes().splitlines()]
         shard = tmp_path / "shard" / "rollouts.jsonl"
-        self._write_rows(shard, orjson.loads(output.read_bytes().splitlines()[0]))
+        self._write_rows(shard, *(landed if case == "resumed run with nothing left" else landed[:1]))
         await self._merge(monkeypatch, output.parent, shard, disable_health_check=True)
 
         listed = aggregation_sources_path_for(output).read_bytes()
-        if stops:
-            # The run fails its validation before it writes: the merged rows, and the shards listed for them, stay.
+        if case == "resumed run that stops before writing":
+            # The run fails its validation before it writes.
             with pytest.raises(ConfigPathNotFoundError):
                 await Helper().run_from_config(
                     RolloutCollectionConfig(
                         **config, resume_from_cache=True, batch_manifest_fpath=str(tmp_path / "missing.json")
                     )
                 )
+        else:
+            await Helper().run_from_config(RolloutCollectionConfig(**config, resume_from_cache=case != "fresh run"))
+
+        if case in ("fresh run", "resumed run"):
+            assert not aggregation_sources_path_for(output).exists()
+            artifacts = health_check_run_dir(output.parent).summary["run"]["artifacts"]
+            assert (artifacts["expected"], artifacts["missing"]) == (2, 0)
+        else:
             assert aggregation_sources_path_for(output).read_bytes() == listed
-            return
 
-        await Helper().run_from_config(RolloutCollectionConfig(**config, resume_from_cache=resume))
+    @pytest.mark.parametrize("mode", [0o600, 0o660], ids=["0600", "0660"])
+    async def test_merging_onto_an_existing_output_keeps_its_mode(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, empty_global_config: MagicMock, mode: int
+    ) -> None:
+        """The merged rows replace the output's contents, not who may read and write it."""
+        run_a, run_b = self._landed_and_failed_runs(tmp_path, same_indices=False)
+        merged = tmp_path / "merged" / "rollouts.jsonl"
+        merged.parent.mkdir()
+        merged.write_bytes(b"")
+        os.chmod(merged, mode)
+        new = tmp_path / "new" / "rollouts.jsonl"
+        previous = os.umask(0o022)
+        try:
+            await self._merge(monkeypatch, merged.parent, run_a, run_b, disable_health_check=True)
+            await self._merge(monkeypatch, new.parent, run_a, run_b, disable_health_check=True)
+        finally:
+            os.umask(previous)
 
-        artifacts = health_check_run_dir(output.parent).summary["run"]["artifacts"]
-        assert (artifacts["expected"], artifacts["missing"]) == (2, 0)
+        assert (merged.stat().st_mode & 0o7777, new.stat().st_mode & 0o7777) == (mode, 0o644)
 
     @pytest.mark.parametrize("change", ["appended", "edited, same size"])
     async def test_a_recheck_refuses_a_shard_changed_since_the_aggregation(

@@ -3408,6 +3408,7 @@ class RolloutCollectionHelper(BaseModel):
         if len(dispatched_per_agent) > 1:
             print(f"Dispatching rollouts round-robin across {len(dispatched_per_agent)} agents")
         completed_count = 0
+        sources_dropped = False
         persisted_count = len(persisted_success_keys)
         collection_succeeded = False
         latency_tracker = DispatchLatencyTracker()
@@ -3446,9 +3447,6 @@ class RolloutCollectionHelper(BaseModel):
                 token_source = TokenCaptureStore(token_capture_dirs[0])
                 owned_token_source = token_source
 
-            # The rows this run adds are not the merged ones an aggregation's shard list names. The list goes here, where
-            # the run starts writing, so a run that stops before then leaves it as it was.
-            aggregation_sources_path_for(output_fpath).unlink(missing_ok=True)
             results_file = resource_stack.enter_context(output_fpath.open("ab"))
             failures_file = resource_stack.enter_context(failures_fpath.open("ab"))
             if not config.retain_results_in_memory and config.upload_rollouts and exporters_enabled:
@@ -3599,6 +3597,11 @@ class RolloutCollectionHelper(BaseModel):
                     upload_spool.write(orjson.dumps(_rollout_for_export(result)) + b"\n")
 
                 dispatch_name = self._dispatch_name(row)
+                if not no_persist and not sources_dropped:
+                    # The rows this run adds are not the merged ones an aggregation's shard list names. The list goes with the
+                    # first row the run writes, so a run that writes none leaves it as it was.
+                    aggregation_sources_path_for(output_fpath).unlink(missing_ok=True)
+                    sources_dropped = True
                 if no_persist:
                     # kill_shaped, or drained by the dispatch budget: written to neither
                     # the jsonl nor the sidecar. Set-difference on resume naturally
@@ -4811,11 +4814,15 @@ class RolloutAggregationHelper(BaseModel):
             # the shards. Their list names what was read from them and the merged contents, and is written before
             # those take their place. A symlinked output keeps its link, and the merged rows replace its target.
             merged_fpath = output_fpath.resolve()
+            # Replacing a merged file keeps its mode, as writing through it did.
+            prior_mode = merged_fpath.stat().st_mode & 0o7777 if merged_fpath.exists() else None
             merging_fpath = merged_fpath.with_name(f".{merged_fpath.name}.{os.getpid()}.merging")
             try:
                 with merging_fpath.open("wb") as out:
                     for r in results:
                         out.write(orjson.dumps(r) + b"\n")
+                if prior_mode is not None:
+                    os.chmod(merging_fpath, prior_mode)
                 # A run merged onto itself keeps its own sidecars beside it: a recheck of it alone is this check.
                 if not in_place:
                     write_aggregation_sources(

@@ -22,6 +22,7 @@ import logging
 import math
 import os
 import re
+import secrets
 import signal
 import time
 import warnings
@@ -3916,12 +3917,16 @@ Rollouts: {output_fpath}
 Aggregate metrics: {aggregate_metrics_fpath}{coverage}""")
 
         if not config.disable_aggregation and not config.disable_health_check:
-            from nemo_gym.rollout_health import format_health_report, run_health_checks
+            from nemo_gym.rollout_health import _aggregated_shards, format_health_report, run_health_checks
 
             try:
+                # A run that wrote no row leaves an aggregated output to its shards: those are checked, as the
+                # aggregation and a recheck check them.
+                shards = _aggregated_shards(output_fpath.parent, rollout_name=output_fpath.name)
                 health_result = await asyncio.to_thread(
                     run_health_checks,
-                    output_fpath,
+                    shards if shards is not None else output_fpath,
+                    output_dir=output_fpath.parent,
                     workers=config.health_check_workers,
                     ignored_checks=config.health_check_ignored_checks,
                     limits=config.run_health_limits,
@@ -4816,9 +4821,14 @@ class RolloutAggregationHelper(BaseModel):
             merged_fpath = output_fpath.resolve()
             # Replacing a merged file keeps its mode, as writing through it did.
             prior_mode = merged_fpath.stat().st_mode & 0o7777 if merged_fpath.exists() else None
-            merging_fpath = merged_fpath.with_name(f".{merged_fpath.name}.{os.getpid()}.merging")
+            # Created anew under a name no one can guess, and owner-only while it takes an existing output's rows,
+            # so it never grants more than that output does. A new output keeps the default creation mode.
+            merging_fpath = merged_fpath.with_name(f".{merged_fpath.name}.{secrets.token_hex(8)}.merging")
+            fd = os.open(
+                merging_fpath, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600 if prior_mode is not None else 0o666
+            )
             try:
-                with merging_fpath.open("wb") as out:
+                with os.fdopen(fd, "wb") as out:
                     for r in results:
                         out.write(orjson.dumps(r) + b"\n")
                 if prior_mode is not None:

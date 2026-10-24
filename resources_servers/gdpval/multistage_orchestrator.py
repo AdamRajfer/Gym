@@ -2279,17 +2279,18 @@ def route_stage_rows(output_fpath: str | Path, rows: Sequence[Mapping[str, Any]]
     output_fpath = Path(output_fpath)
     output_fpath.parent.mkdir(parents=True, exist_ok=True)
     failures_fpath = failures_path_for(output_fpath)
-    if any(not row.get(NG_NO_PERSIST_KEY) for row in rows):
-        # The rows this run writes are not the merged ones an aggregation's shard list names.
-        aggregation_sources_path_for(output_fpath).unlink(missing_ok=True)
+    sources_dropped = False
     with output_fpath.open("ab") as main_handle, failures_fpath.open("ab") as fail_handle:
         for row in rows:
             if row.get(NG_NO_PERSIST_KEY):
                 continue
-            if row.get(NG_FAILURE_CLASS_KEY) is not None:
-                fail_handle.write(orjson.dumps(row) + b"\n")
-            else:
-                main_handle.write(orjson.dumps(row) + b"\n")
+            serialized = orjson.dumps(row) + b"\n"
+            if not sources_dropped:
+                # The rows this run writes are not the merged ones an aggregation's shard list names. Dropped only
+                # once both files are open and a row is ready, so a run that cannot write keeps the list.
+                aggregation_sources_path_for(output_fpath).unlink(missing_ok=True)
+                sources_dropped = True
+            (fail_handle if row.get(NG_FAILURE_CLASS_KEY) is not None else main_handle).write(serialized)
         main_handle.flush()
         fail_handle.flush()
         os.fsync(main_handle.fileno())

@@ -816,15 +816,15 @@ def write_aggregation_sources(
     sources_fpath.write_text(sources.model_dump_json(indent=2) + "\n")
 
 
-def _aggregated_shards(run_dir: Path) -> list[Path] | None:
-    """The shards `gym eval aggregate` merged into ``run_dir/rollouts.jsonl``, in its order; None if it merged none.
+def _aggregated_shards(run_dir: Path, *, rollout_name: str = "rollouts.jsonl") -> list[Path] | None:
+    """The shards `gym eval aggregate` merged into ``run_dir/rollout_name``, in its order; None if it merged none.
 
     The merged rows have none of the shards' failures or inventories, so a recheck reads the shards, as the
     aggregation did. A merged file that is gone, or not byte for byte the one the list was written for, is not
     theirs; a shard that is gone cannot be read, and one not byte for byte the one merged holds other rows. Each
     raises rather than check rows other than the merged ones, or without their failures.
     """
-    merged_fpath = run_dir / "rollouts.jsonl"
+    merged_fpath = run_dir / rollout_name
     sources_fpath = aggregation_sources_path_for(merged_fpath)
     if not sources_fpath.is_file():
         return None

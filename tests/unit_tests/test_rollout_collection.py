@@ -4868,6 +4868,7 @@ class TestRolloutCollection:
         assert aggregated["rows"] == aggregated["results"]
         run_health_checks.assert_called_once_with(
             output_fpath,
+            output_dir=output_fpath.parent,
             workers=None,
             ignored_checks=[],
             limits=RunHealthLimits(),
@@ -8623,17 +8624,70 @@ class TestRolloutAggregationHelper:
         else:
             assert aggregation_sources_path_for(output).read_bytes() == listed
 
+    async def test_a_resume_with_nothing_left_checks_the_shards_its_output_still_names(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, empty_global_config: MagicMock
+    ) -> None:
+        """The run writes no row, so the aggregation still owns its output: the run's own health check reads the
+        listed shards, as the aggregation and a recheck do, rather than the run's inventory beside the output."""
+
+        class Helper(RolloutCollectionHelper):
+            def _run_examples_with_metadata(self, examples, *args, **kwargs):
+                futures = [Future() for _ in examples]
+                for future, example in zip(futures, examples):
+                    future.set_result(_CompletedRollout(row=example, result={"reward": 1.0}, rollout_latency_ms=None))
+                return futures
+
+        output = tmp_path / "results" / "rollouts.jsonl"
+        self._write_rows(
+            tmp_path / "input.jsonl",
+            *(
+                {"responses_create_params": {"input": []}, AGENT_REF_KEY_NAME: {"name": "agent_a"}, "i": i}
+                for i in range(2)
+            ),
+        )
+        config = dict(input_jsonl_fpath=str(tmp_path / "input.jsonl"), output_jsonl_fpath=str(output))
+        await Helper().run_from_config(
+            RolloutCollectionConfig(**config, resume_from_cache=False, disable_aggregation=True)
+        )
+        # An external shard holds the run's two rows, and a third task that timed out.
+        shard = tmp_path / "shard" / "rollouts.jsonl"
+        self._write_rows(shard, *(orjson.loads(line) for line in output.read_bytes().splitlines()))
+        self._write_rows(materialized_path_for(shard), *(self._rollout(task, "agent_a") for task in range(3)))
+        self._write_rows(
+            _failures_path_for(shard), self._rollout(2, "agent_a", **{NG_FAILURE_CLASS_KEY: "timeout_exceeded"})
+        )
+        await self._merge(monkeypatch, output.parent, shard, disable_health_check=True)
+        listed = aggregation_sources_path_for(output).read_bytes()
+
+        await Helper().run_from_config(RolloutCollectionConfig(**config, resume_from_cache=True))
+
+        assert aggregation_sources_path_for(output).read_bytes() == listed
+        reported = orjson.loads((output.parent / "quality_summary.json").read_bytes())["run"]["artifacts"]
+        rechecked = health_check_run_dir(output.parent).summary["run"]["artifacts"]
+        for artifacts in (reported, rechecked):
+            assert (artifacts["expected"], artifacts["missing"], artifacts["failed"]["total"]) == (3, 0, 1)
+
     @pytest.mark.parametrize("mode", [0o600, 0o660], ids=["0600", "0660"])
     async def test_merging_onto_an_existing_output_keeps_its_mode(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, empty_global_config: MagicMock, mode: int
     ) -> None:
-        """The merged rows replace the output's contents, not who may read and write it."""
+        """The merged rows replace the output's contents, not who may read and write it. While they are written,
+        the staging file is owner-only, so it never grants more than the output does."""
         run_a, run_b = self._landed_and_failed_runs(tmp_path, same_indices=False)
         merged = tmp_path / "merged" / "rollouts.jsonl"
         merged.parent.mkdir()
         merged.write_bytes(b"")
         os.chmod(merged, mode)
         new = tmp_path / "new" / "rollouts.jsonl"
+        staging_modes = []
+        fdopen = os.fdopen
+
+        def recording_fdopen(fd, *args, **kwargs):
+            if os.readlink(f"/proc/self/fd/{fd}").endswith(".merging"):
+                staging_modes.append(os.fstat(fd).st_mode & 0o7777)
+            return fdopen(fd, *args, **kwargs)
+
+        monkeypatch.setattr(os, "fdopen", recording_fdopen)
         previous = os.umask(0o022)
         try:
             await self._merge(monkeypatch, merged.parent, run_a, run_b, disable_health_check=True)
@@ -8641,6 +8695,7 @@ class TestRolloutAggregationHelper:
         finally:
             os.umask(previous)
 
+        assert staging_modes == [0o600, 0o644]
         assert (merged.stat().st_mode & 0o7777, new.stat().st_mode & 0o7777) == (mode, 0o644)
 
     @pytest.mark.parametrize("change", ["appended", "edited, same size"])

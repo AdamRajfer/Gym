@@ -3438,6 +3438,33 @@ class TestPrepareResume:
 
         assert not aggregation_sources_path_for(out).exists()
 
+    @pytest.mark.parametrize("stream", ["main", "failures"])
+    def test_a_run_that_cannot_open_the_output_keeps_its_shard_list(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stream: str
+    ) -> None:
+        """No row is written, so the merged rows and the shards listed for them stay as they were."""
+        out = tmp_path / "rollouts.jsonl"
+        out.write_bytes(b"")
+        aggregation_sources_path_for(out).write_text("{}")
+        refused = out if stream == "main" else failures_path_for(out)
+        open_path = Path.open
+
+        def guarded_open(path, *args, **kwargs):
+            if path == refused:
+                raise PermissionError(f"read-only: {path}")
+            return open_path(path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "open", guarded_open)
+        row = {"stage_index": 0, TASK_INDEX_KEY_NAME: 0, ROLLOUT_INDEX_KEY_NAME: 0, "task_id": "t0"}
+        row[NG_ENVIRONMENT_SERVER_KEY] = "gdpval_environment_server"
+
+        with pytest.raises(PermissionError):
+            route_stage_rows(out, [row])
+        monkeypatch.undo()
+
+        assert aggregation_sources_path_for(out).read_text() == "{}"
+        assert out.read_bytes() == b""
+
     def test_a_rewrite_of_the_output_drops_its_shard_list(self, tmp_path: Path) -> None:
         out = tmp_path / "rollouts.jsonl"
         row = {"stage_index": 0, TASK_INDEX_KEY_NAME: 0, ROLLOUT_INDEX_KEY_NAME: 0, "task_id": "t0"}

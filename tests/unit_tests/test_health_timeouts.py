@@ -112,6 +112,19 @@ class TestEvidence:
     def test_an_event_listed_twice_counts_once(self) -> None:
         assert section({"timeouts": [event("e1"), event("e1")]})["events"] == 1
 
+    @pytest.mark.parametrize(
+        ("container", "invalid"),
+        [(False, 1), (0, 1), ("", 1), ({}, 1), (None, 0), ([], 0)],
+        ids=["false", "zero", "empty-string", "empty-object", "null", "empty-list"],
+    )
+    def test_a_timeouts_value_that_is_not_a_list_is_one_invalid_event(self, container, invalid) -> None:
+        """Only an absent or null field, or an empty list, is no evidence; any other value is a malformed one."""
+        alone = section({"timeouts": container, "reward": 0.0})
+        beside_a_signal = section({"timeouts": container, "agent_timed_out": True, "reward": 0.0})
+
+        assert (alone["invalid_events"], alone["timed_out"]) == (invalid, 0)
+        assert (beside_a_signal["invalid_events"], beside_a_signal["by_evidence"]["legacy"]) == (invalid, 1)
+
     def test_only_the_row_carries_events(self) -> None:
         """Collection drops a trajectory whose operation records carry `timeouts`, so they are not read there."""
         trajectory = {"invocations": [{"timeouts": [event("e1")]}], "tool_calls": [{"timeouts": [event("e2")]}]}

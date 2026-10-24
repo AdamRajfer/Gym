@@ -244,7 +244,7 @@ def _timeout_events(row: Mapping[str, Any]) -> tuple[list[TimeoutEvent], int]:
     valid events. Only the row carries events: the trajectory's operation records have no field for them, and
     collection drops a trajectory that adds one."""
     raw_events = row.get("timeouts")
-    if not raw_events:
+    if raw_events is None:
         return [], 0
     if not isinstance(raw_events, list):
         return [], 1

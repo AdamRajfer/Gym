@@ -307,6 +307,14 @@ def parse_opencode_observations(
                         detail=row["id"],
                     )
                 )
+                # The tool ran but has no observation to time, so the tool history read is not complete.
+                gaps.append(
+                    ObservationGap(
+                        code="tool_timing_unavailable",
+                        invocation_id=session_id,
+                        detail=row["id"],
+                    )
+                )
             if observed_call_id is not None and (
                 started_at is None or (native_status in {"completed", "error"} and completed_at is None)
             ):

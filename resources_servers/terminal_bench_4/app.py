@@ -21,6 +21,7 @@ from nemo_gym.base_resources_server import (
     ReverifyMode,
     SimpleResourcesServer,
 )
+from nemo_gym.failure_kinds import VERIFIER_ERROR
 from nemo_gym.rollout_correlation import rollout_context
 from nemo_gym.server_utils import (
     SESSION_ID_KEY,
@@ -60,6 +61,13 @@ def atomic_json(path, value):
     temporary = path.with_name(path.name + ".tmp")
     temporary.write_text(json.dumps(value, indent=2, allow_nan=False))
     temporary.replace(path)
+
+
+# Verifier outcomes that Terminal-Bench never retries and counts as a 0: Harbor excludes them from retries and counts a
+# trial without a reward as 0. They are scored zeros here too, so the task stays in the pass-rate denominator.
+_ZERO_SCORED_VERIFIER_FAILURES = frozenset(
+    {"VerifierTimeoutError", "RewardFileNotFoundError", "RewardFileEmptyError", "VerifierOutputParseError"}
+)
 
 
 class TerminalBench4ResourcesServer(SimpleResourcesServer):
@@ -296,9 +304,13 @@ class TerminalBench4ResourcesServer(SimpleResourcesServer):
             partial_credit = max(float(rewards["reward"]), fraction)
         failure = None
         failure_type = None
+        verifier_failure = None
         if not completed:
-            failure = (result.get("exception_info") or {}).get("exception_type", "MissingOfficialReward")
-            failure_type = failure
+            exception_type = (result.get("exception_info") or {}).get("exception_type", "MissingOfficialReward")
+            if exception_type in _ZERO_SCORED_VERIFIER_FAILURES:
+                verifier_failure = exception_type
+            else:
+                failure = failure_type = exception_type
         elif session.termination.reason == "infrastructure_error" and not result.get("sandbox_resource_limit"):
             failure = session.termination.detail or "Agent infrastructure failure"
         return SandboxedVerifyResponse(
@@ -316,7 +328,8 @@ class TerminalBench4ResourcesServer(SimpleResourcesServer):
             evaluation_completed=completed,
             termination=session.termination,
             infrastructure_error=failure,
-            failure_reason=failure,
+            failure_reason=failure or verifier_failure,
+            failure_kind=VERIFIER_ERROR if verifier_failure else None,
             artifacts={"trial": str(session.directory)},
             timings={
                 key: result.get(key) for key in ("environment_setup", "agent_setup", "agent_execution", "verifier")

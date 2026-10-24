@@ -46,6 +46,34 @@ def test_a_missing_reward_carries_the_exception_type(tmp_path):
     assert verified["_ng_failure_type"] == "SandboxTimeoutException"
 
 
+@pytest.mark.parametrize(
+    "exception_type",
+    ["VerifierTimeoutError", "RewardFileNotFoundError", "RewardFileEmptyError", "VerifierOutputParseError"],
+)
+def test_a_verifier_outcome_terminal_bench_never_retries_scores_zero(tmp_path, exception_type):
+    """Terminal-Bench counts these as 0 without a retry, so the task stays in the pass-rate denominator."""
+    verified = _verified(
+        tmp_path, {"exception_info": {"exception_type": exception_type}}, AgentTermination(reason="completed")
+    )
+
+    assert (verified["reward"], verified["evaluation_completed"], verified["mask_sample"]) == (0.0, False, False)
+    assert (verified["failure_kind"], verified["failure_reason"]) == ("verifier_error", exception_type)
+    assert verified["infrastructure_error"] is None
+    assert "_ng_failure_class" not in verified and "_ng_failure_type" not in verified
+
+
+def test_a_verifier_that_did_not_start_stays_an_infrastructure_failure(tmp_path):
+    verified = _verified(
+        tmp_path,
+        {"exception_info": {"exception_type": "VerifierStartTimeoutError"}},
+        AgentTermination(reason="completed"),
+    )
+
+    assert verified["_ng_failure_class"] == "infrastructure_error"
+    assert verified["_ng_failure_type"] == "VerifierStartTimeoutError"
+    assert verified["failure_kind"] is None
+
+
 def test_a_missing_reward_without_exception_info_names_the_missing_reward(tmp_path):
     verified = _verified(tmp_path, {}, AgentTermination(reason="completed"))
 

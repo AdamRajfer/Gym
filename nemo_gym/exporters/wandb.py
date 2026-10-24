@@ -62,6 +62,7 @@ class WandbExporter(BaseExporter):
         self._record_run_id(self.run.id)
 
     def teardown(self) -> None:
+        self._flush_pending_config()
         if self.run is not None:
             self.run.finish()
             self.run = None

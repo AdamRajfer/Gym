@@ -163,6 +163,7 @@ class MLflowExporter(BaseExporter):
         self._record_run_id(self.run_id)
 
     def teardown(self) -> None:
+        self._flush_pending_config()
         if self.client is not None and self.run_id is not None:
             self.client.set_terminated(self.run_id, status="FINISHED")
         self.client = None

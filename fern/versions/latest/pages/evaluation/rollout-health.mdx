@@ -60,13 +60,15 @@ model-call evidence, explicit model-call references, and observation gaps produc
 [trajectory capability matrix](/main/reference/trajectory-capabilities) for measured harness conformance and
 [model-call capture](/main/model-server/model-call-capture) for collection configuration.
 
-The health checks runner does not reopen raw model-call capture files, inspect `ng_model_call_capture`, or reconstruct turns from an
-agent-specific response. A custom rollout driver receives the same behavior as a built-in driver: checks run when it writes a
+The integrity checks do not reopen raw model-call capture files, inspect `ng_model_call_capture`, or reconstruct turns from an
+agent-specific response. The timeout statistics are separate: their time split reads each row's `ng_model_call_capture`, and
+the capture file of a rollout that failed without a row when collection supplies its capture dir or a recheck passes
+`--model-call-capture-dir`. A custom rollout driver receives the same behavior as a built-in driver: checks run when it writes a
 valid `ng_trajectory`, and checks that need missing evidence are unobserved.
 
 <Note>
-This single-source rule makes health results reproducible after capture files move and prevents two observability representations
-from disagreeing. Rollouts collected before `ng_trajectory` was introduced can still be parsed, but trajectory-dependent checks
+This single-source rule makes the integrity verdicts reproducible after capture files move and prevents two observability
+representations from disagreeing. Moving or omitting the capture files can change only `run.stats.timeouts.time_split`. Rollouts collected before `ng_trajectory` was introduced can still be parsed, but trajectory-dependent checks
 are unobserved instead of being evaluated from inferred historical formats.
 </Note>
 
@@ -273,9 +275,9 @@ This abridged example omits the other check-coverage entries and zero-valued iss
 `run.issues` counts individual findings, not distinct affected rollouts or tasks. It contains every registered check ID, including
 IDs whose count is zero. `run.artifacts.coverage` reports how often each check was evaluated, unobserved, or explicitly ignored.
 
-`run.artifacts.captures` counts rollout trajectories that contain model-call evidence; health does not count or reopen raw
-capture files. Raw statistics under `run.stats` describe all model calls stored in `ng_trajectory`, including unreferenced
-auxiliary calls. Checks with a policy-model subject evaluate only exactly bound calls.
+`run.artifacts.captures` counts rollout trajectories that contain model-call evidence; the integrity checks do not count or
+reopen raw capture files. Raw statistics under `run.stats` describe all model calls stored in `ng_trajectory`, including
+unreferenced auxiliary calls, except `run.stats.timeouts`, whose time split reads the captured calls themselves. Checks with a policy-model subject evaluate only exactly bound calls.
 `model_call_errors.usage_unknown` counts failed calls that returned no finished response and carry no token counts. The
 token checks skip these calls, so any tokens the server spent on them before a cancellation or timeout are counted only here,
 as a number of calls.

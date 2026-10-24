@@ -175,8 +175,11 @@ class _Span:
 _PARTIAL_CAPTURE_GAPS = frozenset(
     {"model_call_capture_records_unreadable", "model_call_capture_pending", "model_call_capture_incomplete"}
 )
-# A trajectory with one of these did not observe its tool calls, so its empty tool list is not a measured zero.
-_TOOL_TIMING_GAPS = frozenset({"tool_timing_unavailable", "agent_artifact_unavailable"})
+# A trajectory with one of these did not observe its tool calls, so its tool list is not a measured history.
+_TOOL_TIMING_GAPS = frozenset({"tool_timing_unavailable", "agent_artifact_unavailable", "observation_capture_failed"})
+# A transcript that could not be read leaves an empty tool list unmeasured. Tools read from another source, as Codex
+# reads its native transcript when its CLI events are missing, stay measured.
+_TRANSCRIPT_GAPS = frozenset({"agent_transcript_unavailable"})
 
 
 def read_rollout_timing(row: Mapping[str, Any]) -> RolloutTiming:
@@ -296,12 +299,14 @@ def _tool_spans(trajectory: Mapping[str, Any]) -> Optional[list[_Span]]:
 
     An empty ``tool_calls`` list is a measured zero. A missing or malformed list leaves the time unknown, and so
     do a tool call without timing (see ``_busy_seconds``) and a gap saying the tool calls were not observed:
-    ``tool_timing_unavailable``, or ``agent_artifact_unavailable`` from an agent that could not read its transcript.
+    ``tool_timing_unavailable``, ``agent_artifact_unavailable`` or ``observation_capture_failed``. An
+    ``agent_transcript_unavailable`` gap leaves an empty list unknown too, but not tools read from another source.
     """
     tool_calls = trajectory.get("tool_calls")
     if not isinstance(tool_calls, list) or not all(isinstance(call, Mapping) for call in tool_calls):
         return None
-    if not _TOOL_TIMING_GAPS.isdisjoint(_gap_codes(trajectory.get("gaps"))):
+    codes = _gap_codes(trajectory.get("gaps"))
+    if not _TOOL_TIMING_GAPS.isdisjoint(codes) or (not tool_calls and not _TRANSCRIPT_GAPS.isdisjoint(codes)):
         return None
     return [_tool_call_span(call) for call in tool_calls]
 

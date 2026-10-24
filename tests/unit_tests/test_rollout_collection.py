@@ -20,6 +20,7 @@ import pickle
 import shutil
 import signal
 import sys
+import threading
 import time
 import warnings
 import weakref
@@ -8659,8 +8660,18 @@ class TestRolloutAggregationHelper:
         await self._merge(monkeypatch, output.parent, shard, disable_health_check=True)
         listed = aggregation_sources_path_for(output).read_bytes()
 
+        resolved_on = []
+        resolve = nemo_gym.rollout_health._aggregated_shards
+
+        def recording_resolve(*args, **kwargs):
+            resolved_on.append(threading.current_thread() is threading.main_thread())
+            return resolve(*args, **kwargs)
+
+        monkeypatch.setattr(nemo_gym.rollout_health, "_aggregated_shards", recording_resolve)
         await Helper().run_from_config(RolloutCollectionConfig(**config, resume_from_cache=True))
 
+        # Resolving the list hashes every listed file, so it runs off the event loop.
+        assert resolved_on == [False]
         assert aggregation_sources_path_for(output).read_bytes() == listed
         reported = orjson.loads((output.parent / "quality_summary.json").read_bytes())["run"]["artifacts"]
         rechecked = health_check_run_dir(output.parent).summary["run"]["artifacts"]
@@ -8680,14 +8691,15 @@ class TestRolloutAggregationHelper:
         os.chmod(merged, mode)
         new = tmp_path / "new" / "rollouts.jsonl"
         staging_modes = []
-        fdopen = os.fdopen
+        open_fd = os.open
 
-        def recording_fdopen(fd, *args, **kwargs):
-            if os.readlink(f"/proc/self/fd/{fd}").endswith(".merging"):
+        def recording_open(path, flags, *args, **kwargs):
+            fd = open_fd(path, flags, *args, **kwargs)
+            if str(path).endswith(".merging"):
                 staging_modes.append(os.fstat(fd).st_mode & 0o7777)
-            return fdopen(fd, *args, **kwargs)
+            return fd
 
-        monkeypatch.setattr(os, "fdopen", recording_fdopen)
+        monkeypatch.setattr(os, "open", recording_open)
         previous = os.umask(0o022)
         try:
             await self._merge(monkeypatch, merged.parent, run_a, run_b, disable_health_check=True)

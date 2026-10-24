@@ -3921,8 +3921,10 @@ Aggregate metrics: {aggregate_metrics_fpath}{coverage}""")
 
             try:
                 # A run that wrote no row leaves an aggregated output to its shards: those are checked, as the
-                # aggregation and a recheck check them.
-                shards = _aggregated_shards(output_fpath.parent, rollout_name=output_fpath.name)
+                # aggregation and a recheck check them. Resolving them hashes every listed file, so off the loop.
+                shards = await asyncio.to_thread(
+                    _aggregated_shards, output_fpath.parent, rollout_name=output_fpath.name
+                )
                 health_result = await asyncio.to_thread(
                     run_health_checks,
                     shards if shards is not None else output_fpath,

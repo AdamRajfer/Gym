@@ -215,3 +215,53 @@ def test_native_web_search_retains_identity_action_and_status(status: str) -> No
     assert tool.started_at is None
     assert (tool.completed_at is None) == (status == "searching")
     assert not bundle.gaps
+
+
+def _time_split(observations) -> tuple:
+    """The run-health timeouts section's policy, tool and untracked shares for a 100-second timed-out rollout whose
+    only model call ran for its first 40 seconds, with these observations attached as collection attaches them."""
+    from nemo_gym.global_config import ROLLOUT_INDEX_KEY_NAME, TASK_INDEX_KEY_NAME
+    from nemo_gym.health.timeouts import ELAPSED_S_KEY, read_rollout_timing, summarize_timeouts
+    from nemo_gym.rollout_collection import _attach_trajectory_record
+
+    started = 1_000_000.0
+    call = {
+        "model_ref": {"type": "responses_api_models", "name": "policy_model"},
+        "started_at": started,
+        "completed_at": started + 40,
+        "latency_total_ms": 40_000,
+        "tokens_out": 100,
+    }
+    row = {
+        "agent_timed_out": True,
+        ELAPSED_S_KEY: 100.0,
+        "reward": 0.0,
+        "ng_model_call_capture": {"calls": [call]},
+        "ng_agent_observations": observations.model_dump(mode="json"),
+    }
+    _attach_trajectory_record({TASK_INDEX_KEY_NAME: 0, ROLLOUT_INDEX_KEY_NAME: 0}, row)
+    split = summarize_timeouts([read_rollout_timing(row)]).model_dump()["time_split"]
+    return split["policy_model"], split["tool"], split["untracked"]
+
+
+def test_a_transcript_that_could_not_be_read_leaves_tool_time_unknown() -> None:
+    """Codex reports `agent_artifact_unavailable` without its transcript: that is not an empty tool history."""
+    assert _time_split(parse_codex_observations(None, "0-0", returncode=-9, timed_out=True)) == (0.4, None, None)
+
+
+@pytest.mark.parametrize(
+    ("transcript", "expected"),
+    [
+        ("not json", (0.4, None, None)),
+        (
+            json.dumps(
+                {"type": "event_msg", "payload": {"type": "token_count", "info": {"total_token_usage": {"x": "7"}}}}
+            ),
+            (0.4, 0.0, 0.6),
+        ),
+    ],
+    ids=["unreadable-record", "unreadable-usage"],
+)
+def test_a_record_it_could_not_read_leaves_tool_time_unknown(transcript: str, expected: tuple) -> None:
+    """An unreadable record may have been a tool call; a token usage record it could not read was not."""
+    assert _time_split(parse_codex_observations(transcript, "0-0", returncode=-9, timed_out=True)) == expected

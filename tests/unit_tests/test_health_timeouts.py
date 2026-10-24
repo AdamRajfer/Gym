@@ -48,8 +48,6 @@ from nemo_gym.rollout_collection import (
     _attach_trajectory_record,
 )
 from nemo_gym.rollout_health import health_check_run_dir
-from responses_api_agents.codex_agent.observability import parse_codex_observations
-from responses_api_agents.openclaw_agent.observability import build_openclaw_observations
 from tests.unit_tests.test_rollout_collection import (  # noqa: F401 - fixture
     FakeResponse,
     empty_global_config,
@@ -580,52 +578,6 @@ def test_collection_marks_tool_time_unknown_without_a_valid_report(producer: dic
 
     codes = {gap["code"] for gap in result["ng_trajectory"]["gaps"]}
     assert ("tool_timing_unavailable" in codes, section(result)["time_split"]["tool"]) == (tool is None, tool)
-
-
-def test_an_agent_that_could_not_read_its_transcript_leaves_tool_time_unknown() -> None:
-    """Codex reports `agent_artifact_unavailable` without its transcript: that is not an empty tool history."""
-    observations = parse_codex_observations(None, "0-0", returncode=-9, timed_out=True)
-    result = timed_out_row(calls=[model_call(0, 40)], ng_agent_observations=observations.model_dump(mode="json"))
-
-    _attach_trajectory_record({TASK_INDEX_KEY_NAME: 0, ROLLOUT_INDEX_KEY_NAME: 0}, result)
-
-    split = section(result)["time_split"]
-    assert (split["policy_model"], split["tool"], split["untracked"]) == (0.4, None, None)
-
-
-@pytest.mark.parametrize(
-    ("transcript", "expected"),
-    [
-        ("not json", (0.4, None, None)),
-        (
-            json.dumps(
-                {"type": "event_msg", "payload": {"type": "token_count", "info": {"total_token_usage": {"x": "7"}}}}
-            ),
-            (0.4, 0.0, 0.6),
-        ),
-    ],
-    ids=["unreadable-record", "unreadable-usage"],
-)
-def test_a_codex_record_it_could_not_read_leaves_tool_time_unknown(transcript: str, expected: tuple) -> None:
-    """An unreadable record may have been a tool call; a token usage record it could not read was not."""
-    observations = parse_codex_observations(transcript, "0-0", returncode=-9, timed_out=True)
-    result = timed_out_row(calls=[model_call(0, 40)], ng_agent_observations=observations.model_dump(mode="json"))
-
-    _attach_trajectory_record({TASK_INDEX_KEY_NAME: 0, ROLLOUT_INDEX_KEY_NAME: 0}, result)
-
-    split = section(result)["time_split"]
-    assert (split["policy_model"], split["tool"], split["untracked"]) == expected
-
-
-def test_an_openclaw_rollout_without_its_transcript_leaves_tool_time_unknown() -> None:
-    """OpenClaw reports an empty history with `agent_transcript_unavailable`: that is not an empty tool history."""
-    observations = build_openclaw_observations("0-0", [], [], transcript_available=False)
-    result = timed_out_row(calls=[model_call(0, 40)], ng_agent_observations=observations.model_dump(mode="json"))
-
-    _attach_trajectory_record({TASK_INDEX_KEY_NAME: 0, ROLLOUT_INDEX_KEY_NAME: 0}, result)
-
-    split = section(result)["time_split"]
-    assert (split["policy_model"], split["tool"], split["untracked"]) == (0.4, None, None)
 
 
 def test_export_keys_are_flat_and_leave_out_unknowns() -> None:

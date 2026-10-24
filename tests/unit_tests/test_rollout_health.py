@@ -1510,6 +1510,15 @@ CONTEXT_OVERFLOWS = {
 }
 
 
+# The adapter's category when the request's own output budget exceeds the whole window: no prompt fits.
+INVALID_OUTPUT_BUDGETS = {
+    name: overflow
+    | {"error_category": "invalid_output_token_parameter"}
+    | ({"local_response_reason": "invalid_output_token_parameter"} if "local_response_reason" in overflow else {})
+    for name, overflow in CONTEXT_OVERFLOWS.items()
+}
+
+
 _POLICY_REF = {"type": "responses_api_models", "name": "policy_model"}
 # A turn points at its call by the call id, or, as Terminal-Bench 4's turns do, by the model and response id.
 TURN_CALL_REFERENCES = {
@@ -1572,6 +1581,21 @@ def test_a_rollout_ending_on_a_context_overflow_is_not_flagged(tmp_path, overflo
     assert "rollout_ended_on_failed_model_call" not in {finding.check for finding in digest.findings}
     assert result.summary["run"]["stats"]["model_call_errors"]["ended_on_error"] == 0
     # The call is still a failed call in the error counts.
+    assert digest.model_call_errors == 1
+
+
+@pytest.mark.parametrize("invalid", INVALID_OUTPUT_BUDGETS.values(), ids=INVALID_OUTPUT_BUDGETS.keys())
+def test_a_budget_larger_than_the_window_still_flags_after_an_answer(tmp_path, invalid):
+    """No prompt fits such a budget, so an earlier answer excuses nothing."""
+    succeeded = _call(model_call_id="first", started_at=1.0)
+    last = _call(model_call_id="last", started_at=2.0, tokens_in=None, tokens_out=0, **invalid)
+    rollout_path = _write_fixture(tmp_path, [(_owned_attempts(succeeded, last), [succeeded, last])])
+
+    result = run_health_checks(rollout_path, workers=1)
+    [digest] = result.rollouts
+
+    assert "rollout_ended_on_failed_model_call" in {finding.check for finding in digest.findings}
+    assert result.summary["run"]["stats"]["model_call_errors"]["ended_on_error"] == 1
     assert digest.model_call_errors == 1
 
 

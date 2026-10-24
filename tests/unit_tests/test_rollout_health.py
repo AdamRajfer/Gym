@@ -1584,6 +1584,50 @@ def test_a_rollout_ending_on_a_context_overflow_is_not_flagged(tmp_path, overflo
     assert digest.model_call_errors == 1
 
 
+@pytest.mark.parametrize(
+    "refusal",
+    [INVALID_OUTPUT_BUDGETS["answered_locally"], CONTEXT_OVERFLOWS["answered_locally"]],
+    ids=["invalid-budget", "context-overflow"],
+)
+@pytest.mark.parametrize("with_clipped", [True, False], ids=["beside-a-clipped-call", "alone"])
+def test_a_length_refusal_without_a_saved_body_leaves_runaway_generation_observed(
+    tmp_path: Path, refusal: dict, with_clipped: bool
+) -> None:
+    """The engine refused before generating anything, so a missing body is no missing evidence, and another call's
+    runaway generation is still found."""
+    calls = [
+        _call(
+            model_call_id="refusal",
+            response_id="r-refusal",
+            started_at=1.0,
+            tokens_in=None,
+            tokens_out=0,
+            **(refusal | {"response": None}),
+        )
+    ]
+    refs = [{"model_call_id": "refusal"}]
+    if with_clipped:
+        reasoning = {"type": "reasoning", "summary": [{"type": "summary_text", "text": "partial"}]}
+        calls.append(
+            _call(
+                model_call_id="clipped",
+                response_id="r-clipped",
+                started_at=2.0,
+                finish_reason="length",
+                response={"output": [reasoning]},
+            )
+        )
+        refs.append({"model_call_id": "clipped"})
+    record = _record(0, 0, refs=refs, usage={"input_tokens": 6, "output_tokens": 4})
+    rollout_path = _write_fixture(tmp_path, [(record, calls)])
+
+    [digest] = run_health_checks(rollout_path, workers=1).rollouts
+
+    assert "model_call_runaway_generation" not in digest.unobserved
+    flagged = [f.locator["call_id"] for f in digest.findings if f.check == "model_call_runaway_generation"]
+    assert flagged == (["clipped"] if with_clipped else [])
+
+
 @pytest.mark.parametrize("invalid", INVALID_OUTPUT_BUDGETS.values(), ids=INVALID_OUTPUT_BUDGETS.keys())
 def test_a_budget_larger_than_the_window_still_flags_after_an_answer(tmp_path, invalid):
     """No prompt fits such a budget, so an earlier answer excuses nothing."""

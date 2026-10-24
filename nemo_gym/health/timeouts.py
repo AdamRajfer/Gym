@@ -175,6 +175,8 @@ class _Span:
 _PARTIAL_CAPTURE_GAPS = frozenset(
     {"model_call_capture_records_unreadable", "model_call_capture_pending", "model_call_capture_incomplete"}
 )
+# A trajectory with one of these did not observe its tool calls, so its empty tool list is not a measured zero.
+_TOOL_TIMING_GAPS = frozenset({"tool_timing_unavailable", "agent_artifact_unavailable"})
 
 
 def read_rollout_timing(row: Mapping[str, Any]) -> RolloutTiming:
@@ -187,7 +189,7 @@ def read_rollout_timing(row: Mapping[str, Any]) -> RolloutTiming:
     row = _mapping(row)
     trajectory = _mapping(row.get("ng_trajectory"))
     capture = _mapping(row.get("ng_model_call_capture"))
-    partial = any(gap.get("code") in _PARTIAL_CAPTURE_GAPS for gap in _objects(capture.get("gaps")))
+    partial = not _PARTIAL_CAPTURE_GAPS.isdisjoint(_gap_codes(capture.get("gaps")))
     model_calls = [] if partial else _objects(capture.get("calls"))
     policy_calls = [call for call in model_calls if _is_policy_call(call)]
     other_calls = [call for call in model_calls if not _is_policy_call(call)]
@@ -220,6 +222,11 @@ def _objects(value: Any) -> list[Mapping[str, Any]]:
     """The objects in a JSON list. Any other value reads as an empty list, and an item that is not an object
     is skipped."""
     return [item for item in value if isinstance(item, Mapping)] if isinstance(value, list) else []
+
+
+def _gap_codes(value: Any) -> set[str]:
+    """The codes in a JSON list of gaps. A code that is not a string names no gap."""
+    return {code for gap in _objects(value) if isinstance(code := gap.get("code"), str)}
 
 
 def _number(value: Any) -> Optional[float]:
@@ -276,9 +283,10 @@ def _model_call_span(call: Mapping[str, Any]) -> _Span:
 
 
 def _tokens_per_s(call: Mapping[str, Any]) -> Optional[float]:
-    """End-to-end output speed of one call, so time in the server queue and in prefill counts too."""
+    """End-to-end output speed of one call, so time in the server queue and in prefill counts too. A call that
+    produced no output is measured at zero; one without a token count or a positive latency is not measured."""
     tokens, latency_ms = _number(call.get("tokens_out")), _number(call.get("latency_total_ms"))
-    if not tokens or not latency_ms:
+    if tokens is None or tokens < 0 or latency_ms is None or latency_ms <= 0:
         return None
     return tokens / (latency_ms / 1000)
 
@@ -286,13 +294,14 @@ def _tokens_per_s(call: Mapping[str, Any]) -> Optional[float]:
 def _tool_spans(trajectory: Mapping[str, Any]) -> Optional[list[_Span]]:
     """When the tool calls ran, or None when the trajectory does not measure it.
 
-    An empty ``tool_calls`` list is a measured zero. A missing or malformed list or a ``tool_timing_unavailable``
-    gap leaves the time unknown, and so does a tool call without timing (see ``_busy_seconds``).
+    An empty ``tool_calls`` list is a measured zero. A missing or malformed list leaves the time unknown, and so
+    do a tool call without timing (see ``_busy_seconds``) and a gap saying the tool calls were not observed:
+    ``tool_timing_unavailable``, or ``agent_artifact_unavailable`` from an agent that could not read its transcript.
     """
     tool_calls = trajectory.get("tool_calls")
     if not isinstance(tool_calls, list) or not all(isinstance(call, Mapping) for call in tool_calls):
         return None
-    if any(gap.get("code") == "tool_timing_unavailable" for gap in _objects(trajectory.get("gaps"))):
+    if not _TOOL_TIMING_GAPS.isdisjoint(_gap_codes(trajectory.get("gaps"))):
         return None
     return [_tool_call_span(call) for call in tool_calls]
 

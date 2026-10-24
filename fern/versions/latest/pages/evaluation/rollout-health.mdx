@@ -357,8 +357,9 @@ for example, a tool calls the policy model. A rollout's busy time is capped at i
 one of those rollouts does not measure that kind of time: a call without timing or one that ends before it starts,
 calls of which one reports only its duration and so cannot be placed against the others, or a trajectory without
 tool timing. Collection marks a row whose agent sent no valid trajectory or observations with a
-`tool_timing_unavailable` gap, so its tool time is unknown rather than zero. `policy_output_tokens_per_s` is end to
-end, so it includes queue and prefill time.
+`tool_timing_unavailable` gap, so its tool time is unknown rather than zero; so does an `agent_artifact_unavailable`
+gap, which an agent reports when it could not read its own transcript. `policy_output_tokens_per_s` is end to end, so
+it includes queue and prefill time, and a call that produced no output counts at zero.
 
 When an exporter is configured, `gym eval run` and `gym eval aggregate` also send this section's numbers as flat keys,
 such as `health/timeouts/timed_out` and `health/timeouts/by_evidence/typed`. A null value is not sent. A limit or

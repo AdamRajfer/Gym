@@ -48,6 +48,7 @@ from nemo_gym.rollout_collection import (
     _attach_trajectory_record,
 )
 from nemo_gym.rollout_health import health_check_run_dir
+from responses_api_agents.codex_agent.observability import parse_codex_observations
 from tests.unit_tests.test_rollout_collection import (  # noqa: F401 - fixture
     FakeResponse,
     empty_global_config,
@@ -193,13 +194,20 @@ class TestTimeSplit:
 
     @pytest.mark.parametrize(
         "trajectory",
-        [{}, {"tool_calls": [{"started_at": T0}]}, {"tool_calls": [], "gaps": [{"code": "tool_timing_unavailable"}]}],
-        ids=["no-tool-list", "untimed-tool-call", "reported-gap"],
+        [
+            {},
+            {"tool_calls": [{"started_at": T0}]},
+            {"tool_calls": [], "gaps": [{"code": "tool_timing_unavailable"}]},
+            {"tool_calls": [], "gaps": [{"code": "agent_artifact_unavailable"}]},
+        ],
+        ids=["no-tool-list", "untimed-tool-call", "reported-gap", "unreadable-transcript"],
     )
     def test_unmeasured_tool_time_is_unknown(self, trajectory: dict) -> None:
         row = timed_out_row(calls=[model_call(0, 40)], ng_trajectory=trajectory)
 
-        assert section(row)["time_split"]["tool"] is None
+        split = section(row)["time_split"]
+
+        assert (split["policy_model"], split["tool"], split["untracked"]) == (0.4, None, None)
 
     def test_an_empty_tool_list_is_zero_tool_time(self) -> None:
         assert section(timed_out_row(calls=[model_call(0, 40)], tools=[]))["time_split"]["tool"] == 0.0
@@ -216,6 +224,18 @@ class TestTimeSplit:
         speed = section(row)["time_split"]["policy_output_tokens_per_s"]
 
         assert speed == {"p50": 30.0, "p5": 12.0}
+
+    def test_a_call_with_no_output_counts_at_zero_speed(self) -> None:
+        """It is the slowest serving the rollout saw, not a missing measurement; a call without a count is one."""
+        calls = [
+            model_call(0, 10, tokens_out=0),
+            model_call(10, 20, tokens_out=500),
+            model_call(20, 30, tokens_out=None),
+        ]
+
+        speed = section(timed_out_row(calls=calls, tools=[]))["time_split"]["policy_output_tokens_per_s"]
+
+        assert speed == {"p50": 25.0, "p5": 2.5}
 
     def test_rollouts_without_captured_calls_are_not_split(self) -> None:
         assert section(timed_out_row())["time_split"]["rollouts_with_captures"] == 0
@@ -275,6 +295,8 @@ _MALFORMED = {
     "trajectory_not_an_object": {"ng_trajectory": "x"},
     "capture_calls_not_a_list": {"ng_model_call_capture": {"calls": 7}},
     "capture_not_an_object": {"ng_model_call_capture": [1]},
+    "capture_gap_code_not_a_string": {"ng_model_call_capture": {"calls": [], "gaps": [{"code": []}, {"code": {}}]}},
+    "trajectory_gap_code_not_a_string": {"ng_trajectory": {"tool_calls": [], "gaps": [{"code": []}]}},
     "model_ref_not_an_object": {"ng_model_call_capture": {"calls": [{"model_ref": "policy_model"}]}},
     "timeouts_not_a_list": {"timeouts": 7},
     "termination_not_an_object": {"termination": "timeout"},
@@ -313,6 +335,23 @@ def test_a_malformed_failure_row_still_gets_a_health_report(tmp_path: Path) -> N
     timeouts = health_check_run_dir(tmp_path).summary["run"]["stats"]["timeouts"]
 
     assert (timeouts["rollouts"], timeouts["failed_without_signal"]) == (2, 1)
+
+
+def test_an_earlier_attempt_with_a_malformed_gap_still_gets_a_health_report(tmp_path: Path) -> None:
+    """The section reads every failed attempt in the sidecars, one that a landed row superseded too."""
+    output = tmp_path / "rollouts.jsonl"
+    output.write_text(json.dumps({TASK_INDEX_KEY_NAME: 0, ROLLOUT_INDEX_KEY_NAME: 0, "reward": 1.0}) + "\n")
+    attempt = {
+        TASK_INDEX_KEY_NAME: 0,
+        ROLLOUT_INDEX_KEY_NAME: 0,
+        NG_FAILURE_CLASS_KEY: "agent_run_error",
+        "ng_model_call_capture": {"calls": [], "gaps": [{"code": []}]},
+    }
+    failures_path_for(output).write_text(json.dumps(attempt) + "\n")
+
+    timeouts = health_check_run_dir(tmp_path).summary["run"]["stats"]["timeouts"]
+
+    assert (timeouts["rollouts"], timeouts["timed_out"]) == (1, 0)
 
 
 def exchange(start: float, end: float, *, model: str = "policy_model") -> dict:
@@ -496,6 +535,17 @@ def test_collection_marks_tool_time_unknown_without_a_valid_report(producer: dic
 
     codes = {gap["code"] for gap in result["ng_trajectory"]["gaps"]}
     assert ("tool_timing_unavailable" in codes, section(result)["time_split"]["tool"]) == (tool is None, tool)
+
+
+def test_an_agent_that_could_not_read_its_transcript_leaves_tool_time_unknown() -> None:
+    """Codex reports `agent_artifact_unavailable` without its transcript: that is not an empty tool history."""
+    observations = parse_codex_observations(None, "0-0", returncode=-9, timed_out=True)
+    result = timed_out_row(calls=[model_call(0, 40)], ng_agent_observations=observations.model_dump(mode="json"))
+
+    _attach_trajectory_record({TASK_INDEX_KEY_NAME: 0, ROLLOUT_INDEX_KEY_NAME: 0}, result)
+
+    split = section(result)["time_split"]
+    assert (split["policy_model"], split["tool"], split["untracked"]) == (0.4, None, None)
 
 
 def test_export_keys_are_flat_and_leave_out_unknowns() -> None:

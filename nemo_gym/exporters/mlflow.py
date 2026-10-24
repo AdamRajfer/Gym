@@ -130,7 +130,9 @@ class MLflowExporter(BaseExporter):
         self.config = MLFlowConfig.model_validate(global_config_dict)
         self.client: Optional[MlflowClient] = None
         self.run_id: Optional[str] = None
-        self.reopened: bool = False
+        # The reopened run's status and resume count before this job reopened it, restored by `start_over`.
+        self._prior_status: Optional[str] = None
+        self._prior_resumes: Optional[str] = None
 
     def setup(self) -> None:
         # The MLflow SDK reads the bearer token from the environment, not from client kwargs.
@@ -147,10 +149,12 @@ class MLflowExporter(BaseExporter):
         recorded = self._recorded_run_id()
         if recorded is not None and self._is_active(recorded):
             self.run_id = recorded
+            run = self.client.get_run(self.run_id)
+            self._prior_status = run.info.status
+            self._prior_resumes = run.data.tags.get(self.RESUME_COUNT_TAG)
             self.client.update_run(self.run_id, status="RUNNING")
             # Counts the times this run was reopened, so a reader knows its metrics span several jobs.
-            resumes = int(self.client.get_run(self.run_id).data.tags.get(self.RESUME_COUNT_TAG, 0))
-            self.client.set_tag(self.run_id, self.RESUME_COUNT_TAG, str(resumes + 1))
+            self.client.set_tag(self.run_id, self.RESUME_COUNT_TAG, str(int(self._prior_resumes or 0) + 1))
             self.reopened = True
             return
         self.run_id = self.client.create_run(
@@ -161,6 +165,18 @@ class MLflowExporter(BaseExporter):
     def teardown(self) -> None:
         if self.client is not None and self.run_id is not None:
             self.client.set_terminated(self.run_id, status="FINISHED")
+        self.client = None
+        self.run_id = None
+        self.reopened = False
+
+    def _close_reopened(self) -> None:
+        # Leave the reopened run as the earlier job left it: no rollout or metric of this job reached it.
+        client, run_id = self._active()
+        client.update_run(run_id, status=self._prior_status)
+        if self._prior_resumes is None:
+            client.delete_tag(run_id, self.RESUME_COUNT_TAG)
+        else:
+            client.set_tag(run_id, self.RESUME_COUNT_TAG, self._prior_resumes)
         self.client = None
         self.run_id = None
         self.reopened = False
@@ -244,8 +260,8 @@ class MLflowExporter(BaseExporter):
         client, run_id = self._active()
         if self.reopened:
             # A resumed run is handed every rollout that landed in its output, and `log_table` appends to the table
-            # an earlier job logged: skip the landed rollouts that table holds. A failed attempt in the table does
-            # not count, so a rollout that lands on resume is logged next to it.
+            # an earlier job logged: skip the landed rollouts that table holds. A failed or no-persist attempt in the
+            # table does not count, so a rollout that lands on resume is logged next to it.
             landed = self._landed_rollout_keys(client, run_id)
             rollouts = [rollout for rollout in rollouts if not (_landed(rollout) and _rollout_key(rollout) in landed)]
             if not rollouts:
@@ -274,8 +290,9 @@ def _rollout_key(rollout: dict[str, Any]) -> tuple[Any, Any]:
 
 
 def _landed(rollout: dict[str, Any]) -> bool:
-    """Whether the rollout landed in the output: a failed attempt carries its failure class."""
+    """Whether the rollout landed in the output: a failed attempt carries its failure class, and a no-persist one is
+    written nowhere."""
     # Imported here: rollout collection imports the exporters.
-    from nemo_gym.rollout_collection import NG_FAILURE_CLASS_KEY
+    from nemo_gym.rollout_collection import NG_FAILURE_CLASS_KEY, NG_NO_PERSIST_KEY
 
-    return rollout.get(NG_FAILURE_CLASS_KEY) is None
+    return rollout.get(NG_FAILURE_CLASS_KEY) is None and not rollout.get(NG_NO_PERSIST_KEY)

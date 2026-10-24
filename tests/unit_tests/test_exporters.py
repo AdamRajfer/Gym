@@ -46,7 +46,7 @@ from nemo_gym.exporters import (
 from nemo_gym.exporters.base import BaseExporter
 from nemo_gym.exporters.mlflow import MLflowExporter, _flatten_config, _sanitize_key
 from nemo_gym.exporters.wandb import WandbExporter
-from nemo_gym.rollout_collection import NG_FAILURE_CLASS_KEY
+from nemo_gym.rollout_collection import NG_FAILURE_CLASS_KEY, NG_NO_PERSIST_KEY
 from nemo_gym.secret_utils import recursively_hide_secrets
 
 
@@ -164,7 +164,7 @@ class FakeMlflowClient:
 
     def get_run(self, run_id: str) -> SimpleNamespace:
         return SimpleNamespace(
-            info=SimpleNamespace(lifecycle_stage="active"),
+            info=SimpleNamespace(lifecycle_stage="active", status="FINISHED"),
             data=SimpleNamespace(params=dict(self.params), tags=dict(self.tags)),
         )
 
@@ -375,8 +375,9 @@ class TestWandbExporter:
             {"resume_from_cache": True},
             {"resubmit": True, "resume_from_cache": None},
             {"resubmit": True, "resume_from_cache": False},
+            {"judge_failed_only": True, "append": True, "resume_from_cache": False},
         ],
-        ids=["resume", "resubmit without the cache flag", "resubmit with the cache flag off"],
+        ids=["resume", "resubmit without the cache flag", "resubmit with the cache flag off", "append recovery"],
     )
     def test_a_resumed_run_resumes_the_wandb_run_recorded_next_to_its_output(
         self, monkeypatch: MonkeyPatch, wandb_config: DictConfig, tmp_path, resumes: dict
@@ -397,10 +398,13 @@ class TestWandbExporter:
         assert "id" not in first.kwargs
         assert (second.kwargs["id"], second.kwargs["resume"]) == ("run-1", "allow")
 
+    @pytest.mark.parametrize("fresh", [{}, {"judge_failed_only": True}], ids=["fresh run", "fresh recovery"])
     def test_a_fresh_run_into_the_same_output_starts_a_new_wandb_run(
-        self, monkeypatch: MonkeyPatch, wandb_config: DictConfig, tmp_path
+        self, monkeypatch: MonkeyPatch, wandb_config: DictConfig, tmp_path, fresh: dict
     ) -> None:
         wandb_config["output_jsonl_fpath"] = str(tmp_path / "rollouts.jsonl")
+        for key, value in fresh.items():
+            wandb_config[key] = value
         (tmp_path / "rollouts_wandb_run_id").write_text("old-run")
         init = MagicMock(return_value=MagicMock(id="new-run"))
         monkeypatch.setattr(wandb_module.wandb, "init", init)
@@ -409,6 +413,28 @@ class TestWandbExporter:
         WandbExporter(wandb_config).setup()
 
         assert "id" not in init.call_args.kwargs
+        assert (tmp_path / "rollouts_wandb_run_id").read_text() == "new-run"
+
+    def test_a_resume_that_starts_over_tracks_a_new_wandb_run(
+        self, monkeypatch: MonkeyPatch, wandb_config: DictConfig, tmp_path
+    ) -> None:
+        wandb_config["output_jsonl_fpath"] = str(tmp_path / "rollouts.jsonl")
+        wandb_config["resume_from_cache"] = True
+        (tmp_path / "rollouts_wandb_run_id").write_text("old-run")
+        old, new = MagicMock(id="old-run"), MagicMock(id="new-run")
+        init = MagicMock(side_effect=[old, new])
+        monkeypatch.setattr(wandb_module.wandb, "init", init)
+        monkeypatch.delenv("WANDB_API_KEY", raising=False)
+
+        exporter = WandbExporter(wandb_config)
+        exporter.setup()
+        exporter.start_over()
+
+        reopen, fresh = init.call_args_list
+        assert reopen.kwargs["id"] == "old-run" and "id" not in fresh.kwargs
+        old.finish.assert_called_once_with()
+        new.config.update.assert_called_once()
+        assert (exporter.run, exporter.reopened) == (new, False)
         assert (tmp_path / "rollouts_wandb_run_id").read_text() == "new-run"
 
     def test_logging_before_setup_raises(self, wandb_config: DictConfig) -> None:
@@ -838,6 +864,11 @@ def _failed_attempt(task: int) -> dict[str, Any]:
     return {"_ng_task_index": task, "_ng_rollout_index": 0, NG_FAILURE_CLASS_KEY: "agent_run_error"}
 
 
+def _table(client: Any, run_id: str) -> list[dict[str, Any]]:
+    table = orjson.loads(Path(client.download_artifacts(run_id, "rollouts.json")).read_bytes())
+    return [orjson.loads(row[table["columns"].index("Rollout")]) for row in table["data"]]
+
+
 class TestMLflowReopenAgainstARealStore:
     """The real MLflow client: `log_table` appends to an existing table, and a deleted run cannot be reopened."""
 
@@ -847,8 +878,9 @@ class TestMLflowReopenAgainstARealStore:
             {"resume_from_cache": True},
             {"resubmit": True, "resume_from_cache": None},
             {"resubmit": True, "resume_from_cache": False},
+            {"judge_failed_only": True, "append": True, "resume_from_cache": False},
         ],
-        ids=["resume", "resubmit without the cache flag", "resubmit with the cache flag off"],
+        ids=["resume", "resubmit without the cache flag", "resubmit with the cache flag off", "append recovery"],
     )
     def test_a_resumed_run_logs_each_landed_rollout_once(self, mlflow_store: DictConfig, resumes: dict) -> None:
         first = MLflowExporter(mlflow_store)
@@ -879,13 +911,16 @@ class TestMLflowReopenAgainstARealStore:
             (3, True),
         ]
 
-    def test_a_fresh_run_into_the_same_output_starts_a_new_run(self, mlflow_store: DictConfig) -> None:
+    @pytest.mark.parametrize("fresh", [{}, {"judge_failed_only": True}], ids=["fresh run", "fresh recovery"])
+    def test_a_fresh_run_into_the_same_output_starts_a_new_run(self, mlflow_store: DictConfig, fresh: dict) -> None:
         first = MLflowExporter(mlflow_store)
         first.setup()
         first_run = first.run_id
         first.teardown()
 
         mlflow_store["resume_from_cache"] = False
+        for key, value in fresh.items():
+            mlflow_store[key] = value
         fresh = MLflowExporter(mlflow_store)
         fresh.setup()
         fresh_run = fresh.run_id
@@ -893,6 +928,55 @@ class TestMLflowReopenAgainstARealStore:
 
         assert fresh_run != first_run
         assert Path(mlflow_store["output_jsonl_fpath"]).with_name("rollouts_mlflow_run_id").read_text() == fresh_run
+
+    @pytest.mark.parametrize("failure_class", ["absent", None], ids=["no failure class", "null failure class"])
+    def test_a_no_persist_attempt_does_not_hide_the_rollout_that_lands(
+        self, mlflow_store: DictConfig, failure_class: Optional[str]
+    ) -> None:
+        """Collection writes a no-persist attempt nowhere but still uploads it, so it is no landed rollout."""
+        attempt = {"_ng_task_index": 2, "_ng_rollout_index": 0, NG_NO_PERSIST_KEY: True, "reward": 0.0}
+        if failure_class is None:
+            attempt[NG_FAILURE_CLASS_KEY] = None
+        first = MLflowExporter(mlflow_store)
+        first.setup()
+        first.export_rollouts([_rollout(0), attempt])
+        first.teardown()
+
+        second = MLflowExporter(mlflow_store)
+        second.setup()
+        second.export_rollouts([_rollout(0), _rollout(2)])
+        rows = _table(second.client, second.run_id)
+        second.teardown()
+
+        assert [(row["_ng_task_index"], NG_NO_PERSIST_KEY in row) for row in rows] == [
+            (0, False),
+            (2, True),
+            (2, False),
+        ]
+
+    def test_a_resume_that_starts_over_tracks_a_new_run_and_leaves_the_old_one(self, mlflow_store: DictConfig) -> None:
+        first = MLflowExporter(mlflow_store)
+        first.setup()
+        old_run = first.run_id
+        first.export_rollouts([_rollout(0)])
+        first.teardown()
+
+        # Collection finds nothing to resume and starts the output anew, where task 0 now scores 0.
+        second = MLflowExporter(mlflow_store)
+        second.setup()
+        assert second.run_id == old_run
+        second.start_over()
+        second.export_rollouts([{**_rollout(0), "reward": 0.0}])
+        client, new_run = second.client, second.run_id
+        second.teardown()
+
+        assert new_run != old_run
+        assert Path(mlflow_store["output_jsonl_fpath"]).with_name("rollouts_mlflow_run_id").read_text() == new_run
+        assert [row["reward"] for row in _table(client, new_run)] == [0.0]
+        assert [row["reward"] for row in _table(client, old_run)] == [1.0]
+        old = client.get_run(old_run)
+        assert (old.info.status, old.data.tags.get("gym_resume_count")) == ("FINISHED", None)
+        assert client.get_run(new_run).data.params["output_jsonl_fpath"] == mlflow_store["output_jsonl_fpath"]
 
     def test_a_deleted_run_is_replaced_by_a_new_one(self, mlflow_store: DictConfig) -> None:
         first = MLflowExporter(mlflow_store)

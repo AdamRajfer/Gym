@@ -91,13 +91,21 @@ class BaseExporter(ABC):
             self._guard("a new run", self._start_over)
 
     def _start_over(self) -> None:
-        self._close_reopened()
+        try:
+            self._close_reopened()
+        except Exception as e:
+            # Leaving the old run as it was is best effort; the output gets a run of its own either way.
+            logger.warning(
+                f"Exporter {self.name} could not restore the reopened run; starting a new one anyway: {e}",
+                exc_info=True,
+            )
         self._starting_over = True
         self.setup()
         self.export_config()
 
     def _close_reopened(self) -> None:
-        """Close the reopened run. A backend that marks a run when it reopens it undoes that mark here."""
+        """Close the reopened run. A backend that marks a run when it reopens it undoes that mark here, and lets go
+        of the run first, so that nothing more reaches it even when closing fails."""
         self.teardown()
 
     def _guard(self, what: str, fn, *args) -> None:

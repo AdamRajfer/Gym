@@ -66,6 +66,12 @@ class WandbExporter(BaseExporter):
             self.run.finish()
             self.run = None
 
+    def _close_reopened(self) -> None:
+        # Let go of the reopened run before finishing it, so the new output never logs to it, even when that fails.
+        run, self.run, self.reopened = self.run, None, False
+        if run is not None:
+            run.finish()
+
     def _active_run(self) -> Run:
         if self.run is None:
             raise RuntimeError("W&B run is not open; call setup() before logging.")

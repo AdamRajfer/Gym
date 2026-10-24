@@ -170,16 +170,15 @@ class MLflowExporter(BaseExporter):
         self.reopened = False
 
     def _close_reopened(self) -> None:
-        # Leave the reopened run as the earlier job left it: no rollout or metric of this job reached it.
+        # Leave the reopened run as the earlier job left it: no rollout or metric of this job reached it. Let go of
+        # it first, so the new output never logs to it, even when this fails.
         client, run_id = self._active()
+        self.client, self.run_id, self.reopened = None, None, False
         client.update_run(run_id, status=self._prior_status)
         if self._prior_resumes is None:
             client.delete_tag(run_id, self.RESUME_COUNT_TAG)
         else:
             client.set_tag(run_id, self.RESUME_COUNT_TAG, self._prior_resumes)
-        self.client = None
-        self.run_id = None
-        self.reopened = False
 
     def _is_active(self, run_id: str) -> bool:
         """Whether the recorded run still exists and is not deleted; a new run takes the place of one that is not."""

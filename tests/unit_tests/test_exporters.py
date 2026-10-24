@@ -437,6 +437,26 @@ class TestWandbExporter:
         assert (exporter.run, exporter.reopened) == (new, False)
         assert (tmp_path / "rollouts_wandb_run_id").read_text() == "new-run"
 
+    def test_a_resume_that_starts_over_opens_a_new_wandb_run_when_finishing_the_old_one_fails(
+        self, monkeypatch: MonkeyPatch, wandb_config: DictConfig, tmp_path, caplog
+    ) -> None:
+        wandb_config["output_jsonl_fpath"] = str(tmp_path / "rollouts.jsonl")
+        wandb_config["resume_from_cache"] = True
+        (tmp_path / "rollouts_wandb_run_id").write_text("old-run")
+        old, new = MagicMock(id="old-run"), MagicMock(id="new-run")
+        old.finish.side_effect = RuntimeError("service unavailable")
+        monkeypatch.setattr(wandb_module.wandb, "init", MagicMock(side_effect=[old, new]))
+        monkeypatch.delenv("WANDB_API_KEY", raising=False)
+
+        exporter = WandbExporter(wandb_config)
+        exporter.setup()
+        exporter.start_over()
+
+        assert "could not restore the reopened run" in caplog.text
+        assert (exporter.run, exporter.reopened) == (new, False)
+        new.config.update.assert_called_once()
+        assert (tmp_path / "rollouts_wandb_run_id").read_text() == "new-run"
+
     def test_logging_before_setup_raises(self, wandb_config: DictConfig) -> None:
         with pytest.raises(RuntimeError, match="not open"):
             WandbExporter(wandb_config)._log_metrics({"reward": 1.0})
@@ -977,6 +997,44 @@ class TestMLflowReopenAgainstARealStore:
         old = client.get_run(old_run)
         assert (old.info.status, old.data.tags.get("gym_resume_count")) == ("FINISHED", None)
         assert client.get_run(new_run).data.params["output_jsonl_fpath"] == mlflow_store["output_jsonl_fpath"]
+
+    @pytest.mark.parametrize("failing", ["delete_tag", "set_tag"])
+    def test_a_resume_that_starts_over_leaves_the_old_run_when_restoring_it_fails(
+        self, mlflow_store: DictConfig, monkeypatch: MonkeyPatch, caplog, failing: str
+    ) -> None:
+        """Restoring the old run is best effort: the fresh rollouts and metrics reach only the new run."""
+        first = MLflowExporter(mlflow_store)
+        first.setup()
+        old_run = first.run_id
+        first.export_rollouts([_rollout(0)])
+        first.teardown()
+        if failing == "set_tag":
+            # A run reopened before has a resume count, which starting over sets back with `set_tag`.
+            reopened = MLflowExporter(mlflow_store)
+            reopened.setup()
+            reopened.teardown()
+
+        second = MLflowExporter(mlflow_store)
+        second.setup()
+        monkeypatch.setattr(second.client, failing, MagicMock(side_effect=MlflowException("tracking server refused")))
+        second.start_over()
+        second.export_rollouts([{**_rollout(0), "reward": 0.0}])
+        second.export_metrics({"reward": 0.0})
+        client, new_run = second.client, second.run_id
+        second.teardown()
+
+        assert new_run != old_run
+        assert "could not restore the reopened run" in caplog.text
+        assert Path(mlflow_store["output_jsonl_fpath"]).with_name("rollouts_mlflow_run_id").read_text() == new_run
+        assert [row["reward"] for row in _table(client, new_run)] == [0.0]
+        assert [row["reward"] for row in _table(client, old_run)] == [1.0]
+        assert (
+            "reward" in client.get_run(new_run).data.metrics,
+            "reward" in client.get_run(old_run).data.metrics,
+        ) == (
+            True,
+            False,
+        )
 
     def test_a_deleted_run_is_replaced_by_a_new_one(self, mlflow_store: DictConfig) -> None:
         first = MLflowExporter(mlflow_store)

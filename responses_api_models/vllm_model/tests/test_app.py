@@ -5053,6 +5053,16 @@ _WINDOW_32768 = json.dumps(
             '{"message": "max_completion_tokens=40000 cannot be greater than max_model_len=32768."}',
             ("invalid_output_token_parameter",) * 2,
         ),
+        (
+            {"max_tokens": 40000},
+            json.dumps(
+                {
+                    "message": "max_tokens=40000 cannot be greater than max_model_len=max_total_tokens=32768. "
+                    "Please request fewer output tokens. (parameter=max_tokens, value=40000)"
+                }
+            ),
+            ("invalid_output_token_parameter",) * 2,
+        ),
         ({"max_tokens": 32768}, _WINDOW_32768, ("context_length_exceeded",) * 2),
         ({}, _WINDOW_32768, ("context_length_exceeded",) * 2),
         (
@@ -5066,6 +5076,7 @@ _WINDOW_32768 = json.dumps(
         "completions-budget-over-window",
         "alias-only-over-window",
         "max-model-len",
+        "vllm-0.27-max-total-tokens",
         "budget-equal-to-window",
         "no-budget",
         "no-window-named",

@@ -135,8 +135,11 @@ def _is_context_length_error(error: ClientResponseError) -> bool:
     return _names_context_window(message) or any(marker in message for marker in _MAX_TOKENS_PARAMETER_MARKERS)
 
 
-# How an engine names its context window: "maximum context length is 32768", "max_model_len=32768".
-_CONTEXT_WINDOW_SIZE = re.compile(r"(?:maximum context length|maximum model length|max_model_len)\D{0,5}(\d+)")
+# How an engine names its context window: "maximum context length is 32768", "max_model_len=32768", and vLLM 0.27's
+# "max_model_len=max_total_tokens=32768".
+_CONTEXT_WINDOW_SIZE = re.compile(
+    r"(?:maximum context length|maximum model length|max_model_len|max_total_tokens)\D{0,5}(\d+)"
+)
 
 
 def _length_refusal_category(

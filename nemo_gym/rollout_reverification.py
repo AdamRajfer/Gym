@@ -536,6 +536,9 @@ def _seed_output_with_successes(successes_fpath: Path, output_fpath: Path) -> se
                 if key in present:
                     continue
                 present.add(key)
+            if seeded == 0:
+                # Seeded rows are not the merged ones an aggregation's shard list names.
+                aggregation_sources_path_for(output_fpath).unlink(missing_ok=True)
             dst.write(line if line.endswith(b"\n") else line + b"\n")
             seeded += 1
     print(f"Recovery mode: seeded {seeded} successful rollout(s) into {output_fpath}")
@@ -946,8 +949,8 @@ def _prepare_output_fpaths(
                     f"Output file already exists: '{fpath}'. Pass --overwrite to delete it and start fresh, "
                     "or --resume to continue from it."
                 )
-    # The rows this run writes are not the merged ones an aggregation's shard list names.
-    aggregation_sources_path_for(output_fpath).unlink(missing_ok=True)
+        # Nor the shard list of the merged rows it deleted. A run that appends drops it when it starts writing.
+        aggregation_sources_path_for(output_fpath).unlink(missing_ok=True)
     return OutputPaths(output=output_fpath, failures=failures_fpath)
 
 
@@ -1036,6 +1039,9 @@ class RolloutReverificationHelper(BaseModel):
         pcts_to_print = [20, 40, 60, 80, 90, 95, 98, 99, 100]
         run_labels = rollout_run_labels(payloads_to_reverify)
         counts_left = Counter(run_labels.get(rollout_run_key(r)) for r in payloads_to_reverify)
+        # The rows this run adds are not the merged ones an aggregation's shard list names. The list goes here, where
+        # the run starts writing, so a run that stops before then leaves it as it was.
+        aggregation_sources_path_for(output_fpaths.output).unlink(missing_ok=True)
         results_file = output_fpaths.output.open("ab")
         failures_file = output_fpaths.failures.open("ab")
         failure_counts: Counter = Counter()

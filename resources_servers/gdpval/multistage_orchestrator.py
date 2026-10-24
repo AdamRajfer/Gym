@@ -2274,6 +2274,8 @@ def route_stage_rows(output_fpath: str | Path, rows: Sequence[Mapping[str, Any]]
     output_fpath = Path(output_fpath)
     output_fpath.parent.mkdir(parents=True, exist_ok=True)
     failures_fpath = failures_path_for(output_fpath)
+    # The rows this run writes are not the merged ones an aggregation's shard list names.
+    aggregation_sources_path_for(output_fpath).unlink(missing_ok=True)
     with output_fpath.open("ab") as main_handle, failures_fpath.open("ab") as fail_handle:
         for row in rows:
             if row.get(NG_NO_PERSIST_KEY):
@@ -2741,6 +2743,7 @@ def _prepare_resume(
             resubmit_offset_path_for(output_fpath),
             journal_fpath,
             aggregate_metrics_path_for(output_fpath),
+            aggregation_sources_path_for(output_fpath),
         ):
             if stale.exists():
                 quarantined = stale.with_name(stale.name + stale_suffix)
@@ -2750,8 +2753,6 @@ def _prepare_resume(
         print("[multistage-elo] resuming multi-stage run from cache (fingerprint match)", file=sys.stderr, flush=True)
         if getattr(rollout_collection_config, "resubmit", False):
             record_resubmit_offset(output_fpath)
-    # The rows this run writes are not the merged ones an aggregation's shard list names.
-    aggregation_sources_path_for(output_fpath).unlink(missing_ok=True)
     return build_file_resume(output_fpath, journal_fpath, fingerprint)
 
 

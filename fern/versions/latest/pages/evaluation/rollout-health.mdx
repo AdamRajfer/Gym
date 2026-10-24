@@ -52,7 +52,7 @@ standalone command are always written in the run directory.
 
 When `gym eval aggregate` merges shards into `rollouts.jsonl`, it lists them in `rollouts_sources.json`, and the check
 reads those shards with the failure sidecars and materialized inputs beside them, as the aggregation did: the merged
-file has none of its own. A single run merged onto itself needs no list. The check fails if a shard is gone, or if a
+file has none of its own. A single run merged onto itself needs no list, and drops one an earlier aggregation into it left. A run that writes to the merged file, such as a resumed `gym eval run`, drops the list once it starts writing. The check fails if a shard is gone, or if a
 shard or the merged file changed since the aggregation; rerun `gym eval aggregate` then. A `--rollouts-file` path is
 checked alone, without the list, so a merged file with another name is checked without its shards' failures and
 inventories: recheck its shards one by one instead.

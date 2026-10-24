@@ -3427,6 +3427,10 @@ class TestPrepareResume:
         aggregation_sources_path_for(out).write_text("{}")
 
         _prepare_resume(self._cfg(resume_from_cache), out, journal, fp)
+        # A fresh run sets the list aside with the rows it names; a resumed one keeps it until it writes.
+        assert aggregation_sources_path_for(out).exists() is resume_from_cache
+        row = {"stage_index": 0, TASK_INDEX_KEY_NAME: 0, ROLLOUT_INDEX_KEY_NAME: 0, "task_id": "t0"}
+        route_stage_rows(out, [{**row, NG_ENVIRONMENT_SERVER_KEY: "gdpval_environment_server"}])
 
         assert not aggregation_sources_path_for(out).exists()
 

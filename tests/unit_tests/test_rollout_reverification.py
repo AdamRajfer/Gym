@@ -989,6 +989,22 @@ class TestSeedOutputWithSuccesses:
         seeded = [orjson.loads(line) for line in out.read_bytes().splitlines() if line.strip()]
         assert seeded == rows
 
+    @pytest.mark.parametrize("seeds", [True, False], ids=["seeds a row", "seeds nothing"])
+    def test_drops_the_shard_list_only_when_it_seeds(self, tmp_path: Path, seeds: bool) -> None:
+        """Seeded rows are not the merged ones an aggregation listed shards for; with none seeded, they still are."""
+        out = tmp_path / "output.jsonl"
+        out.write_bytes(orjson.dumps({TASK_INDEX_KEY_NAME: 0, ROLLOUT_INDEX_KEY_NAME: 0}) + b"\n")
+        src = tmp_path / "successes.jsonl"
+        tasks = (0, 1) if seeds else (0,)
+        src.write_bytes(
+            b"".join(orjson.dumps({TASK_INDEX_KEY_NAME: t, ROLLOUT_INDEX_KEY_NAME: 0}) + b"\n" for t in tasks)
+        )
+        aggregation_sources_path_for(out).write_text("{}")
+
+        _seed_output_with_successes(src, out)
+
+        assert aggregation_sources_path_for(out).exists() is not seeds
+
     def test_empty_source_creates_empty_output_and_returns_empty_set(self, tmp_path: Path) -> None:
         src = tmp_path / "successes.jsonl"
         src.write_bytes(b"")
@@ -1752,8 +1768,8 @@ class TestPrepareOutputFpaths:
         assert not paths.output.exists()
 
     @pytest.mark.parametrize("mode", ["overwrite", "append", "resume_from_cache"])
-    def test_drops_the_shard_list_of_an_output_it_takes_over(self, tmp_path: Path, mode: str) -> None:
-        """`gym eval aggregate` listed the shards of the rows this run replaces or appends to."""
+    def test_drops_the_shard_list_only_with_the_output_it_deletes(self, tmp_path: Path, mode: str) -> None:
+        """A run that appends drops it when it starts writing, so one that stops before then keeps it."""
         out = tmp_path / "out.jsonl"
         out.write_text("merged rows\n")
         aggregation_sources_path_for(out).write_text("{}")
@@ -1766,7 +1782,7 @@ class TestPrepareOutputFpaths:
             append=mode == "append",
         )
 
-        assert not aggregation_sources_path_for(out).exists()
+        assert aggregation_sources_path_for(out).exists() is (mode != "overwrite")
 
     def test_keeps_existing_files_when_resuming_regardless_of_overwrite(self, tmp_path: Path) -> None:
         out = tmp_path / "out.jsonl"
@@ -3201,6 +3217,33 @@ class TestRunFromConfigJudgeFailedOnly:
         assert [r[TASK_INDEX_KEY_NAME] for r in rows].count(0) == 1
         task0 = next(r for r in rows if r[TASK_INDEX_KEY_NAME] == 0)
         assert task0["reward"] == 1.0  # the seeded success, not a fresh re-verification
+
+    @pytest.mark.parametrize("inputs", [True, False], ids=["writes", "stops before writing"])
+    async def test_drops_the_shard_list_of_its_output_once_it_writes(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, inputs: bool
+    ) -> None:
+        """A resume that fails before writing leaves the merged rows, and the shards listed for them, as they were."""
+        out = tmp_path / "recovered.jsonl"
+        self._write(out, [self._success(0)])
+        self._setup_fixture(
+            tmp_path,
+            materialized=[self._mat(t) for t in range(2)],
+            successes=[self._success(0)],
+            failures=[self._failure(1)],
+        )
+        if not inputs:
+            (tmp_path / "inputs.jsonl").unlink()
+        aggregation_sources_path_for(out).write_text("{}")
+        self._patch(monkeypatch, [])
+
+        run = RolloutReverificationHelper().run_from_config(self._make_config(tmp_path, resume_from_cache=True))
+        if inputs:
+            await run
+        else:
+            with pytest.raises(FileNotFoundError):
+                await run
+
+        assert aggregation_sources_path_for(out).exists() is not inputs
 
     async def test_resume_does_not_reseed_and_reverifies_only_still_failing(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path

@@ -3197,8 +3197,6 @@ class RolloutCollectionHelper(BaseModel):
         persisted_success_keys.clear()
         if config.resume_from_cache and config.materialized_jsonl_fpath.exists() and output_fpath.exists():
             should_clear_outputs = False
-            # The rows this run adds are not the merged ones an aggregation's shard list names.
-            aggregation_sources_path_for(output_fpath).unlink(missing_ok=True)
             _drop_truncated_tail(output_fpath)
             if failures_fpath.exists():
                 _drop_truncated_tail(failures_fpath)
@@ -3448,6 +3446,9 @@ class RolloutCollectionHelper(BaseModel):
                 token_source = TokenCaptureStore(token_capture_dirs[0])
                 owned_token_source = token_source
 
+            # The rows this run adds are not the merged ones an aggregation's shard list names. The list goes here, where
+            # the run starts writing, so a run that stops before then leaves it as it was.
+            aggregation_sources_path_for(output_fpath).unlink(missing_ok=True)
             results_file = resource_stack.enter_context(output_fpath.open("ab"))
             failures_file = resource_stack.enter_context(failures_fpath.open("ab"))
             if not config.retain_results_in_memory and config.upload_rollouts and exporters_enabled:
@@ -4821,6 +4822,9 @@ class RolloutAggregationHelper(BaseModel):
                         output_fpath, [(Path(path), *shard_digests[path]) for path in input_paths], merging_fpath
                     )
                 os.replace(merging_fpath, merged_fpath)
+                if in_place:
+                    # A run merged onto itself is checked alone, so a list an earlier aggregation into it left goes.
+                    aggregation_sources_path_for(output_fpath).unlink(missing_ok=True)
             finally:
                 merging_fpath.unlink(missing_ok=True)
 

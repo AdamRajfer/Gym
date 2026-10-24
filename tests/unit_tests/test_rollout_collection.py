@@ -8570,9 +8570,18 @@ class TestRolloutAggregationHelper:
 
         assert not aggregation_sources_path_for(merged_dir / "rollouts.jsonl").exists()
 
-    @pytest.mark.parametrize("resume", [False, True], ids=["fresh run", "resumed run"])
-    async def test_a_run_that_takes_over_a_merged_output_drops_its_shard_list(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, empty_global_config: MagicMock, resume: bool
+    @pytest.mark.parametrize(
+        "resume,stops",
+        [(False, False), (True, False), (True, True)],
+        ids=["fresh run", "resumed run", "resumed run that stops before writing"],
+    )
+    async def test_a_run_that_writes_to_a_merged_output_drops_its_shard_list(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        empty_global_config: MagicMock,
+        resume: bool,
+        stops: bool,
     ) -> None:
         """The run's rows, sidecar and inventory are the ones beside the output now, not the listed shards."""
 
@@ -8599,6 +8608,18 @@ class TestRolloutAggregationHelper:
         shard = tmp_path / "shard" / "rollouts.jsonl"
         self._write_rows(shard, orjson.loads(output.read_bytes().splitlines()[0]))
         await self._merge(monkeypatch, output.parent, shard, disable_health_check=True)
+
+        listed = aggregation_sources_path_for(output).read_bytes()
+        if stops:
+            # The run fails its validation before it writes: the merged rows, and the shards listed for them, stay.
+            with pytest.raises(ConfigPathNotFoundError):
+                await Helper().run_from_config(
+                    RolloutCollectionConfig(
+                        **config, resume_from_cache=True, batch_manifest_fpath=str(tmp_path / "missing.json")
+                    )
+                )
+            assert aggregation_sources_path_for(output).read_bytes() == listed
+            return
 
         await Helper().run_from_config(RolloutCollectionConfig(**config, resume_from_cache=resume))
 
@@ -8651,10 +8672,13 @@ class TestRolloutAggregationHelper:
         self._write_rows(materialized_path_for(run_a), self._rollout(0, "agent_a"), self._rollout(1, "agent_a"))
         self._write_rows(run_a, self._rollout(1, "agent_a", reward=1.0), self._rollout(0, "agent_a", reward=1.0))
         unsorted = run_a.read_bytes()
+        # A list an earlier aggregation into this directory left.
+        aggregation_sources_path_for(run_a).write_text("{}")
 
         aggregated = orjson.loads((await self._merge(monkeypatch, run_a.parent, run_a)).read_bytes())["run"]
 
         assert run_a.read_bytes() != unsorted
+        assert not aggregation_sources_path_for(run_a).exists()
         assert self._accounting(health_check_run_dir(run_a.parent).summary["run"]) == self._accounting(aggregated)
 
     async def test_a_linked_output_is_written_through(

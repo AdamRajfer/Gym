@@ -189,7 +189,13 @@ Per-session OpenClaw state/config, prompt, transcript, and supervisor output are
 or creating bootstrap files in the task repository. Task HOME, XDG directories, PATH and
 dependencies are preserved for tools and verification.
 The sandbox adapter enables `read`, `write`, `edit`, `exec`, and `process`; subagent/channel/plugin
-execution and required external HTTP/MCP tools are unsupported. OpenClaw's internal `gateway`
+execution and required direct-HTTP tool grants are unsupported. MCP tool grants become streamable-HTTP
+`mcp.servers` entries, and the model sees their tools as `<grant>__<tool>`; `mcp_tool_timeout_seconds` sets
+their per-request timeout. Before the agent runs, the adapter connects to each grant with
+`openclaw mcp probe <grant> --json`: a required grant that does not connect fails the activation, and an optional
+one is left out and reported as an `mcp_server_skipped` gap. The pinned `probe --json` exits 0 when a connection
+fails, so a grant counts as connected only when the JSON lists it under `servers` with no diagnostic for it.
+OpenClaw's internal `gateway`
 exec host refers to the embedded CLI process inside the borrowed sandbox.
 
 Sandbox request support is deliberately explicit:

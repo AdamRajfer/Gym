@@ -10,12 +10,19 @@ from omegaconf import OmegaConf
 from nemo_gym.benchmarks import BenchmarkConfig
 from nemo_gym.global_config import GlobalConfigDictParser, GlobalConfigDictParserConfig
 from responses_api_agents.codex_agent.app import CodexAgentConfig
+from responses_api_agents.openclaw_agent.app import OpenClawAgentConfig
+from responses_api_agents.opencode_agent.app import OpenCodeAgentConfig
 from responses_api_agents.pi_agent.app import PiAgentConfig
 
 
 _BENCHMARK_DIR = Path(__file__).resolve().parents[3] / "benchmarks" / "gdpval"
 # Each harness config here (<harness>.yaml), with its agent's config class.
-_HARNESS_CONFIGS = {"pi": PiAgentConfig, "codex": CodexAgentConfig}
+_HARNESS_CONFIGS = {
+    "pi": PiAgentConfig,
+    "codex": CodexAgentConfig,
+    "opencode": OpenCodeAgentConfig,
+    "openclaw": OpenClawAgentConfig,
+}
 
 
 @pytest.fixture(autouse=True)

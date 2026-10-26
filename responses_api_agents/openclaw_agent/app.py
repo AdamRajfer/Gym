@@ -67,10 +67,11 @@ from nemo_gym.rollout_observability import (
     AgentObservationBundle,
     ObservationGap,
 )
-from nemo_gym.sandbox import AsyncSandbox, SandboxSpec, create_provider
+from nemo_gym.sandbox import AsyncSandbox, SandboxExecResult, SandboxSpec, create_provider
 from nemo_gym.sandbox.access import DirectSandboxConnection
 from nemo_gym.sandbox.config import resolve_provider_config
 from nemo_gym.server_utils import get_global_config_dict, get_response_json, raise_for_status
+from nemo_gym.tool_access import MCPToolAccess
 from responses_api_agents.openclaw_agent.observability import (
     OPENCLAW_OBSERVATION_SOURCE,
     OpenClawSessionTree,
@@ -416,6 +417,34 @@ fi
     return bootstrap + f"{check_paths} && mkdir -p {shlex.quote(directory + '/home/.openclaw')}"
 
 
+# One ``openclaw mcp probe`` per MCP grant: CLI startup, connection and tool listing.
+_MCP_PROBE_TIMEOUT_SECONDS = 120
+
+
+def _mcp_probe_problem(name: str, result: SandboxExecResult) -> str | None:
+    """Why ``openclaw mcp probe <name> --json`` did not prove a connection, or None if it did."""
+    output = (result.stdout or "") + (result.stderr or "")
+    if result.return_code != 0 or result.error_type is not None:
+        return f"{result.error_type or f'exit {result.return_code}'}: {output.strip()[-2000:]}"
+    start = (result.stdout or "").find("{")
+    try:
+        report, _ = json.JSONDecoder().raw_decode((result.stdout or "")[start:]) if start >= 0 else (None, 0)
+    except ValueError:
+        report = None
+    if not isinstance(report, dict) or not isinstance(report.get("servers"), dict):
+        return f"unreadable probe output: {output.strip()[-2000:]}"
+    diagnostics = [
+        str(item.get("message"))
+        for item in report.get("diagnostics") or []
+        if isinstance(item, dict) and item.get("serverName") == name
+    ]
+    if diagnostics:
+        return "; ".join(diagnostics)[-2000:]
+    if name not in report["servers"]:
+        return "not connected"
+    return None
+
+
 class OpenClawAgentConfig(BaseResponsesAPIAgentConfig):
     resources_server: Optional[ResourcesServerRef] = None
     model_server: Optional[ModelServerRef] = None
@@ -442,6 +471,8 @@ class OpenClawAgentConfig(BaseResponsesAPIAgentConfig):
     sandbox_config: dict[str, Any] = Field(default_factory=dict)
     sandbox_install_timeout_seconds: float = Field(default=600, gt=0, allow_inf_nan=False)
     session_close_timeout_seconds: float = Field(default=60, gt=0, allow_inf_nan=False)
+    # Per-request timeout of a sandbox session's MCP tool grants (OpenClaw's mcp.servers.<name>.timeout).
+    mcp_tool_timeout_seconds: float | None = Field(default=None, gt=0, allow_inf_nan=False)
 
     @property
     def command_parts(self) -> list[str]:
@@ -494,9 +525,16 @@ class OpenClawAgent(SimpleResponsesAPIAgent):
             provider_ref = body.sandbox_access.connection.provider_config_ref
         if not isinstance(workdir, str) or not workdir.startswith("/") or workdir in ("/", "/tmp"):
             raise HTTPException(422, "OpenClaw workdir must be absolute and separate from /tmp runtime storage")
-        if any(access.required for access in self.effective_tool_accesses(body)):
+        unsupported = [
+            access.name
+            for access in self.effective_tool_accesses(body)
+            if access.required and not isinstance(access, MCPToolAccess)
+        ]
+        if unsupported:
             raise HTTPException(
-                422, "OpenClaw sandbox execution supports its own sandbox tools, not required HTTP/MCP tools"
+                422,
+                "OpenClaw in the task sandbox supports only MCP tool grants; required grants it cannot use: "
+                + ", ".join(sorted(unsupported)),
             )
         if self.config.model_server is None:
             raise HTTPException(422, "OpenClaw sandbox execution requires a sandbox-reachable Gym model_server")
@@ -688,6 +726,7 @@ class OpenClawAgent(SimpleResponsesAPIAgent):
                 "plugins": {"enabled": False},
             }
         )
+        mcp_servers, required_grants = self._granted_mcp_servers(state.request)
         timeout = resolve_agent_timeout(body.metadata, ceiling=self.config.timeout)
         command = [
             f"{state.runtime}/node/bin/node",
@@ -725,6 +764,15 @@ class OpenClawAgent(SimpleResponsesAPIAgent):
                 "OPENCLAW_NO_RESPAWN": "1",
             },
         }
+        mcp_gaps = []
+        if mcp_servers:
+            mcp_gaps = await self._probe_mcp_grants(
+                state, payload, mcp_servers, required_grants, timeout=min(timeout, _MCP_PROBE_TIMEOUT_SECONDS)
+            )
+            if mcp_servers:
+                session_config["mcp"] = {"servers": mcp_servers}
+                # The model sees each grant's tools as <grant>__<tool>; the allow list must name them.
+                session_config["tools"]["allow"].append("bundle-mcp")
         try:
             async with self.sem:
                 await state.execute(payload, timeout=timeout, close_timeout=self.config.session_close_timeout_seconds)
@@ -733,16 +781,74 @@ class OpenClawAgent(SimpleResponsesAPIAgent):
             # for the subsequent close. Never convert uncertain cleanup to success.
             try:
                 await self._collect_sandbox_response(state, body, prompt=prompt, system=system)
+                state.observations.gaps.extend(mcp_gaps)
             except Exception:
                 LOG.exception("Could not salvage interrupted OpenClaw observations")
             raise
         response = await self._collect_sandbox_response(state, body, prompt=prompt, system=system)
+        if state.observations is not None:
+            state.observations.gaps.extend(mcp_gaps)
         if response.error is not None:
             # Preserve the transcript in session observations, but let the environment
             # classify runtime/provider failures before it invokes the verifier.
             raise HTTPException(502, response.error.message)
         response.metadata = {**(response.metadata or {}), AGENT_TIMEOUT_METADATA_KEY: str(timeout)}
         return response
+
+    def _granted_mcp_servers(self, request: AgentSeedSessionRequest) -> tuple[dict[str, Any], set[str]]:
+        """OpenClaw ``mcp.servers`` entries for a session's MCP tool grants, and the required grant names."""
+        servers = {}
+        required = set()
+        for access in self.effective_tool_accesses(request):
+            if not isinstance(access, MCPToolAccess):
+                continue
+            entry: dict[str, Any] = {"url": str(access.connection.url), "transport": "streamable-http"}
+            if access.connection.headers:
+                entry["headers"] = dict(access.connection.headers)
+            if self.config.mcp_tool_timeout_seconds is not None:
+                entry["timeout"] = self.config.mcp_tool_timeout_seconds
+            servers[access.name] = entry
+            if access.required:
+                required.add(access.name)
+        return servers, required
+
+    async def _probe_mcp_grants(
+        self,
+        state: OpenClawSandboxSession,
+        payload: dict[str, Any],
+        servers: dict[str, Any],
+        required: set[str],
+        *,
+        timeout: float,
+    ) -> list[ObservationGap]:
+        """Connect to each grant with ``openclaw mcp probe <name> --json`` before the agent runs.
+
+        OpenClaw leaves a server that fails to connect out of the tool list and keeps running. A required grant that
+        does not connect fails the activation before any model call; an optional one is removed from ``servers`` and
+        reported as a gap. ``probe --json`` exits 0 when the connection fails (2026.6.11 prints the catalog without
+        the check ``doctor --probe`` makes), so a grant counts as connected only when the JSON lists it under
+        ``servers`` with no diagnostic for it.
+        """
+        await state.upload_json("home/.openclaw/openclaw.json", {"mcp": {"servers": servers}})
+        gaps = []
+        missing = []
+        for name in list(servers):
+            command = shlex.join([*payload["command"][:2], "mcp", "probe", name, "--json"])
+            result = await state.session.sandbox.exec(
+                command, cwd=state.session.workdir, env=payload["env"], timeout_s=timeout
+            )
+            problem = _mcp_probe_problem(name, result)
+            if problem is None:
+                continue
+            detail = f"{name}: {problem}"
+            if name in required:
+                missing.append(detail)
+            else:
+                del servers[name]
+                gaps.append(ObservationGap(code="mcp_server_skipped", detail=detail))
+        if missing:
+            raise HTTPException(502, "Required Gym MCP tools could not be initialized: " + "; ".join(missing))
+        return gaps
 
     async def _collect_sandbox_response(
         self,

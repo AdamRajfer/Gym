@@ -80,6 +80,7 @@ from nemo_gym.server_utils import (
     is_nemo_gym_fastapi_entrypoint,
     raise_for_status,
 )
+from nemo_gym.tool_access import MCPToolAccess
 from responses_api_agents.opencode_agent.artifacts import (
     _parse_opencode_session,
     parse_opencode_export,
@@ -208,6 +209,8 @@ class OpenCodeAgentConfig(BaseResponsesAPIAgentConfig):
     sandbox_config: dict[str, Any] = Field(default_factory=dict)
     sandbox_install_timeout_seconds: float = Field(default=600, gt=0, allow_inf_nan=False)
     session_close_timeout_seconds: float = Field(default=60, gt=0, allow_inf_nan=False)
+    # Connection and per-call timeout of a sandbox session's MCP tool grants; OpenCode's default is 30 s.
+    mcp_tool_timeout_seconds: float | None = Field(default=None, gt=0, allow_inf_nan=False)
 
     @property
     def command_parts(self) -> list[str]:
@@ -685,9 +688,16 @@ class OpenCodeAgent(SimpleResponsesAPIAgent):
             raise HTTPException(
                 422, "OpenCode sandbox workdir must be absolute and separate from adapter runtime/session storage"
             )
-        if any(access.required for access in self.effective_tool_accesses(body)):
+        unsupported = [
+            access.name
+            for access in self.effective_tool_accesses(body)
+            if access.required and not isinstance(access, MCPToolAccess)
+        ]
+        if unsupported:
             raise HTTPException(
-                422, "OpenCode sandbox execution uses its own tools; required HTTP/MCP tools are unsupported"
+                422,
+                "OpenCode in the task sandbox supports only MCP tool grants; required grants it cannot use: "
+                + ", ".join(sorted(unsupported)),
             )
         if not isinstance(self.config.opencode_version, str) or not re.fullmatch(
             r"\d+\.\d+\.\d+", self.config.opencode_version
@@ -781,6 +791,72 @@ class OpenCodeAgent(SimpleResponsesAPIAgent):
                 raise AgentSessionSetupError(state, error=error) from error
             raise
         return state
+
+    def _granted_mcp_servers(self, request: AgentSeedSessionRequest) -> tuple[dict[str, Any], dict[str, list[str]]]:
+        """OpenCode ``mcp`` entries for a session's MCP tool grants, and the grant names by requirement.
+
+        The model sees each grant's tools as ``<grant>_<tool>``. OpenCode connects when the run starts and leaves a
+        server that fails to connect out of the tool list, so ``required_mcp.mjs`` checks the grants before the first
+        model call and ``_check_mcp_grants`` reads the result.
+        """
+        servers = {}
+        grants: dict[str, list[str]] = {"required": [], "optional": []}
+        for access in self.effective_tool_accesses(request):
+            if not isinstance(access, MCPToolAccess):
+                continue
+            entry: dict[str, Any] = {
+                "type": "remote",
+                "url": str(access.connection.url),
+                "enabled": True,
+                # The grant's headers authenticate the session; a headless run must not start an OAuth flow.
+                "oauth": False,
+            }
+            if access.connection.headers:
+                entry["headers"] = dict(access.connection.headers)
+            if self.config.mcp_tool_timeout_seconds is not None:
+                entry["timeout"] = round(self.config.mcp_tool_timeout_seconds * 1000)
+            servers[access.name] = entry
+            grants["required" if access.required else "optional"].append(access.name)
+        return servers, grants
+
+    @staticmethod
+    async def _check_mcp_grants(
+        state: OpenCodeSandboxSession, grants: dict[str, list[str]], observations: AgentObservationBundle
+    ) -> tuple[str | None, str | None]:
+        """Read the status ``required_mcp.mjs`` recorded, and add a gap for each optional grant that did not connect.
+
+        Returns the error for required grants it recorded as not connected, and the error to use when no status
+        confirms the required grants: the plugin writes it before the first model call, so a missing, null or
+        malformed status means the required tools were never confirmed.
+        """
+        unconfirmed = (
+            "Required Gym MCP tools were not confirmed before the model call: " + ", ".join(grants["required"])
+            if grants["required"]
+            else None
+        )
+        try:
+            statuses = json.loads(await state.read_text("mcp-status.json"))
+        except Exception:
+            LOG.warning("OpenCode MCP grant status unavailable", exc_info=True)
+            statuses = None
+        if not isinstance(statuses, dict):
+            observations.gaps.append(ObservationGap(code="mcp_status_unavailable"))
+            return None, unconfirmed
+        missing = []
+        for name in [*grants["required"], *grants["optional"]]:
+            entry = statuses.get(name) if isinstance(statuses.get(name), dict) else {}
+            if entry.get("status") == "connected":
+                continue
+            detail = f"{name}: {entry.get('status', 'unavailable')}" + (
+                f" ({entry['error']})" if entry.get("error") else ""
+            )
+            if name in grants["required"]:
+                missing.append(detail)
+            else:
+                observations.gaps.append(ObservationGap(code="mcp_server_skipped", detail=detail))
+        if missing:
+            return "Required Gym MCP tools could not be initialized: " + "; ".join(missing), None
+        return None, None
 
     @staticmethod
     def _check_sandbox_setup(command: str, result: SandboxExecResult) -> None:
@@ -1123,12 +1199,24 @@ class OpenCodeAgent(SimpleResponsesAPIAgent):
             },
             **self.config.opencode_config,
         }
+        mcp_servers, mcp_grants = self._granted_mcp_servers(state.request)
+        if mcp_servers:
+            config["mcp"] = mcp_servers
+            directory = state.session.session_dir
+            await state.session.sandbox.upload(
+                Path(__file__).with_name("required_mcp.mjs"), f"{directory}/required_mcp.mjs"
+            )
+            await state.upload_json("mcp-grants.json", mcp_grants)
+            # null until the plugin checks the grants before the first model call of this activation.
+            await state.upload_json("mcp-status.json", None)
         # System instructions are separate from the user's task and applied to every OpenCode model turn.
         if system:
             config["instructions"] = [f"{state.session.session_dir}/instructions.md"]
         if self._model_call_capture_enabled():
             apply_observability_patch(config, plugin_path=Path(state.persistent_directory) / OBSERVABILITY_PATCH.name)
         config.setdefault("plugin", []).append((Path(state.session.session_dir) / "task_environment.mjs").as_uri())
+        if mcp_servers:
+            config["plugin"].append((Path(state.session.session_dir) / "required_mcp.mjs").as_uri())
         command = [f"{state.runtime}/opencode", "run", "--format", "json", "--title", "NeMo Gym"]
         if self.config.thinking:
             command.append("--thinking")
@@ -1188,6 +1276,9 @@ class OpenCodeAgent(SimpleResponsesAPIAgent):
             state.activation_observations = observations
         else:
             state.observations = observations
+        mcp_unconfirmed = None
+        if mcp_servers and not isinstance(failure, asyncio.CancelledError):
+            error, mcp_unconfirmed = await self._check_mcp_grants(state, mcp_grants, observations)
         if state.session.artifacts is not None:
             try:
                 parsed = json.loads(state.session.artifacts)
@@ -1200,7 +1291,7 @@ class OpenCodeAgent(SimpleResponsesAPIAgent):
                     raise ValueError("expected message info objects")
                 export = parsed
             except (ValueError, TypeError) as exc:
-                error = f"OpenCode output parse failed: {exc}"
+                error = error or f"OpenCode output parse failed: {exc}"
         output = []
         usage = None
         if export.get("messages"):
@@ -1239,6 +1330,14 @@ class OpenCodeAgent(SimpleResponsesAPIAgent):
             continuation=state.is_continuation,
         )
         error = error or outcome.error
+        # Without a recorded status, work the model did cannot count: the required tools were never confirmed.
+        # A run that failed for another reason, or made no model call and ended early (timeout), keeps its cause.
+        if (
+            mcp_unconfirmed
+            and not (error or failure or reported_error)
+            and (assistants or outcome.status == "completed")
+        ):
+            error = mcp_unconfirmed
         if context_limit:
             outcome = OpenCodeRunOutcome(status="incomplete")
         status = outcome.status

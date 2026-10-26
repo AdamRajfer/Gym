@@ -492,6 +492,44 @@ gym eval run \
   and `model_auto_compact_token_limit` for another window, with
   `++gdpval_codex_agent.responses_api_agents.codex_agent.<key>=<value>`.
 
+`benchmarks/gdpval/opencode.yaml` and `benchmarks/gdpval/openclaw.yaml` run
+[OpenCode](../../responses_api_agents/opencode_agent/README.md) and
+[OpenClaw](../../responses_api_agents/openclaw_agent/README.md) the same way. Neither sends sampling settings, so set
+them on the model server as for Pi:
+
+```bash
+export PERSIST_DELIVERABLES_DIR=$PWD/output/gdpval_opencode/deliverables
+gym eval prepare --benchmark gdpval/opencode
+gym eval run \
+    --model-type vllm_model \
+    --benchmark gdpval/opencode \
+    --split benchmark \
+    --output results/gdpval_opencode.jsonl \
+    --model-url <vllm_base_url> \
+    --model-api-key <vllm_api_key> \
+    --model <served_model_name> \
+    '++policy_model.responses_api_models.vllm_model.sampling_overrides={temperature: 1.0, top_p: 0.95}'
+```
+
+Replace `opencode` with `openclaw` for OpenClaw.
+
+- The rows, the task tools and the deliverables directory work as for Pi, and these are not AA v2 scores either.
+  Each harness installs its pinned runtime in the task sandbox at the start of each episode (OpenCode 1.17.11,
+  OpenClaw 2026.6.11 on Node.js 22).
+- The model sees the task tools as `gdpval_resources_server_<tool>` in OpenCode and
+  `gdpval_resources_server__<tool>` in OpenClaw. Their web tools stay off: the web goes through `web_search` and
+  `fetch_web_page`.
+- Each model call may use up to `max_output_tokens` (32,768), and both harnesses compact against `context_window`
+  (262,144). Set `context_window` to the served model's context length; OpenClaw lowers a call's output request when
+  the input leaves less room.
+- The resources server's MCP tools must connect before the model runs. OpenCode checks them before its first model
+  call and OpenClaw probes them with `openclaw mcp probe` before it starts; if they do not connect, the episode fails
+  instead of running without `finish`.
+- As for Codex, `finish` does not end the run, a later `finish` or `abandon_task_finish` replaces the recorded call,
+  and the files are collected when the run ends.
+- Change a harness setting with `++gdpval_opencode_agent.responses_api_agents.opencode_agent.<key>=<value>` or
+  `++gdpval_openclaw_agent.responses_api_agents.openclaw_agent.<key>=<value>`.
+
 ## Multi-judge panel
 
 By default every GDPVal deliverable is graded by a **panel** of frontier LLM

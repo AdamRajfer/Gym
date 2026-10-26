@@ -221,3 +221,58 @@ async def test_final_negative_probe_receipt_releases_unconfirmed(probe_env, tmp_
         assert state.probe is None
     finally:
         await owner.stop()
+
+
+async def test_close_before_probe_registration_starts_no_probe(probe_env, tmp_path):
+    """Close that begins while the activation still stages its MCP config must not let a probe start afterwards."""
+    agent, runtime, pid_dir, workdir = probe_env
+    owner, state, release = await borrowed_state(tmp_path, runtime, workdir)
+    staged, resume_staging = asyncio.Event(), asyncio.Event()
+    retiring, resume_retire = asyncio.Event(), asyncio.Event()
+    upload_json, execute = state.upload_json, owner.exec
+
+    async def delayed_config(name, data):
+        staged.set()
+        await resume_staging.wait()
+        await upload_json(name, data)
+
+    async def held_remove(command, **kwargs):
+        # Hold the session-directory removal before it moves anything, so the runner files still exist.
+        if command.startswith("if [ -d") and ".closed" in command:
+            retiring.set()
+            await resume_retire.wait()
+        return await execute(command, **kwargs)
+
+    async def record_release(*args, **kwargs):
+        release["calls"] += 1
+
+    state.upload_json = delayed_config
+    owner.exec = held_remove
+    state.session.sandbox.disconnect = record_release
+    try:
+        state.task = asyncio.create_task(
+            agent._probe_mcp_grants(
+                state,
+                payload_for(runtime, pid_dir, block="task_tools"),
+                {"task_tools": {"url": "http://x/mcp"}},
+                {"task_tools"},
+                timeout=60,
+            )
+        )
+        await asyncio.wait_for(staged.wait(), timeout=5)
+        closing = asyncio.create_task(state.close(timeout=15))
+        await asyncio.wait_for(retiring.wait(), timeout=10)
+        resume_staging.set()
+        for _ in range(60):
+            if (pid_dir / "task_tools.pid").exists() or state.task.done():
+                break
+            await asyncio.sleep(0.05)
+        started_during_close = (pid_dir / "task_tools.pid").exists()
+        resume_retire.set()
+        await asyncio.wait_for(closing, timeout=30)
+        assert not started_during_close, "a probe started after close began"
+        assert state.session.closed and release["calls"] == 1 and state.task.done()
+    finally:
+        if (pid_dir / "task_tools.pid").exists() and alive(pid_of(pid_dir, "task_tools")):
+            os.kill(pid_of(pid_dir, "task_tools"), 9)
+        await owner.stop()

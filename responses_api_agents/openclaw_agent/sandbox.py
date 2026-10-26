@@ -75,6 +75,10 @@ class OpenClawSandboxSession(AgentSessionState):
 
     async def close(self, timeout: float) -> None:
         """Stop an MCP probe, then capture and release before cancelling the HTTP activation."""
+        if not self.session.launch_started:
+            # Before the agent run launches, the activation may still be staging or about to start an MCP probe.
+            # Join it first so no probe can start while release removes the session directory.
+            await self._join_activation(timeout)
         if self.probe is not None:
             await self._stop_probe(timeout)
         await self.session.close(timeout=timeout)
@@ -91,21 +95,28 @@ class OpenClawSandboxSession(AgentSessionState):
                     raise
                 # The agent base replays the activation error independently of close.
 
+    async def _join_activation(self, timeout: float) -> None:
+        """Cancel an unfinished activation and wait for it; a task that outlives the timeout fails close."""
+        if self.task is None or self.task.done():
+            return
+        if not self.task.cancelling():
+            self.task.cancel()
+        try:
+            await asyncio.wait_for(asyncio.shield(self.task), timeout=timeout)
+        except asyncio.CancelledError:
+            if not self.task.cancelled():
+                raise
+        except Exception:
+            if not self.task.done():
+                raise
+            # The agent base replays the activation error independently of close.
+
     async def _stop_probe(self, timeout: float) -> None:
         """Confirm an MCP probe stopped; unconfirmed termination fails close, which keeps the session for retry."""
         probe = self.probe
         assert probe is not None
-        if self.task is not None and not self.task.done():
-            # Cancelling the activation unwinds the probe's execute, which stops it and records its receipt.
-            self.task.cancel()
-            try:
-                await asyncio.wait_for(asyncio.shield(self.task), timeout=timeout)
-            except asyncio.CancelledError:
-                if not self.task.cancelled():
-                    raise
-            except Exception:
-                if not self.task.done():
-                    raise
+        # Cancelling the activation unwinds the probe's execute, which stops it and records its receipt.
+        await self._join_activation(timeout)
         if not probe.cleanup_confirmed:
             try:
                 await probe.stop_harness(timeout=timeout)

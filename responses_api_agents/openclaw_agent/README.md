@@ -195,7 +195,10 @@ their per-request timeout. Before the agent runs, the adapter connects to each g
 `openclaw mcp probe <grant> --json`: a required grant that does not connect fails the activation, and an optional
 one is left out and reported as an `mcp_server_skipped` gap. The pinned `probe --json` exits 0 when a connection
 fails, so a grant counts as connected only when the JSON lists it under `servers` with no diagnostic for it.
-OpenClaw's internal `gateway`
+Each probe runs under the same process supervisor as the agent, with its own directory and cleanup receipt, so a
+probe that exceeds its 120-second limit is stopped inside the sandbox (some providers stop only their local client on
+an exec timeout). The agent starts only after the probe's termination is confirmed, and session close stops a probe
+that is still running before it releases the sandbox. OpenClaw's internal `gateway`
 exec host refers to the embedded CLI process inside the borrowed sandbox.
 
 Sandbox request support is deliberately explicit:

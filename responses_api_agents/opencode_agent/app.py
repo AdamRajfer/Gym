@@ -1203,12 +1203,14 @@ class OpenCodeAgent(SimpleResponsesAPIAgent):
         if mcp_servers:
             config["mcp"] = mcp_servers
             directory = state.session.session_dir
-            await state.session.sandbox.upload(
-                Path(__file__).with_name("required_mcp.mjs"), f"{directory}/required_mcp.mjs"
-            )
-            await state.upload_json("mcp-grants.json", mcp_grants)
-            # null until the plugin checks the grants before the first model call of this activation.
-            await state.upload_json("mcp-status.json", None)
+            # Staging spends the activation's budget; an expiry here is a pre-launch timeout.
+            async with asyncio.timeout_at(deadline):
+                await state.session.sandbox.upload(
+                    Path(__file__).with_name("required_mcp.mjs"), f"{directory}/required_mcp.mjs"
+                )
+                await state.upload_json("mcp-grants.json", mcp_grants)
+                # null until the plugin checks the grants before the first model call of this activation.
+                await state.upload_json("mcp-status.json", None)
         # System instructions are separate from the user's task and applied to every OpenCode model turn.
         if system:
             config["instructions"] = [f"{state.session.session_dir}/instructions.md"]

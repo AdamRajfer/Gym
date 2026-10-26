@@ -35,7 +35,7 @@ import psutil
 from fastapi import HTTPException, Request
 from pydantic import ConfigDict, Field, PrivateAttr
 
-from nemo_gym.agent_utils.sandbox_session import SandboxSession
+from nemo_gym.agent_utils.sandbox_session import SandboxCommand, SandboxSession
 from nemo_gym.agent_utils.task_timeout import AGENT_TIMEOUT_METADATA_KEY, resolve_agent_timeout
 from nemo_gym.base_resources_server import BaseRunRequest, BaseVerifyResponse
 from nemo_gym.base_responses_api_agent import (
@@ -70,6 +70,7 @@ from nemo_gym.rollout_observability import (
 from nemo_gym.sandbox import AsyncSandbox, SandboxExecResult, SandboxSpec, create_provider
 from nemo_gym.sandbox.access import DirectSandboxConnection
 from nemo_gym.sandbox.config import resolve_provider_config
+from nemo_gym.sandbox.utils import read_text, upload_text
 from nemo_gym.server_utils import get_global_config_dict, get_response_json, raise_for_status
 from nemo_gym.tool_access import MCPToolAccess
 from responses_api_agents.openclaw_agent.observability import (
@@ -832,11 +833,8 @@ class OpenClawAgent(SimpleResponsesAPIAgent):
         await state.upload_json("home/.openclaw/openclaw.json", {"mcp": {"servers": servers}})
         gaps = []
         missing = []
-        for name in list(servers):
-            command = shlex.join([*payload["command"][:2], "mcp", "probe", name, "--json"])
-            result = await state.session.sandbox.exec(
-                command, cwd=state.session.workdir, env=payload["env"], timeout_s=timeout
-            )
+        for index, name in enumerate(list(servers)):
+            result = await self._run_mcp_probe(state, payload, name, index=index, timeout=timeout)
             problem = _mcp_probe_problem(name, result)
             if problem is None:
                 continue
@@ -847,8 +845,78 @@ class OpenClawAgent(SimpleResponsesAPIAgent):
                 del servers[name]
                 gaps.append(ObservationGap(code="mcp_server_skipped", detail=detail))
         if missing:
+            # The activation ends before the agent runs; close reports these instead of only the interruption.
+            state.observations = AgentObservationBundle(
+                source=OPENCLAW_OBSERVATION_SOURCE, gaps=[ObservationGap(code="agent_activation_interrupted"), *gaps]
+            )
             raise HTTPException(502, "Required Gym MCP tools could not be initialized: " + "; ".join(missing))
         return gaps
+
+    async def _run_mcp_probe(
+        self, state: OpenClawSandboxSession, payload: dict[str, Any], name: str, *, index: int, timeout: float
+    ) -> SandboxExecResult:
+        """Run one ``openclaw mcp probe`` under its own supervisor and receipt, beside the agent run's.
+
+        A provider timeout may stop only the local client (Docker does), so the supervisor bounds the probe inside
+        the sandbox and stops it on timeout, cancellation and close. The probe's result counts only once its
+        termination is confirmed; until then ``state.probe`` keeps it for close to stop.
+        """
+        probe = SandboxSession(
+            sandbox=state.session.sandbox,
+            session_dir=f"{state.session.session_dir}/mcp-probe-{index}",
+            workdir=state.session.workdir,
+            harness="OpenClaw MCP probe",
+        )
+        runner_input = {
+            "directory": probe.session_dir,
+            "prompt": "",
+            "command": [*payload["command"][:2], "mcp", "probe", name, "--json"],
+            "cwd": state.session.workdir,
+            "env": payload["env"],
+        }
+
+        async def stage() -> SandboxCommand:
+            await upload_text(probe.sandbox, path=f"{probe.session_dir}/input.json", text=json.dumps(runner_input))
+            runner = f"{state.session.session_dir}/sandbox_runner.py"
+            return SandboxCommand(python="python3", argv=["python3", "-I", runner, f"{probe.session_dir}/input.json"])
+
+        async def collect() -> dict[str, str]:
+            output = {}
+            for file in ("stdout.log", "stderr.log"):
+                try:
+                    output[file] = await read_text(probe.sandbox, path=f"{probe.session_dir}/{file}")
+                except Exception:
+                    LOG.warning("OpenClaw MCP probe %s unavailable for %s", file, name, exc_info=True)
+            return output
+
+        state.probe = probe
+        error: Exception | None = None
+        try:
+            output = await probe.execute(
+                stage_activation=stage,
+                collect=collect,
+                timeout=timeout,
+                close_timeout=self.config.session_close_timeout_seconds,
+            )
+        except Exception as exc:  # A timeout or runner failure; termination is checked below either way.
+            output, error = probe.artifacts or {}, exc
+        if not probe.cleanup_confirmed:
+            raise RuntimeError(f"OpenClaw MCP probe for {name} did not confirm termination") from error
+        state.probe = None
+        receipt = probe.cleanup or {}
+        if receipt.get("timed_out") or isinstance(error, TimeoutError):
+            return SandboxExecResult(
+                stdout=None, stderr=f"probe exceeded {timeout:g} s", return_code=-1, error_type="timeout"
+            )
+        if error is not None:
+            return SandboxExecResult(stdout=None, stderr=str(error), return_code=-1, error_type="sandbox")
+        return_code = receipt.get("return_code")
+        return SandboxExecResult(
+            stdout=output.get("stdout.log"),
+            stderr=output.get("stderr.log"),
+            return_code=return_code if type(return_code) is int else -1,
+            error_type=None,
+        )
 
     async def _collect_sandbox_response(
         self,

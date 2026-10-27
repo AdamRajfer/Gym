@@ -241,10 +241,12 @@ def test_probe_problem_keeps_kind_and_origin_only(setup):  # noqa: F811
     agent, sandbox = setup
     body = seed().model_dump(mode="json")
     body["tool_accesses"] = [grant("task_tools", required=True)]
-    body["tool_accesses"][0]["connection"]["url"] = "http://user:pw@resources.example:8000/task_tools/mcp?token=q"
+    body["tool_accesses"][0]["connection"]["url"] = (
+        "http://user:pw@resources.example:8000/task_tools/mcp?token=q"  # pragma: allowlist secret
+    )
     message = (
         "Streamable HTTP error: Error POSTing to endpoint (HTTP 401) "
-        "http://user:pw@resources.example:8000/task_tools/mcp?token=q-secret "
+        "http://user:pw@resources.example:8000/task_tools/mcp?token=q-secret "  # pragma: allowlist secret
         'Authorization: Bearer b-secret x-session=token {"error": "body-secret"} plaintext-private-server-response'
     )
     probes = install_probe_fake(sandbox, {"task_tools"}, "diagnostic")

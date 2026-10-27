@@ -198,7 +198,12 @@ fails, so a grant counts as connected only when the JSON lists it under `servers
 Each probe runs under the same process supervisor as the agent, with its own directory and cleanup receipt, so a
 probe that exceeds its 120-second limit is stopped inside the sandbox (some providers stop only their local client on
 an exec timeout). The agent starts only after the probe's termination is confirmed, and session close stops a probe
-that is still running before it releases the sandbox. OpenClaw's internal `gateway`
+that is still running before it releases the sandbox. A grant can pass the probe and still fail when the agent
+starts; OpenClaw then logs `failed to start server "<grant>"` and runs on without its tools. The adapter reads that
+from the run's stderr: a required grant fails the activation with HTTP 502, and an optional one is reported as an
+`mcp_server_skipped` gap. A probe failure in a 502 or a gap names only the error kind, an HTTP status, a bootstrap
+class (such as a missing executable) and the configured server's URL origin; the probe's own output, which can
+echo server responses, stays in its files in the session directory. OpenClaw's internal `gateway`
 exec host refers to the embedded CLI process inside the borrowed sandbox.
 
 Sandbox request support is deliberately explicit:
@@ -254,6 +259,9 @@ Natural CLI exit cannot distinguish unfinished tools in other sessions from serv
 those processes may still change task files. The stop-time cutoff also has adoption/PID
 races and cannot classify later service forks. It is not a security boundary.
 The sandbox launcher sets `OPENCLAW_NO_RESPAWN=1` to keep the CLI in the supervised group.
+The supervisor and the runner above OpenClaw run as `gym-supervisor` and `gym-runner` (links to the
+sandbox's `python3`) from files without a `.py` suffix, so a task agent's `pkill -f python3`,
+`pkill python3` or `killall python3` does not end OpenClaw.
 Services must use task-owned files rather than the temporary agent session directory. Close is serialized and checks the receipt, process handle,
 adapter-owned file removal, and disconnect before succeeding. Unknown launch outcomes and missing
 or negative termination evidence block verification. Missing evidence remains retryable;

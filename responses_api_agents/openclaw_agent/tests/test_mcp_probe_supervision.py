@@ -17,7 +17,8 @@ from unittest.mock import MagicMock
 import pytest
 from fastapi import HTTPException
 
-from nemo_gym.agent_utils.sandbox_session import SandboxSession
+from nemo_gym.agent_utils import sandbox_session as sandbox_session_module
+from nemo_gym.agent_utils.sandbox_session import RUNNER_FILE, SandboxSession
 from nemo_gym.sandbox import AsyncSandbox, SandboxSpec
 from nemo_gym.sandbox.providers.local.provider import LocalProvider
 from nemo_gym.server_utils import ServerClient
@@ -84,7 +85,7 @@ async def borrowed_state(tmp_path, runtime, workdir):
     await owner.start(SandboxSpec(workdir=str(workdir)))
     session_dir = tmp_path / "sessions" / "s1"
     session_dir.mkdir(parents=True)
-    shutil.copy(Path(__file__).parents[1] / "sandbox_runner.py", session_dir / "sandbox_runner.py")
+    shutil.copy(Path(__file__).parents[1] / "sandbox_runner.py", session_dir / RUNNER_FILE)
     session = SandboxSession(sandbox=owner, session_dir=str(session_dir), workdir=str(workdir), harness="OpenClaw")
     state = OpenClawSandboxSession(request=MagicMock(), session=session, runtime=str(runtime))
     release = {"calls": 0, "alive_at_disconnect": None}
@@ -190,7 +191,7 @@ async def test_unconfirmed_probe_termination_fails_close(probe_env, tmp_path):
     probe.launch_started = True
     state.probe = probe
     try:
-        with pytest.raises(Exception):
+        with pytest.raises(RuntimeError, match="cannot confirm termination"):
             await state.close(timeout=3)
         assert state.probe is probe and not state.session.closed and release["calls"] == 0
     finally:
@@ -275,4 +276,99 @@ async def test_close_before_probe_registration_starts_no_probe(probe_env, tmp_pa
     finally:
         if (pid_dir / "task_tools.pid").exists() and alive(pid_of(pid_dir, "task_tools")):
             os.kill(pid_of(pid_dir, "task_tools"), 9)
+        await owner.stop()
+
+
+async def test_unconfirmed_first_cleanup_keeps_the_probe_for_close(probe_env, tmp_path, monkeypatch):
+    """A probe whose first stop cannot be confirmed fails the activation and stays registered until close confirms."""
+    agent, runtime, pid_dir, workdir = probe_env
+    owner, state, release = await borrowed_state(tmp_path, runtime, workdir)
+    confirm = sandbox_session_module.stop_and_confirm_cleanup
+    calls = []
+
+    async def first_stop_unconfirmed(*args, **kwargs):
+        calls.append(kwargs["session_dir"])
+        if len(calls) == 1:
+            raise RuntimeError("probe launch outcome is unknown; cannot confirm termination")
+        return await confirm(*args, **kwargs)
+
+    async def record_release(*args, **kwargs):
+        release["calls"] += 1
+
+    monkeypatch.setattr(sandbox_session_module, "stop_and_confirm_cleanup", first_stop_unconfirmed)
+    state.session.sandbox.disconnect = record_release
+    try:
+        with pytest.raises(RuntimeError, match="did not confirm termination"):
+            await agent._probe_mcp_grants(
+                state,
+                payload_for(runtime, pid_dir, block="task_tools"),
+                {"task_tools": {"url": "http://x/mcp"}},
+                {"task_tools"},
+                timeout=2,
+            )
+        # The result did not count, and the probe stays registered: close must confirm it before release.
+        assert state.probe is not None and not state.probe.cleanup_confirmed and release["calls"] == 0
+        await state.close(timeout=15)
+        assert len(calls) == 2 and calls[0] == calls[1]
+        assert state.probe is None and state.session.closed and release["calls"] == 1
+        assert not alive(pid_of(pid_dir, "task_tools"))
+    finally:
+        await owner.stop()
+
+
+async def test_probe_directory_belongs_to_the_session_user(probe_env, tmp_path):
+    """An upload that creates missing parents the session user cannot write must not break the probe."""
+    agent, runtime, pid_dir, workdir = probe_env
+    owner, state, release = await borrowed_state(tmp_path, runtime, workdir)
+    upload = owner.upload
+
+    async def upload_creating_foreign_parents(source, destination):
+        # Like a provider that creates missing parents as root: the session user cannot write into them.
+        parent = Path(destination).parent
+        if "/mcp-probe-" in str(parent) and not parent.exists():
+            parent.mkdir(parents=True)
+            await upload(source, destination)
+            parent.chmod(0o555)
+            return
+        await upload(source, destination)
+
+    async def record_release(*args, **kwargs):
+        release["calls"] += 1
+
+    owner.upload = upload_creating_foreign_parents
+    state.session.sandbox.disconnect = record_release
+    servers = {"task_tools": {"url": "http://x/mcp"}}
+    try:
+        gaps = await asyncio.wait_for(
+            agent._probe_mcp_grants(state, payload_for(runtime, pid_dir), servers, {"task_tools"}, timeout=20),
+            timeout=60,
+        )
+        assert gaps == [] and set(servers) == {"task_tools"} and state.probe is None
+        await state.close(timeout=15)
+        assert state.session.closed and release["calls"] == 1
+    finally:
+        for path in Path(state.session.session_dir).parent.rglob("*"):
+            if path.is_dir():
+                path.chmod(0o755)
+        await owner.stop()
+
+
+async def test_probe_that_fails_before_openclaw_starts_reports_why(probe_env, tmp_path):
+    """A probe whose command cannot start (no Node) reports the error from output.log, not an empty `exit 1: `."""
+    agent, runtime, pid_dir, workdir = probe_env
+    owner, state, _ = await borrowed_state(tmp_path, runtime, workdir)
+    (runtime / "node" / "bin" / "node").unlink()
+    try:
+        with pytest.raises(HTTPException) as failed:
+            await agent._probe_mcp_grants(
+                state,
+                payload_for(runtime, pid_dir),
+                {"task_tools": {"url": "http://x/mcp"}},
+                {"task_tools"},
+                timeout=20,
+            )
+        detail = failed.value.detail
+        assert detail.startswith("Required Gym MCP tools could not be initialized: task_tools: exit ")
+        assert detail.endswith(": executable not found"), detail
+    finally:
         await owner.stop()

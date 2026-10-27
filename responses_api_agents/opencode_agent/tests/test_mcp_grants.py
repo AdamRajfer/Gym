@@ -3,6 +3,7 @@
 """MCP tool grants in a borrowed-sandbox OpenCode session."""
 
 import json
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -214,3 +215,59 @@ def test_plugin_checks_grants_before_the_model_call(tmp_path, server_status, exp
         "connected" if expected is None else ("failed" if server_status else "unavailable")
     )
     assert recorded["extra"]["status"] == ("failed" if expected is None else "unavailable")
+
+
+@pytest.mark.parametrize("with_grant", [True, False])
+@pytest.mark.parametrize("step", ["placeholder", "model-step"])
+def test_timeout_during_mcp_connect_keeps_its_cause(setup, step, with_grant):  # noqa: F811
+    """OpenCode saves an empty assistant message before it connects MCP; only a real model step needs the status."""
+    agent, sandbox = setup
+    body = seed().model_dump(mode="json")
+    if with_grant:
+        body["tool_accesses"] = [grant("task_tools", required=True)]
+    export = json.loads(sandbox.events)
+    if step == "placeholder":
+        # Killed while MCP was still connecting: an assistant message with no parts and no finish.
+        assistant = {key: value for key, value in export["messages"][-1]["info"].items() if key != "finish"}
+        assistant["time"] = {"created": 100}
+        assistant.pop("tokens", None)
+        export["messages"] = [export["messages"][0], {"info": assistant, "parts": []}]
+    sandbox.events = json.dumps(export)
+    sandbox.result["timed_out"] = True
+    sandbox.result["return_code"] = -9
+    with TestClient(agent.setup_webserver()) as client:
+        created = client.post("/v1/agent_sessions", json=body)
+        assert created.status_code == 200, created.text
+        result = client.post("/ng-rollout/opencode-smoke-a2/v1/responses", json={"input": "task"})
+        if step == "model-step" and with_grant:
+            # The model worked without confirmed required tools: fail closed.
+            assert result.status_code == 502 and result.json()["detail"].startswith(_UNCONFIRMED)
+        else:
+            assert result.status_code == 200, result.text
+            assert result.json()["status"] == "incomplete"
+        closed = client.post("/v1/agent_sessions/close", json=close_body(created.json()["agent_session_id"]))
+        assert closed.status_code == 200, closed.text
+    sandbox.disconnect.assert_awaited_once()
+    sandbox.stop.assert_not_awaited()
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node is required")
+@pytest.mark.skipif(os.geteuid() == 0, reason="root can write a read-only file")
+def test_plugin_replaces_a_staged_status_it_cannot_write(tmp_path):
+    """The adapter's upload can leave mcp-status.json owned by another user; the plugin must replace, not write into it."""
+    shutil.copy(Path(__file__).parents[1] / "required_mcp.mjs", tmp_path / "required_mcp.mjs")
+    (tmp_path / "mcp-grants.json").write_text(json.dumps({"required": ["task_tools"], "optional": []}))
+    staged = tmp_path / "mcp-status.json"
+    staged.write_text("null")
+    staged.chmod(0o444)  # Not writable by the plugin's user; the directory still is.
+    script = tmp_path / "check.mjs"
+    script.write_text(
+        'import { RequiredMcp } from "./required_mcp.mjs";\n'
+        "const client = { mcp: { status: async () => ({ data: { task_tools: { status: 'connected' } } }) } };\n"
+        "const hooks = await RequiredMcp({ client });\n"
+        "try { await hooks['chat.params']({}, {}); console.log('ok'); } catch (error) { console.log(error.code); }\n"
+    )
+    result = subprocess.run(["node", str(script)], capture_output=True, text=True, check=True, timeout=60)
+    assert result.stdout.strip() == "ok"
+    assert json.loads(staged.read_text()) == {"task_tools": {"status": "connected"}}
+    assert sorted(path.name for path in tmp_path.glob("mcp-status.json*")) == ["mcp-status.json"]

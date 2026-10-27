@@ -37,7 +37,7 @@ from nemo_gym.agent_activation_types import (
     AgentContinuationCapabilities,
 )
 from nemo_gym.agent_outcome import AgentOutcome
-from nemo_gym.agent_utils.sandbox_session import SandboxSession
+from nemo_gym.agent_utils.sandbox_session import RUNNER_FILE, SandboxSession
 from nemo_gym.agent_utils.task_timeout import AGENT_TIMEOUT_METADATA_KEY, resolve_agent_timeout
 from nemo_gym.base_resources_server import BaseRunRequest, BaseVerifyResponse
 from nemo_gym.base_responses_api_agent import (
@@ -776,7 +776,7 @@ class OpenCodeAgent(SimpleResponsesAPIAgent):
             )
             result = await sandbox.exec(command, cwd=workdir, timeout_s=self.config.sandbox_install_timeout_seconds)
             self._check_sandbox_setup(command, result)
-            await sandbox.upload(Path(__file__).with_name("sandbox_runner.py"), f"{directory}/sandbox_runner.py")
+            await sandbox.upload(Path(__file__).with_name("sandbox_runner.py"), f"{directory}/{RUNNER_FILE}")
             await sandbox.upload(Path(__file__).with_name("task_environment.mjs"), f"{directory}/task_environment.mjs")
             if self._model_call_capture_enabled():
                 await sandbox.upload(OBSERVABILITY_PATCH, f"{directory}/{OBSERVABILITY_PATCH.name}")
@@ -1334,10 +1334,15 @@ class OpenCodeAgent(SimpleResponsesAPIAgent):
         error = error or outcome.error
         # Without a recorded status, work the model did cannot count: the required tools were never confirmed.
         # A run that failed for another reason, or made no model call and ended early (timeout), keeps its cause.
+        # OpenCode saves the assistant message before it connects MCP; parts or a finish show a model step ran.
+        model_called = any(
+            message["info"].get("role") == "assistant" and (message.get("parts") or message["info"].get("finish"))
+            for message in export.get("messages", [])
+        )
         if (
             mcp_unconfirmed
             and not (error or failure or reported_error)
-            and (assistants or outcome.status == "completed")
+            and (model_called or outcome.status == "completed")
         ):
             error = mcp_unconfirmed
         if context_limit:

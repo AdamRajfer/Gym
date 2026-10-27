@@ -517,8 +517,8 @@ Replace `opencode` with `openclaw` for OpenClaw.
   Each harness installs its pinned runtime in the task sandbox at the start of each episode (OpenCode 1.17.11,
   OpenClaw 2026.6.11 on Node.js 22).
 - The model sees the task tools as `gdpval_resources_server_<tool>` in OpenCode and
-  `gdpval_resources_server__<tool>` in OpenClaw. Their web tools stay off: the web goes through `web_search` and
-  `fetch_web_page`.
+  `gdpval_resources_server__<tool>` in OpenClaw. Their built-in web tools are off, and the task's `web_search` and
+  `fetch_web_page` are provided instead; the sandbox still has egress, so shell commands can reach the web too.
 - Each model call may use up to `max_output_tokens` (32,768). OpenClaw compacts against `context_window`, the served
   model's context length (262,144), and lowers a call's output request when the input leaves less room. OpenCode
   always asks for `max_output_tokens`, so its `context_window` is the served length minus that (229,376).
@@ -527,6 +527,15 @@ Replace `opencode` with `openclaw` for OpenClaw.
   instead of running without `finish`.
 - As for Codex, `finish` does not end the run, a later `finish` or `abandon_task_finish` replaces the recorded call,
   and the files are collected when the run ends.
+- A run stopped by its `timeout` has no `stop_reason: wall_time`, so it is judged on its last `finish` (or as an
+  empty submission) and `--resume` does not rerun it, unlike a Stirrup timeout. If the task tools do not connect,
+  the episode fails with HTTP 502, and `--resume` reruns it.
+- Neither agent accepts sampling or output limits in the request, so every row fails with HTTP 422 if
+  `gym eval run` gets `--temperature`, `--top-p` or `--max-output-tokens`.
+- The installs need egress from the task sandbox (GitHub releases, nodejs.org and the npm registry, and
+  `apt-get install ripgrep` for OpenCode), so the agents' shell commands can reach the web too.
+- OpenCode applies `mcp_tool_timeout_seconds` (900) to each task-tool call, but OpenCode 1.17.11 stops a call
+  after about 300 seconds, Bun's default `fetch` timeout, so a slower `fetch_web_page` fails at about 300 s.
 - Change a harness setting with `++gdpval_opencode_agent.responses_api_agents.opencode_agent.<key>=<value>` or
   `++gdpval_openclaw_agent.responses_api_agents.openclaw_agent.<key>=<value>`.
 

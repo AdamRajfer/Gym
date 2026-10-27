@@ -94,6 +94,9 @@ tools in separate sessions. The sandbox owner stops the preserved services later
 Natural CLI exit cannot distinguish unfinished tools in other sessions from services;
 those processes may still change task files. The stop-time cutoff also has adoption/PID
 races and cannot classify later service forks. It is not a security boundary.
+The supervisor and the runner above OpenCode run as `gym-supervisor` and `gym-runner` (links to the
+sandbox's `python3`) from files without a `.py` suffix, so a task agent's `pkill -f python3`,
+`pkill python3` or `killall python3` does not end OpenCode.
 The CLI must exit before
 SQLite observations are captured; services must use task-owned files rather than the
 agent session directory, which close removes. Capture requires confirmed termination.
@@ -115,7 +118,9 @@ The session path accepts one text task, optional system/developer text and
 `instructions`. Unsupported controls, images, history replay and required direct-HTTP
 tool grants are rejected. MCP tool grants become OpenCode `remote` MCP servers, and the model sees
 their tools as `<grant>_<tool>`. `mcp_tool_timeout_seconds` sets their connection and per-call
-timeout (OpenCode's default is 30 seconds). Before the first model call, `required_mcp.mjs` checks
+timeout; without it, OpenCode allows 30 seconds to connect and 60 seconds per call. A call still
+fails after about 300 seconds, Bun's default `fetch` timeout. Before the first model call,
+`required_mcp.mjs` checks
 their status: a required grant that did not connect fails the activation, and an optional one is
 reported as an `mcp_server_skipped` gap. A run that called the model but left no readable status
 also fails, because nothing confirms its required tools; a run that failed for another reason keeps

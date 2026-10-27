@@ -10,6 +10,8 @@ from types import SimpleNamespace
 import pytest
 from fastapi.testclient import TestClient
 
+from nemo_gym.sandbox import SandboxExecResult
+from responses_api_agents.openclaw_agent.app import _mcp_probe_problem
 from responses_api_agents.openclaw_agent.tests.test_sandbox import close_body, seed, setup  # noqa: F401
 
 
@@ -22,11 +24,12 @@ def grant(name: str, *, required: bool) -> dict:
     }
 
 
+# What a 502 or gap says: classifications only, never probe output text.
 _PROBLEM = {
-    "diagnostic": "refused",
-    "exit": "exit 1: No MCP server named x",
+    "diagnostic": "connection failed (http://resources.example:8000)",
+    "exit": "exit 1",
     "not-listed": "not connected",
-    "unreadable": "unreadable probe output: not json",
+    "unreadable": "unreadable probe output",
     "timeout": "timeout: probe exceeded 120 s",
 }
 
@@ -60,7 +63,7 @@ def install_probe_fake(sandbox, failing: set[str], failure: str) -> list[dict]:
 
     async def probe_or_run(command, **kwargs):
         match = re.search(r"(/\S*/mcp-probe-\d+)/cleanup\.json", command)
-        if match and "process_supervisor.py" in command:
+        if match and "process_supervisor" in command:
             directory = match.group(1)
             runner_input = json.loads(sandbox.files.pop(f"{directory}/input.json"))
             name = runner_input["command"][4]
@@ -114,6 +117,8 @@ def test_mcp_grants_are_probed_before_the_agent_runs(setup, unreachable, failure
         directory = agent._session_records[session_id].state.session.session_dir
         result = client.post("/ng-rollout/openclaw-smoke-a2/v1/responses", json={"input": "task"})
         assert [probe["name"] for probe in probes] == ["task_tools", "extra"]
+        # The probe runs with plugins off, as the agent run does.
+        assert probes[0]["config"]["plugins"] == {"enabled": False}
         assert probes[0]["config"]["mcp"]["servers"]["task_tools"] == {
             "url": "http://resources.example:8000/task_tools/mcp",
             "transport": "streamable-http",
@@ -189,3 +194,119 @@ def test_required_non_mcp_grant_is_still_rejected(setup):  # noqa: F811
     assert response.status_code == 422
     assert response.json()["detail"].endswith("required grants it cannot use: tools")
     sandbox.exec.assert_not_awaited()
+
+
+@pytest.mark.parametrize("lost", ["task_tools", "extra", "both"])
+@pytest.mark.parametrize("required_first", [True, False])
+def test_server_that_fails_at_agent_startup_after_its_probe(setup, lost, required_first):  # noqa: F811
+    """OpenClaw logs a server that fails at agent startup, runs on without its tools and exits 0."""
+    agent, sandbox = setup
+    body = seed().model_dump(mode="json")
+    grants = [grant("task_tools", required=True), grant("extra", required=False)]
+    body["tool_accesses"] = grants if required_first else grants[::-1]
+    install_probe_fake(sandbox, set(), "diagnostic")
+    names = ["task_tools", "extra"] if lost == "both" else [lost]
+    wait_exit = sandbox.wait_exit
+
+    async def run_with_lost_servers():
+        result = await wait_exit()
+        sandbox.files[f"{sandbox.directory}/stderr.log"] = "".join(
+            f'\x1b[33m[bundle-mcp]\x1b[39m bundle-mcp: failed to start server "{name}" (http://127.0.0.1:1/mcp)\n'
+            for name in names
+        )
+        return result
+
+    sandbox.wait_exit = run_with_lost_servers
+    with TestClient(agent.setup_webserver()) as client:
+        created = client.post("/v1/agent_sessions", json=body)
+        assert created.status_code == 200, created.text
+        session_id = created.json()["agent_session_id"]
+        result = client.post("/ng-rollout/openclaw-smoke-a2/v1/responses", json={"input": "task"})
+        sandbox.launch.assert_awaited_once()
+        if "task_tools" in names:
+            assert result.status_code == 502
+            assert result.json()["detail"] == "Required Gym MCP tools did not connect in the agent run: task_tools"
+        else:
+            assert result.status_code == 200 and result.json()["status"] == "completed", result.text
+        closed = client.post("/v1/agent_sessions/close", json=close_body(session_id))
+        assert closed.status_code == 200, closed.text
+    expected = ["extra: did not connect in the agent run"] if "extra" in names else []
+    assert skipped(closed) == expected
+    sandbox.disconnect.assert_awaited_once()
+    sandbox.stop.assert_not_awaited()
+
+
+def test_probe_problem_keeps_kind_and_origin_only(setup):  # noqa: F811
+    """A 502 or gap never carries server bodies, credentials, query values or URL userinfo."""
+    agent, sandbox = setup
+    body = seed().model_dump(mode="json")
+    body["tool_accesses"] = [grant("task_tools", required=True)]
+    body["tool_accesses"][0]["connection"]["url"] = "http://user:pw@resources.example:8000/task_tools/mcp?token=q"
+    message = (
+        "Streamable HTTP error: Error POSTing to endpoint (HTTP 401) "
+        "http://user:pw@resources.example:8000/task_tools/mcp?token=q-secret "
+        'Authorization: Bearer b-secret x-session=token {"error": "body-secret"} plaintext-private-server-response'
+    )
+    probes = install_probe_fake(sandbox, {"task_tools"}, "diagnostic")
+    fake = sandbox.exec.side_effect
+
+    async def leaky_diagnostic(command, **kwargs):
+        result = await fake(command, **kwargs)
+        for path in [path for path in sandbox.files if path.endswith("/stdout.log") and "/mcp-probe-" in path]:
+            report = {"servers": {}, "diagnostics": [{"serverName": "task_tools", "message": message}]}
+            sandbox.files[path] = json.dumps(report)
+        return result
+
+    sandbox.exec.side_effect = leaky_diagnostic
+    with TestClient(agent.setup_webserver()) as client:
+        created = client.post("/v1/agent_sessions", json=body)
+        result = client.post("/ng-rollout/openclaw-smoke-a2/v1/responses", json={"input": "task"})
+        client.post("/v1/agent_sessions/close", json=close_body(created.json()["agent_session_id"]))
+    assert probes and result.status_code == 502
+    assert result.json()["detail"] == (
+        "Required Gym MCP tools could not be initialized: task_tools: HTTP 401 (http://resources.example:8000)"
+    )
+
+
+@pytest.mark.parametrize(
+    "result, expected",
+    [
+        # A nonzero exit whose output is a plain-text server body.
+        (
+            SandboxExecResult(stdout="", stderr="HTTP 401\nplain-private-response-body", return_code=1),
+            "exit 1: HTTP 401",
+        ),
+        (SandboxExecResult(stdout="", stderr="plain-private-response-body", return_code=1), "exit 1"),
+        # A successful probe whose diagnostic is a plain-text server body.
+        (
+            SandboxExecResult(
+                stdout=json.dumps(
+                    {
+                        "servers": {},
+                        "diagnostics": [
+                            {"serverName": "task_tools", "message": "HTTP 401: plaintext-private-server-response"}
+                        ],
+                    }
+                ),
+                stderr="",
+                return_code=0,
+            ),
+            "HTTP 401",
+        ),
+        # Bootstrap failure before OpenClaw starts (no Node), from output.log.
+        (
+            SandboxExecResult(
+                stdout="", stderr="FileNotFoundError: [Errno 2] No such file or directory: '/r/node'", return_code=1
+            ),
+            "exit 1: executable not found",
+        ),
+        (SandboxExecResult(stdout="private text", stderr="", return_code=0), "unreadable probe output"),
+    ],
+)
+@pytest.mark.parametrize("url", [None, "http://u:p@resources.example:8000/x/mcp?k=v"])
+def test_probe_problem_never_returns_probe_output(result, expected, url):
+    origin = " (http://resources.example:8000)" if url and "HTTP" in expected else ""
+    problem = _mcp_probe_problem("task_tools", result, url=url)
+    assert problem == expected + origin
+    for private in ("private", "u:p", "/x/mcp", "k=v", "/r/node"):
+        assert private not in problem

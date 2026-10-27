@@ -29,13 +29,15 @@ from collections.abc import Mapping
 from pathlib import Path
 from time import time
 from typing import Any, Callable, ClassVar, Optional
+from urllib.parse import urlsplit
 from uuid import uuid4
 
 import psutil
 from fastapi import HTTPException, Request
 from pydantic import ConfigDict, Field, PrivateAttr
 
-from nemo_gym.agent_utils.sandbox_session import SandboxCommand, SandboxSession
+from nemo_gym.agent_utils.sandbox_session import RUNNER_FILE, SandboxCommand, SandboxSession
+from nemo_gym.agent_utils.supervisor_client import OUTPUT_LOG_FILE
 from nemo_gym.agent_utils.task_timeout import AGENT_TIMEOUT_METADATA_KEY, resolve_agent_timeout
 from nemo_gym.base_resources_server import BaseRunRequest, BaseVerifyResponse
 from nemo_gym.base_responses_api_agent import (
@@ -422,25 +424,63 @@ fi
 _MCP_PROBE_TIMEOUT_SECONDS = 120
 
 
-def _mcp_probe_problem(name: str, result: SandboxExecResult) -> str | None:
-    """Why ``openclaw mcp probe <name> --json`` did not prove a connection, or None if it did."""
+_ANSI = re.compile(r"\x1b\[[0-9;]*m")
+_HTTP_STATUS = re.compile(r"\bHTTP (\d{3})\b")
+_PROBE_LIMIT = re.compile(r"probe exceeded [0-9.]+ s")
+# Bootstrap failures before OpenClaw starts, as the runner or interpreter reports them in output.log.
+_BOOTSTRAP = (
+    ("FileNotFoundError", "executable not found"),
+    ("No such file or directory", "executable not found"),
+    ("PermissionError", "permission denied"),
+    ("Permission denied", "permission denied"),
+)
+
+
+def _url_origin(url: str | None) -> str | None:
+    """scheme://host[:port] of a configured server URL, without path, query or userinfo."""
+    try:
+        parts = urlsplit(url or "")
+        port = f":{parts.port}" if parts.port else ""
+    except ValueError:
+        return None
+    return f"{parts.scheme}://{parts.hostname}{port}" if parts.scheme and parts.hostname else None
+
+
+def _mcp_probe_problem(name: str, result: SandboxExecResult, *, url: str | None = None) -> str | None:
+    """Why ``openclaw mcp probe <name> --json`` did not prove a connection, or None if it did.
+
+    The answer goes into a 502 or a gap, so it holds only classifications: the error kind, an HTTP status, a
+    bootstrap class and the configured server's origin. Probe output itself is untrusted (it can echo server bodies
+    or credentials) and stays in the probe's own files.
+    """
     output = (result.stdout or "") + (result.stderr or "")
+    origin = _url_origin(url)
+    where = f" ({origin})" if origin else ""
+    status = _HTTP_STATUS.search(output)
+    if result.error_type == "timeout":
+        limit = _PROBE_LIMIT.fullmatch((result.stderr or "").strip())
+        return f"timeout: {limit.group(0)}" if limit else "timeout"
     if result.return_code != 0 or result.error_type is not None:
-        return f"{result.error_type or f'exit {result.return_code}'}: {output.strip()[-2000:]}"
+        kind = result.error_type or f"exit {result.return_code}"
+        detail = next((label for marker, label in _BOOTSTRAP if marker in output), None)
+        if status:
+            detail = f"HTTP {status.group(1)}{where}"
+        return f"{kind}: {detail}" if detail else kind
     start = (result.stdout or "").find("{")
     try:
         report, _ = json.JSONDecoder().raw_decode((result.stdout or "")[start:]) if start >= 0 else (None, 0)
     except ValueError:
         report = None
     if not isinstance(report, dict) or not isinstance(report.get("servers"), dict):
-        return f"unreadable probe output: {output.strip()[-2000:]}"
+        return "unreadable probe output"
     diagnostics = [
         str(item.get("message"))
         for item in report.get("diagnostics") or []
         if isinstance(item, dict) and item.get("serverName") == name
     ]
     if diagnostics:
-        return "; ".join(diagnostics)[-2000:]
+        status = _HTTP_STATUS.search(" ".join(diagnostics))
+        return f"{f'HTTP {status.group(1)}' if status else 'connection failed'}{where}"
     if name not in report["servers"]:
         return "not connected"
     return None
@@ -617,7 +657,7 @@ class OpenClawAgent(SimpleResponsesAPIAgent):
                     f"bash {directory}/{installer} {runtime} {self.config.openclaw_version}\n"
                     f"stderr={(installed.stderr or '')[-16000:]}; stdout={(installed.stdout or '')[-16000:]}"
                 )
-            await sandbox.upload(Path(__file__).with_name("sandbox_runner.py"), f"{directory}/sandbox_runner.py")
+            await sandbox.upload(Path(__file__).with_name("sandbox_runner.py"), f"{directory}/{RUNNER_FILE}")
         except BaseException as error:
             try:
                 if prepared_directory or owns_sandbox:
@@ -787,12 +827,25 @@ class OpenClawAgent(SimpleResponsesAPIAgent):
                 LOG.exception("Could not salvage interrupted OpenClaw observations")
             raise
         response = await self._collect_sandbox_response(state, body, prompt=prompt, system=system)
+        # A grant can pass the probe and still fail at agent startup: OpenClaw 2026.6.11 then logs
+        # `bundle-mcp: failed to start server "<name>"`, runs on without its tools and exits 0.
+        stderr = _ANSI.sub("", (state.session.artifacts or {}).get("stderr.log", ""))
+        lost = sorted(name for name in mcp_servers if f'failed to start server "{name}"' in stderr)
+        mcp_gaps += [
+            ObservationGap(code="mcp_server_skipped", detail=f"{name}: did not connect in the agent run")
+            for name in lost
+            if name not in required_grants
+        ]
         if state.observations is not None:
             state.observations.gaps.extend(mcp_gaps)
         if response.error is not None:
             # Preserve the transcript in session observations, but let the environment
             # classify runtime/provider failures before it invokes the verifier.
             raise HTTPException(502, response.error.message)
+        if lost_required := [name for name in lost if name in required_grants]:
+            raise HTTPException(
+                502, "Required Gym MCP tools did not connect in the agent run: " + ", ".join(lost_required)
+            )
         response.metadata = {**(response.metadata or {}), AGENT_TIMEOUT_METADATA_KEY: str(timeout)}
         return response
 
@@ -830,12 +883,14 @@ class OpenClawAgent(SimpleResponsesAPIAgent):
         the check ``doctor --probe`` makes), so a grant counts as connected only when the JSON lists it under
         ``servers`` with no diagnostic for it.
         """
-        await state.upload_json("home/.openclaw/openclaw.json", {"mcp": {"servers": servers}})
+        await state.upload_json(
+            "home/.openclaw/openclaw.json", {"mcp": {"servers": servers}, "plugins": {"enabled": False}}
+        )
         gaps = []
         missing = []
         for index, name in enumerate(list(servers)):
             result = await self._run_mcp_probe(state, payload, name, index=index, timeout=timeout)
-            problem = _mcp_probe_problem(name, result)
+            problem = _mcp_probe_problem(name, result, url=servers[name].get("url"))
             if problem is None:
                 continue
             detail = f"{name}: {problem}"
@@ -876,13 +931,23 @@ class OpenClawAgent(SimpleResponsesAPIAgent):
         }
 
         async def stage() -> SandboxCommand:
+            # Create the directory as the session user: a provider's upload may create missing parents as root,
+            # and the supervisor, running as the session user, must write its claim and receipt there.
+            made = await probe.sandbox.exec(f"mkdir -p -- {shlex.quote(probe.session_dir)}", cwd="/", timeout_s=30)
+            if made.return_code != 0 or made.error_type:
+                raise RuntimeError(f"Cannot create {probe.session_dir}: {made.stderr or made.stdout}")
             await upload_text(probe.sandbox, path=f"{probe.session_dir}/input.json", text=json.dumps(runner_input))
-            runner = f"{state.session.session_dir}/sandbox_runner.py"
-            return SandboxCommand(python="python3", argv=["python3", "-I", runner, f"{probe.session_dir}/input.json"])
+            runner = f"{state.session.session_dir}/{RUNNER_FILE}"
+            return SandboxCommand(
+                python="python3",
+                argv=["python3", "-I", runner, f"{probe.session_dir}/input.json"],
+                stdlib_runner=True,
+            )
 
         async def collect() -> dict[str, str]:
             output = {}
-            for file in ("stdout.log", "stderr.log"):
+            # output.log holds supervisor and interpreter errors from before OpenClaw starts.
+            for file in ("stdout.log", "stderr.log", OUTPUT_LOG_FILE):
                 try:
                     output[file] = await read_text(probe.sandbox, path=f"{probe.session_dir}/{file}")
                 except Exception:
@@ -913,7 +978,7 @@ class OpenClawAgent(SimpleResponsesAPIAgent):
         return_code = receipt.get("return_code")
         return SandboxExecResult(
             stdout=output.get("stdout.log"),
-            stderr=output.get("stderr.log"),
+            stderr=output.get("stderr.log") or output.get(OUTPUT_LOG_FILE),
             return_code=return_code if type(return_code) is int else -1,
             error_type=None,
         )

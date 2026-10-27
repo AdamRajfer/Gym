@@ -43,7 +43,7 @@ gdpval_opencode_agent:
       # Well above a slow web call: httpx gives each step of a search or fetch up to 180 s.
       mcp_tool_timeout_seconds: 900
       opencode_config:
-        # The web goes through the task's web_search and fetch_web_page tools only.
+        # Use the task's web_search and fetch_web_page instead of the built-in web tools; shell egress remains.
         tools:
           webfetch: false
           websearch: false

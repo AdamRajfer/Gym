@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-import { readFile, writeFile } from "node:fs/promises";
+import { readFile, rename, writeFile } from "node:fs/promises";
 
 // OpenCode leaves an MCP server that fails to connect out of the tool list and keeps running.
 // Before the first model call, record each grant's status and stop the run when a required grant is missing.
@@ -18,7 +18,10 @@ export const RequiredMcp = async ({ client }) => {
         ...(entry?.error ? { error: String(entry.error).slice(0, 2000) } : {}),
       };
     }
-    await writeFile(new URL("./mcp-status.json", import.meta.url), JSON.stringify(statuses));
+    // Replace the staged file rather than write into it: the adapter's upload may own it as another user.
+    const staged = new URL(`./mcp-status.json.${process.pid}`, import.meta.url);
+    await writeFile(staged, JSON.stringify(statuses));
+    await rename(staged, new URL("./mcp-status.json", import.meta.url));
     return grants.required.filter((name) => statuses[name].status !== "connected");
   };
 

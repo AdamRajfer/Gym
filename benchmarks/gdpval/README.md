@@ -519,9 +519,9 @@ Replace `opencode` with `openclaw` for OpenClaw.
 - The model sees the task tools as `gdpval_resources_server_<tool>` in OpenCode and
   `gdpval_resources_server__<tool>` in OpenClaw. Their web tools stay off: the web goes through `web_search` and
   `fetch_web_page`.
-- Each model call may use up to `max_output_tokens` (32,768), and both harnesses compact against `context_window`
-  (262,144). Set `context_window` to the served model's context length; OpenClaw lowers a call's output request when
-  the input leaves less room.
+- Each model call may use up to `max_output_tokens` (32,768). OpenClaw compacts against `context_window`, the served
+  model's context length (262,144), and lowers a call's output request when the input leaves less room. OpenCode
+  always asks for `max_output_tokens`, so its `context_window` is the served length minus that (229,376).
 - The resources server's MCP tools must connect before the model runs. OpenCode checks them before its first model
   call and OpenClaw probes them with `openclaw mcp probe` before it starts; if they do not connect, the episode fails
   instead of running without `finish`.

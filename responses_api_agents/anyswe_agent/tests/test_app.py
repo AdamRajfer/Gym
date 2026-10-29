@@ -264,9 +264,10 @@ class TestSandboxAPI:
             passing = passing.replace("::test_fix", "::\x1b[1mtest_fix\x1b[0m")
             passing = passing.replace("::test_stays_green", "::\x1b[1mtest_stays_green\x1b[0m")
         assert _r2e_resolved(instance, passing)
-        for status in ("FAILED", "ERROR", "XFAIL", "SKIPPED"):
+        for status in ("FAILED", "ERROR", "SKIPPED"):
             nonpassing = passing.replace("PASSED", status, 1)
             assert not _r2e_resolved(instance, nonpassing)
+        assert _r2e_resolved(instance, passing.replace("PASSED", "XFAIL", 1))
         assert not _r2e_resolved(instance, passing.splitlines()[0])
 
     def test_safe_config_redacts_provider_key(self) -> None:

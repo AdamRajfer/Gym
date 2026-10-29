@@ -4,6 +4,7 @@
 
 import json
 import os
+import shlex
 import shutil
 import subprocess
 from pathlib import Path
@@ -13,6 +14,22 @@ from fastapi.testclient import TestClient
 
 from nemo_gym.tool_access import MCPToolAccess
 from responses_api_agents.opencode_agent.tests.test_sandbox_sessions import close_body, seed, setup  # noqa: F401
+
+
+def read_params(text: str) -> dict:
+    """Parse the harness runner's params.sh: scalars, arrays, and the env array back into a mapping."""
+    lexer = shlex.shlex(text, posix=True, punctuation_chars="()")
+    lexer.whitespace_split = True
+    tokens, params = list(lexer), {}
+    while tokens:
+        name, _, value = tokens.pop(0).partition("=")
+        if not value and tokens and tokens[0] == "(":
+            end = tokens.index(")")
+            params[name], tokens = tokens[1:end], tokens[end + 1 :]
+        else:
+            params[name] = value
+    params["env"] = dict(word.split("=", 1) for word in params["env"])
+    return params
 
 
 def grant(name: str, *, required: bool) -> dict:
@@ -62,7 +79,7 @@ def test_mcp_grants_are_configured_and_checked(setup, scenario):  # noqa: F811
         created = client.post("/v1/agent_sessions", json=body)
         assert created.status_code == 200, created.text
         result = client.post("/ng-rollout/opencode-smoke-a2/v1/responses", json={"input": "task"})
-        payload = json.loads(sandbox.files[f"{sandbox.directory}/input.json"])
+        payload = read_params(sandbox.files[f"{sandbox.directory}/params.sh"])
         config = json.loads(payload["env"]["OPENCODE_CONFIG_CONTENT"])
         assert config["mcp"]["task_tools"] == {
             "type": "remote",
@@ -147,7 +164,7 @@ def test_configured_and_request_grants_are_both_kept(setup):  # noqa: F811
         created = client.post("/v1/agent_sessions", json=body)
         assert created.status_code == 200, created.text
         client.post("/ng-rollout/opencode-smoke-a2/v1/responses", json={"input": "task"})
-        payload = json.loads(sandbox.files[f"{sandbox.directory}/input.json"])
+        payload = read_params(sandbox.files[f"{sandbox.directory}/params.sh"])
         assert set(json.loads(payload["env"]["OPENCODE_CONFIG_CONTENT"])["mcp"]) == {"configured", "task_tools"}
         assert json.loads(sandbox.files[f"{sandbox.directory}/mcp-grants.json"]) == {
             "required": ["task_tools"],

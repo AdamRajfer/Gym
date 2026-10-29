@@ -18,7 +18,7 @@ import pytest
 from fastapi import HTTPException
 
 from nemo_gym.agent_utils import sandbox_session as sandbox_session_module
-from nemo_gym.agent_utils.sandbox_session import RUNNER_FILE, SandboxSession
+from nemo_gym.agent_utils.sandbox_session import HARNESS_RUNNER_FILE, HARNESS_RUNNER_SCRIPT, SandboxSession
 from nemo_gym.sandbox import AsyncSandbox, SandboxSpec
 from nemo_gym.sandbox.providers.local.provider import LocalProvider
 from nemo_gym.server_utils import ServerClient
@@ -85,7 +85,7 @@ async def borrowed_state(tmp_path, runtime, workdir):
     await owner.start(SandboxSpec(workdir=str(workdir)))
     session_dir = tmp_path / "sessions" / "s1"
     session_dir.mkdir(parents=True)
-    shutil.copy(Path(__file__).parents[1] / "sandbox_runner.py", session_dir / RUNNER_FILE)
+    shutil.copy(HARNESS_RUNNER_SCRIPT, session_dir / HARNESS_RUNNER_FILE)
     session = SandboxSession(sandbox=owner, session_dir=str(session_dir), workdir=str(workdir), harness="OpenClaw")
     state = OpenClawSandboxSession(request=MagicMock(), session=session, runtime=str(runtime))
     release = {"calls": 0, "alive_at_disconnect": None}

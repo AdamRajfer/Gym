@@ -52,8 +52,8 @@ def test_mcp_staging_expiry_is_incomplete_and_next_activation_recovers(setup, tm
 
     async def connected_launch(**kwargs):
         # Stand-in for required_mcp.mjs, which records the grant status before the first model call.
-        path = [path for path in sandbox.files if path.endswith("/input.json")][-1]
-        directory = json.loads(sandbox.files[path])["directory"]
+        path = [path for path in sandbox.files if path.endswith("/params.sh")][-1]
+        directory = path.rsplit("/", 1)[0]
         sandbox.files[f"{directory}/mcp-status.json"] = json.dumps({"task_tools": {"status": "connected"}})
         return await launch(**kwargs)
 

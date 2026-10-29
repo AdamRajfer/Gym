@@ -53,6 +53,16 @@ def probe_result(name: str, failing: set[str], failure: str) -> dict:
     return {**result, "stdout": stdout}
 
 
+def read_params(text: str) -> dict:
+    """Parse the harness runner's params.sh: scalars, arrays, and the env array back into a mapping."""
+    params = {}
+    for line in text.splitlines():
+        name, _, value = line.partition("=")
+        params[name] = shlex.split(value[1:-1]) if value.startswith("(") else shlex.split(value)[0]
+    params["env"] = dict(word.split("=", 1) for word in params["env"])
+    return params
+
+
 def install_probe_fake(sandbox, failing: set[str], failure: str) -> list[dict]:
     """Answer each supervised `openclaw mcp probe` launch the way its supervisor and runner would.
 
@@ -65,7 +75,7 @@ def install_probe_fake(sandbox, failing: set[str], failure: str) -> list[dict]:
         match = re.search(r"(/\S*/mcp-probe-\d+)/cleanup\.json", command)
         if match and "process_supervisor" in command:
             directory = match.group(1)
-            runner_input = json.loads(sandbox.files.pop(f"{directory}/input.json"))
+            runner_input = read_params(sandbox.files.pop(f"{directory}/params.sh"))
             name = runner_input["command"][4]
             config = next(text for path, text in sandbox.files.items() if path.endswith("/.openclaw/openclaw.json"))
             probes.append({"name": name, "config": json.loads(config), "input": runner_input, "launch": command})

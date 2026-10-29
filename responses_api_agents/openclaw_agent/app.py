@@ -36,7 +36,13 @@ import psutil
 from fastapi import HTTPException, Request
 from pydantic import ConfigDict, Field, PrivateAttr
 
-from nemo_gym.agent_utils.sandbox_session import RUNNER_FILE, SandboxCommand, SandboxSession
+from nemo_gym.agent_utils.sandbox_session import (
+    HARNESS_RUNNER_FILE,
+    HARNESS_RUNNER_SCRIPT,
+    SandboxCommand,
+    SandboxSession,
+    shell_assignments,
+)
 from nemo_gym.agent_utils.supervisor_client import OUTPUT_LOG_FILE
 from nemo_gym.agent_utils.task_timeout import AGENT_TIMEOUT_METADATA_KEY, resolve_agent_timeout
 from nemo_gym.base_resources_server import BaseRunRequest, BaseVerifyResponse
@@ -396,10 +402,9 @@ def _extract_instruction(body_input) -> tuple[str, Optional[str]]:
 
 
 def _sandbox_prepare_command(workdir: str, directory: str, runtime: str) -> str:
-    # Bootstrap with POSIX sh; the runtime installer itself requires Bash.
+    # Bootstrap with POSIX sh; the runtime installer and harness runner require Bash.
     bootstrap = """set -eu
 set --
-command -v python3 >/dev/null 2>&1 || set -- "$@" python3
 command -v bash >/dev/null 2>&1 || set -- "$@" bash
 if [ "$#" -gt 0 ]; then
     [ "$(id -u)" = 0 ] || { echo "OpenClaw sandbox execution requires $*: preinstall these tools or use a root image." >&2; exit 1; }
@@ -414,9 +419,7 @@ if [ "$#" -gt 0 ]; then
     fi
 fi
 """
-    check_paths = shlex.join(
-        ["python3", "-I", "-c", _SANDBOX_PATH_CHECK, workdir, str(Path(directory).parent), runtime]
-    )
+    check_paths = f"(set -- {shlex.join([workdir, str(Path(directory).parent), runtime])}{_SANDBOX_PATH_CHECK})"
     return bootstrap + f"{check_paths} && mkdir -p {shlex.quote(directory + '/home/.openclaw')}"
 
 
@@ -657,7 +660,7 @@ class OpenClawAgent(SimpleResponsesAPIAgent):
                     f"bash {directory}/{installer} {runtime} {self.config.openclaw_version}\n"
                     f"stderr={(installed.stderr or '')[-16000:]}; stdout={(installed.stdout or '')[-16000:]}"
                 )
-            await sandbox.upload(Path(__file__).with_name("sandbox_runner.py"), f"{directory}/{RUNNER_FILE}")
+            await sandbox.upload(HARNESS_RUNNER_SCRIPT, f"{directory}/{HARNESS_RUNNER_FILE}")
         except BaseException as error:
             try:
                 if prepared_directory or owns_sandbox:
@@ -791,7 +794,6 @@ class OpenClawAgent(SimpleResponsesAPIAgent):
         ]
         payload = {
             "config": session_config,
-            "directory": state.session.session_dir,
             "command": command,
             "prompt": f"{system}\n\n{prompt}" if system else prompt,
             "cwd": state.session.workdir,
@@ -922,12 +924,13 @@ class OpenClawAgent(SimpleResponsesAPIAgent):
             workdir=state.session.workdir,
             harness="OpenClaw MCP probe",
         )
-        runner_input = {
-            "directory": probe.session_dir,
-            "prompt": "",
-            "command": [*payload["command"][:2], "mcp", "probe", name, "--json"],
+        params = {
             "cwd": state.session.workdir,
+            "command": [*payload["command"][:2], "mcp", "probe", name, "--json"],
             "env": payload["env"],
+            "stdin": "/dev/null",
+            "stdout": f"{probe.session_dir}/stdout.log",
+            "stderr": f"{probe.session_dir}/stderr.log",
         }
 
         async def stage() -> SandboxCommand:
@@ -936,17 +939,13 @@ class OpenClawAgent(SimpleResponsesAPIAgent):
             made = await probe.sandbox.exec(f"mkdir -p -- {shlex.quote(probe.session_dir)}", cwd="/", timeout_s=30)
             if made.return_code != 0 or made.error_type:
                 raise RuntimeError(f"Cannot create {probe.session_dir}: {made.stderr or made.stdout}")
-            await upload_text(probe.sandbox, path=f"{probe.session_dir}/input.json", text=json.dumps(runner_input))
-            runner = f"{state.session.session_dir}/{RUNNER_FILE}"
-            return SandboxCommand(
-                python="python3",
-                argv=["python3", "-I", runner, f"{probe.session_dir}/input.json"],
-                stdlib_runner=True,
-            )
+            await upload_text(probe.sandbox, path=f"{probe.session_dir}/params.sh", text=shell_assignments(params))
+            runner = f"{state.session.session_dir}/{HARNESS_RUNNER_FILE}"
+            return SandboxCommand(argv=["bash", runner, f"{probe.session_dir}/params.sh"])
 
         async def collect() -> dict[str, str]:
             output = {}
-            # output.log holds supervisor and interpreter errors from before OpenClaw starts.
+            # output.log holds supervisor and runner errors from before OpenClaw starts.
             for file in ("stdout.log", "stderr.log", OUTPUT_LOG_FILE):
                 try:
                     output[file] = await read_text(probe.sandbox, path=f"{probe.session_dir}/{file}")

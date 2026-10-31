@@ -45,7 +45,6 @@ from nemo_gym.agent_utils.sandbox_session import (
 )
 from nemo_gym.agent_utils.supervisor_client import OUTPUT_LOG_FILE
 from nemo_gym.agent_utils.task_timeout import AGENT_TIMEOUT_METADATA_KEY, resolve_agent_timeout
-from nemo_gym.base_resources_server import BaseRunRequest, BaseVerifyResponse
 from nemo_gym.base_responses_api_agent import (
     AgentCloseSessionResponse,
     AgentSeedSessionRequest,
@@ -55,6 +54,7 @@ from nemo_gym.base_responses_api_agent import (
     Body,
     SimpleResponsesAPIAgent,
 )
+from nemo_gym.client import get_response_json, raise_for_status
 from nemo_gym.config import ModelServerRef, ResourcesServerRef
 from nemo_gym.core import (
     NeMoGymEasyInputMessage,
@@ -70,11 +70,6 @@ from nemo_gym.core import (
     NeMoGymResponseUsage,
     NeMoGymSummary,
 )
-from nemo_gym.rollout_observability import (
-    AgentEpisode,
-    AgentObservationBundle,
-    ObservationGap,
-)
 from nemo_gym.sandbox import (
     AsyncSandbox,
     DirectSandboxConnection,
@@ -85,8 +80,13 @@ from nemo_gym.sandbox import (
     resolve_provider_config,
     upload_text,
 )
-from nemo_gym.server_utils import get_global_config_dict, get_response_json, raise_for_status
-from nemo_gym.tool_access import MCPToolAccess
+from nemo_gym.server_runtime import BaseRunRequest, BaseVerifyResponse, MCPToolAccess
+from nemo_gym.server_utils import get_global_config_dict
+from nemo_gym.trajectory import (
+    AgentEpisode,
+    AgentObservationBundle,
+    ObservationGap,
+)
 from responses_api_agents.openclaw_agent.observability import (
     OPENCLAW_OBSERVATION_SOURCE,
     OpenClawSessionTree,

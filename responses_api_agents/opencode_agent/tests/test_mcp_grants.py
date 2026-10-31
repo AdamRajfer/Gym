@@ -12,7 +12,7 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
-from nemo_gym.tool_access import MCPToolAccess
+from nemo_gym.server_runtime import MCPToolAccess
 from responses_api_agents.opencode_agent.tests.test_sandbox_sessions import close_body, seed, setup  # noqa: F401
 
 
